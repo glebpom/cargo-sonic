@@ -1,0 +1,23 @@
+set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+
+sonic_manifest := "../../crates/cargo-sonic/Cargo.toml"
+fat_binary := "target/sonic/x86_64-unknown-linux-gnu/debug/sonic-variant-printer"
+
+default: build
+
+# Build the local cargo-sonic tool and then build this example as a fat executable.
+build:
+    cargo run --manifest-path {{sonic_manifest}} -- sonic build
+
+# Run the generated fat executable. The loader is silent; this output comes from the app.
+run: build
+    ./{{fat_binary}}
+
+# Show the loader ELF has no dynamic interpreter or libc dependency.
+check-loader: build
+    ! readelf -l {{fat_binary}} | grep -q INTERP
+    ! readelf -d {{fat_binary}} | grep -q NEEDED
+
+# Remove this example's build artifacts.
+clean:
+    rm -rf target

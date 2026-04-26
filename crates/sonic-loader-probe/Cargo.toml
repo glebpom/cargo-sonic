@@ -1,0 +1,8 @@
+[package]
+name = "sonic-loader-probe"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+sonic-loader = { path = "../sonic-loader" }

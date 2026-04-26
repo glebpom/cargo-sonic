@@ -1,0 +1,8 @@
+[package]
+name = "sonic-survey"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = "1"

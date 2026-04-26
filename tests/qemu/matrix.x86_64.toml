@@ -1,0 +1,28 @@
+[[case]]
+name = "x86 generic"
+arch = "x86_64"
+qemu = "qemu-x86_64"
+cpu = "qemu64"
+variants = ["generic", "x86-64-v2", "x86-64-v3", "haswell"]
+expect_selected = "generic"
+expect_present = ["sse", "sse2"]
+expect_absent = ["avx2", "avx512f"]
+
+[[case]]
+name = "haswell"
+arch = "x86_64"
+qemu = "qemu-x86_64"
+cpu = "Haswell-v4"
+variants = ["generic", "x86-64-v2", "x86-64-v3", "haswell", "skylake-avx512"]
+expect_selected = "haswell"
+expect_present = ["avx", "avx2", "bmi1", "bmi2", "fma"]
+expect_absent = ["avx512f"]
+
+[[case]]
+name = "skylake server avx512"
+arch = "x86_64"
+qemu = "qemu-x86_64"
+cpu = "Skylake-Server"
+variants = ["generic", "x86-64-v3", "x86-64-v4", "skylake-avx512"]
+expect_selected_any_of = ["x86-64-v4", "skylake-avx512"]
+expect_present = ["avx512f", "avx512bw", "avx512dq", "avx512vl"]

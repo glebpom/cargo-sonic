@@ -1,0 +1,13 @@
+[package]
+name = "sonic-variant-printer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata.sonic]
+target-cpus = [
+  "znver5",
+  "raptorlake",
+]
+
+[workspace]
