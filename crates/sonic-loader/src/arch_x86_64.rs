@@ -61,6 +61,7 @@ pub fn detect_x86_features_from_cpuid(leaves: X86Cpuid, xcr0: u64) -> FeatureMas
     if avx512_state {
         if bit(b7, 16) { out.insert(Feature::Avx512F); }
         if bit(b7, 17) { out.insert(Feature::Avx512Dq); }
+        if bit(b7, 21) { out.insert(Feature::Avx512Ifma); }
         if bit(b7, 28) { out.insert(Feature::Avx512Cd); }
         if bit(b7, 30) { out.insert(Feature::Avx512Bw); }
         if bit(b7, 31) { out.insert(Feature::Avx512Vl); }
@@ -121,9 +122,11 @@ mod tests {
     fn x86_avx512_requires_opmask_zmm_xcr0_state() {
         let mut leaves = X86Cpuid::default();
         leaves.leaf1.ecx = (1 << 26) | (1 << 27) | (1 << 28);
-        leaves.leaf7_0.ebx = 1 << 16;
+        leaves.leaf7_0.ebx = (1 << 16) | (1 << 21);
         assert!(!detect_x86_features_from_cpuid(leaves, 0b110).contains(Feature::Avx512F));
-        assert!(detect_x86_features_from_cpuid(leaves, 0b1110_0110).contains(Feature::Avx512F));
+        let mask = detect_x86_features_from_cpuid(leaves, 0b1110_0110);
+        assert!(mask.contains(Feature::Avx512F));
+        assert!(mask.contains(Feature::Avx512Ifma));
     }
 
     #[test]
