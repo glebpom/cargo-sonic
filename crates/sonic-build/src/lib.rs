@@ -682,6 +682,9 @@ unsafe extern "C" fn loader_entry(stack: *const usize) -> ! {
         i += 1;
     }
     let selected_meta = select::select_variant(host, &metas[..count]);
+    if stack::debug_enabled(&initial) {
+        debug_selection(host, &metas[..count], selected_meta.target_cpu);
+    }
     let selected = find_variant(selected_meta.target_cpu);
     exec_payload(selected, &initial)
 }
@@ -711,6 +714,176 @@ unsafe fn exec_payload(selected: &Variant, initial: &stack::InitialStack) -> ! {
     }
     linux_sys::execveat(fd, b"\0".as_ptr(), initial.argv, envp, linux_sys::AT_EMPTY_PATH);
     linux_sys::exit(114)
+}
+
+fn debug_selection(host: HostInfo, variants: &[VariantMeta], selected: &str) {
+    unsafe {
+        linux_sys::write_stderr(b"cargo-sonic debug\n");
+        linux_sys::write_stderr(b"  host.features=");
+        debug_mask(host.features);
+        linux_sys::write_stderr(b"\n");
+        linux_sys::write_stderr(b"  host.feature_names=");
+        debug_feature_names(host.features);
+        linux_sys::write_stderr(b"\n");
+        linux_sys::write_stderr(b"  host.identity=");
+        debug_identity(host.identity);
+        linux_sys::write_stderr(b"\n");
+        linux_sys::write_stderr(b"  variants:\n");
+        let mut i = 0;
+        while i < variants.len() {
+            let v = &variants[i];
+            let eligible = v.target_kind.is_generic() || v.required_features.is_subset_of(host.features);
+            linux_sys::write_stderr(b"    ");
+            linux_sys::write_stderr(v.target_cpu.as_bytes());
+            linux_sys::write_stderr(b" eligible=");
+            linux_sys::write_stderr(if eligible { b"yes" } else { b"no" });
+            linux_sys::write_stderr(b" tier=");
+            debug_u8(v.feature_tier);
+            linux_sys::write_stderr(b" count=");
+            debug_u16(v.rank_feature_count);
+            linux_sys::write_stderr(b" required=");
+            debug_mask(v.required_features);
+            if !eligible {
+                linux_sys::write_stderr(b" missing=");
+                debug_missing(v.required_features, host.features);
+                linux_sys::write_stderr(b" missing_features=");
+                debug_missing_feature_names(v.required_features, host.features);
+            }
+            linux_sys::write_stderr(b"\n");
+            i += 1;
+        }
+        linux_sys::write_stderr(b"  selected=");
+        linux_sys::write_stderr(selected.as_bytes());
+        linux_sys::write_stderr(b"\n");
+    }
+}
+
+fn debug_identity(identity: CpuIdentity) {
+    unsafe {
+        match identity {
+            CpuIdentity::Unknown => linux_sys::write_stderr(b"unknown"),
+            CpuIdentity::X86 { vendor, family, model, stepping } => {
+                linux_sys::write_stderr(b"x86(");
+                linux_sys::write_stderr(match vendor {
+                    select::X86Vendor::Intel => b"intel",
+                    select::X86Vendor::Amd => b"amd",
+                    select::X86Vendor::Other => b"other",
+                });
+                linux_sys::write_stderr(b" family=");
+                debug_u16(family);
+                linux_sys::write_stderr(b" model=");
+                debug_u16(model);
+                linux_sys::write_stderr(b" stepping=");
+                debug_u8(stepping);
+                linux_sys::write_stderr(b")");
+            }
+            CpuIdentity::Aarch64 { implementer, part, variant, revision } => {
+                linux_sys::write_stderr(b"aarch64(implementer=");
+                debug_u16(implementer);
+                linux_sys::write_stderr(b" part=");
+                debug_u16(part);
+                linux_sys::write_stderr(b" variant=");
+                debug_u8(variant);
+                linux_sys::write_stderr(b" revision=");
+                debug_u8(revision);
+                linux_sys::write_stderr(b")");
+            }
+        }
+    }
+}
+
+fn debug_mask(mask: feature_mask::FeatureMask) {
+    let words = mask.words();
+    unsafe {
+        linux_sys::write_stderr(b"[");
+        debug_hex64(words[0]);
+        linux_sys::write_stderr(b",");
+        debug_hex64(words[1]);
+        linux_sys::write_stderr(b"]");
+    }
+}
+
+fn debug_missing(required: feature_mask::FeatureMask, host: feature_mask::FeatureMask) {
+    let required = required.words();
+    let host = host.words();
+    unsafe {
+        linux_sys::write_stderr(b"[");
+        debug_hex64(required[0] & !host[0]);
+        linux_sys::write_stderr(b",");
+        debug_hex64(required[1] & !host[1]);
+        linux_sys::write_stderr(b"]");
+    }
+}
+
+fn debug_feature_names(mask: feature_mask::FeatureMask) {
+    unsafe {
+        linux_sys::write_stderr(b"[");
+        let mut first = true;
+        let mut i = 0;
+        while i < feature_mask::ALL_FEATURES.len() {
+            let feature = feature_mask::ALL_FEATURES[i];
+            if mask.contains(feature) {
+                if !first {
+                    linux_sys::write_stderr(b",");
+                }
+                linux_sys::write_stderr(feature_mask::feature_name(feature).as_bytes());
+                first = false;
+            }
+            i += 1;
+        }
+        linux_sys::write_stderr(b"]");
+    }
+}
+
+fn debug_missing_feature_names(required: feature_mask::FeatureMask, host: feature_mask::FeatureMask) {
+    unsafe {
+        linux_sys::write_stderr(b"[");
+        let mut first = true;
+        let mut i = 0;
+        while i < feature_mask::ALL_FEATURES.len() {
+            let feature = feature_mask::ALL_FEATURES[i];
+            if required.contains(feature) && !host.contains(feature) {
+                if !first {
+                    linux_sys::write_stderr(b",");
+                }
+                linux_sys::write_stderr(feature_mask::feature_name(feature).as_bytes());
+                first = false;
+            }
+            i += 1;
+        }
+        linux_sys::write_stderr(b"]");
+    }
+}
+
+fn debug_hex64(value: u64) {
+    let mut buf = *b"0x0000000000000000";
+    let mut i = 0;
+    while i < 16 {
+        let shift = (15 - i) * 4;
+        let nibble = ((value >> shift) & 0xf) as u8;
+        buf[2 + i] = if nibble < 10 { b'0' + nibble } else { b'a' + (nibble - 10) };
+        i += 1;
+    }
+    unsafe { linux_sys::write_stderr(&buf) }
+}
+
+fn debug_u8(value: u8) {
+    debug_u16(value as u16);
+}
+
+fn debug_u16(mut value: u16) {
+    let mut buf = [0u8; 5];
+    let mut i = buf.len();
+    if value == 0 {
+        unsafe { linux_sys::write_stderr(b"0") }
+        return;
+    }
+    while value > 0 {
+        i -= 1;
+        buf[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    unsafe { linux_sys::write_stderr(&buf[i..]) }
 }
 
 fn detect_host(initial: &stack::InitialStack) -> HostInfo {
@@ -853,6 +1026,10 @@ pub unsafe fn write_all(fd: isize, mut ptr: *const u8, mut len: usize) -> isize 
     0
 }
 
+pub unsafe fn write_stderr(buf: &[u8]) {
+    let _ = write_all(2, buf.as_ptr(), buf.len());
+}
+
 pub unsafe fn execveat(fd: isize, path: *const u8, argv: *const *const u8, envp: *const *const u8, flags: usize) -> isize {
     syscall6(SYS_EXECVEAT, fd as usize, path as usize, argv as usize, envp as usize, flags, 0)
 }
@@ -940,10 +1117,33 @@ pub unsafe fn build_envp(initial: &InitialStack, enabled: &'static [u8], cpu: &'
     out
 }
 
+pub unsafe fn debug_enabled(initial: &InitialStack) -> bool {
+    let mut i = 0;
+    while i < initial.envc {
+        if env_name_matches(*initial.envp.add(i), b"CARGO_SONIC_DEBUG") {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 unsafe fn is_sonic_key(p: *const u8) -> bool {
     starts_with(p, b"CARGO_SONIC_ENABLED=")
         || starts_with(p, b"CARGO_SONIC_SELECTED_TARGET_CPU=")
         || starts_with(p, b"CARGO_SONIC_SELECTED_FLAGS=")
+}
+
+unsafe fn env_name_matches(p: *const u8, name: &[u8]) -> bool {
+    let mut i = 0;
+    while i < name.len() {
+        if *p.add(i) != name[i] {
+            return false;
+        }
+        i += 1;
+    }
+    let next = *p.add(i);
+    next == 0 || next == b'='
 }
 
 unsafe fn starts_with(mut p: *const u8, prefix: &[u8]) -> bool {

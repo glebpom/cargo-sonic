@@ -124,6 +124,24 @@ fn main() {
 The application cannot inspect loader internals directly. The environment is
 the supported observation surface.
 
+## Loader Debugging
+
+The loader is silent by default. Set `CARGO_SONIC_DEBUG` to make it print
+selection diagnostics to stderr before it executes the selected payload:
+
+```bash
+CARGO_SONIC_DEBUG=1 target/sonic/x86_64-unknown-linux-gnu/debug/sonic-variant-printer
+```
+
+Debug output includes:
+
+- detected host feature mask and feature names
+- detected CPU identity
+- every configured variant
+- each variant's eligibility
+- missing feature names for ineligible variants
+- selected target CPU
+
 ## Example
 
 See [examples/variant-printer](examples/variant-printer).
