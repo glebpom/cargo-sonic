@@ -107,7 +107,12 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
     for cpu in &included {
         let feature_names = features_by_cpu.get(cpu).cloned().unwrap_or_default();
         let rank_features = feature_mask(&feature_names)?;
-        let required_features = if cpu == "generic" { FeatureMask::EMPTY } else { rank_features };
+        let required_feature_names = safety_required_features(&feature_names);
+        let required_features = if cpu == "generic" {
+            FeatureMask::EMPTY
+        } else {
+            feature_mask(&required_feature_names)?
+        };
         let artifact = build_payload_variant(package, &cargo_args, manifest_path.as_deref(), &target, profile, cpu, &out_root)?;
         variants.push(VariantBuild {
             target_cpu: cpu.clone(),
@@ -381,6 +386,25 @@ fn feature_mask(features: &[String]) -> Result<FeatureMask> {
         mask.insert(feature);
     }
     Ok(mask)
+}
+
+fn safety_required_features(features: &[String]) -> Vec<String> {
+    features
+        .iter()
+        .filter(|feature| is_safety_required_feature(feature))
+        .cloned()
+        .collect()
+}
+
+fn is_safety_required_feature(feature: &str) -> bool {
+    !matches!(
+        feature,
+        // These instructions are not normal compiler codegen targets. They are
+        // kept in rank_features / CARGO_SONIC_SELECTED_FLAGS, but do not make a
+        // CPU-tuned payload ineligible when firmware, virtualization, or kernel
+        // policy hides hardware RNG support.
+        "rdrand" | "rdseed"
+    )
 }
 
 fn build_payload_variant(
@@ -1275,6 +1299,12 @@ mod tests {
         let rank = feature_mask(&["avx2".into()]).unwrap();
         assert_eq!(FeatureMask::EMPTY.count(), 0);
         assert_eq!(rank.count(), 1);
+    }
+
+    #[test]
+    fn rng_features_are_rank_only_not_safety_required() {
+        let required = safety_required_features(&["avx2".into(), "rdseed".into(), "rdrand".into()]);
+        assert_eq!(required, vec!["avx2"]);
     }
 
     #[test]
