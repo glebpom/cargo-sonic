@@ -705,9 +705,14 @@ unsafe extern "C" fn loader_entry(stack: *const usize) -> ! {
         };
         i += 1;
     }
-    let selected_meta = select::select_variant(host, &metas[..count]);
+    let sonic_enabled = stack::sonic_enabled(&initial);
+    let selected_meta = if sonic_enabled {
+        select::select_variant(host, &metas[..count])
+    } else {
+        generic_meta(&metas[..count])
+    };
     if stack::debug_enabled(&initial) {
-        debug_selection(host, &metas[..count], selected_meta.target_cpu);
+        debug_selection(host, &metas[..count], selected_meta.target_cpu, sonic_enabled);
     }
     let selected = find_variant(selected_meta.target_cpu);
     exec_payload(selected, &initial)
@@ -722,6 +727,17 @@ fn find_variant(name: &str) -> &'static Variant {
         i += 1;
     }
     &VARIANTS[0]
+}
+
+fn generic_meta<'a>(variants: &'a [VariantMeta]) -> &'a VariantMeta {
+    let mut i = 0;
+    while i < variants.len() {
+        if variants[i].target_kind.is_generic() {
+            return &variants[i];
+        }
+        i += 1;
+    }
+    &variants[0]
 }
 
 unsafe fn exec_payload(selected: &Variant, initial: &stack::InitialStack) -> ! {
@@ -740,9 +756,12 @@ unsafe fn exec_payload(selected: &Variant, initial: &stack::InitialStack) -> ! {
     linux_sys::exit(114)
 }
 
-fn debug_selection(host: HostInfo, variants: &[VariantMeta], selected: &str) {
+fn debug_selection(host: HostInfo, variants: &[VariantMeta], selected: &str, sonic_enabled: bool) {
     unsafe {
         linux_sys::write_stderr(b"cargo-sonic debug\n");
+        linux_sys::write_stderr(b"  enable=");
+        linux_sys::write_stderr(if sonic_enabled { b"1" } else { b"0" });
+        linux_sys::write_stderr(b"\n");
         linux_sys::write_stderr(b"  host.features=");
         debug_mask(host.features);
         linux_sys::write_stderr(b"\n");
@@ -1152,6 +1171,19 @@ pub unsafe fn debug_enabled(initial: &InitialStack) -> bool {
     false
 }
 
+pub unsafe fn sonic_enabled(initial: &InitialStack) -> bool {
+    let mut i = 0;
+    while i < initial.envc {
+        let p = *initial.envp.add(i);
+        if starts_with(p, b"CARGO_SONIC_ENABLE=") {
+            let value = p.add(b"CARGO_SONIC_ENABLE=".len());
+            return !is_disabled_value(value);
+        }
+        i += 1;
+    }
+    true
+}
+
 unsafe fn is_sonic_key(p: *const u8) -> bool {
     starts_with(p, b"CARGO_SONIC_ENABLED=")
         || starts_with(p, b"CARGO_SONIC_SELECTED_TARGET_CPU=")
@@ -1168,6 +1200,18 @@ unsafe fn env_name_matches(p: *const u8, name: &[u8]) -> bool {
     }
     let next = *p.add(i);
     next == 0 || next == b'='
+}
+
+unsafe fn is_disabled_value(p: *const u8) -> bool {
+    if *p == b'0' && *p.add(1) == 0 {
+        return true;
+    }
+    (*p == b'f' || *p == b'F')
+        && (*p.add(1) == b'a' || *p.add(1) == b'A')
+        && (*p.add(2) == b'l' || *p.add(2) == b'L')
+        && (*p.add(3) == b's' || *p.add(3) == b'S')
+        && (*p.add(4) == b'e' || *p.add(4) == b'E')
+        && *p.add(5) == 0
 }
 
 unsafe fn starts_with(mut p: *const u8, prefix: &[u8]) -> bool {

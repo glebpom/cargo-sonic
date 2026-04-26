@@ -1,17 +1,33 @@
 set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
 sonic_manifest := "../../crates/cargo-sonic/Cargo.toml"
-fat_binary := "target/sonic/x86_64-unknown-linux-gnu/debug/sonic-variant-printer"
+fat_binary := "target/sonic/x86_64-unknown-linux-gnu/release/sonic-variant-printer"
 
 default: build
 
 # Build the local cargo-sonic tool and then build this example as a fat executable.
 build:
-    cargo run --manifest-path {{sonic_manifest}} -- sonic build
+    cargo run --manifest-path {{sonic_manifest}} -- sonic build --release
 
 # Run the generated fat executable. The loader is silent; this output comes from the app.
 run: build
     ./{{fat_binary}}
+
+# Run the same fat executable but force the loader to select generic.
+run-generic: build
+    CARGO_SONIC_ENABLE=0 ./{{fat_binary}}
+
+# Run both modes with the same iteration count for a quick local comparison.
+compare: build
+    echo "default selection"
+    ./{{fat_binary}}
+    echo
+    echo "forced generic"
+    CARGO_SONIC_ENABLE=0 ./{{fat_binary}}
+
+# Print loader selection diagnostics before running the app.
+debug: build
+    CARGO_SONIC_DEBUG=1 ./{{fat_binary}}
 
 # Show the loader ELF has no dynamic interpreter or libc dependency.
 check-loader: build

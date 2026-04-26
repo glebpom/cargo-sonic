@@ -111,6 +111,13 @@ CARGO_SONIC_SELECTED_TARGET_CPU=<target_cpu>
 CARGO_SONIC_SELECTED_FLAGS=<rustc target_feature CSV>
 ```
 
+Selection is enabled by default. Set `CARGO_SONIC_ENABLE=0` or
+`CARGO_SONIC_ENABLE=false` to force the loader to select the `generic` payload:
+
+```bash
+CARGO_SONIC_ENABLE=0 target/sonic/x86_64-unknown-linux-gnu/release/sonic-variant-printer
+```
+
 Application code can read these like normal environment variables:
 
 ```rust
@@ -130,7 +137,7 @@ The loader is silent by default. Set `CARGO_SONIC_DEBUG` to make it print
 selection diagnostics to stderr before it executes the selected payload:
 
 ```bash
-CARGO_SONIC_DEBUG=1 target/sonic/x86_64-unknown-linux-gnu/debug/sonic-variant-printer
+CARGO_SONIC_DEBUG=1 target/sonic/x86_64-unknown-linux-gnu/release/sonic-variant-printer
 ```
 
 Debug output includes:
@@ -155,10 +162,18 @@ just run
 just check-loader
 ```
 
+The example builds in release mode and runs a CPU-heavy floating point kernel
+implemented directly in the example, with no crate-level runtime CPU dispatch.
 On a Raptor Lake host, `just run` prints:
 
 ```text
 selected target-cpu: raptorlake
+```
+
+Compare default selection with forced generic:
+
+```bash
+just compare
 ```
 
 The loader itself prints nothing.
@@ -209,8 +224,8 @@ This verifies the generated loader executable has no ELF interpreter and no
 dynamic libc dependency:
 
 ```bash
-readelf -l target/sonic/x86_64-unknown-linux-gnu/debug/sonic-variant-printer
-readelf -d target/sonic/x86_64-unknown-linux-gnu/debug/sonic-variant-printer
+readelf -l target/sonic/x86_64-unknown-linux-gnu/release/sonic-variant-printer
+readelf -d target/sonic/x86_64-unknown-linux-gnu/release/sonic-variant-printer
 ```
 
 Expected:

@@ -6,6 +6,7 @@ publish = false
 
 [package.metadata.sonic]
 target-cpus = [
+  "x86-64-v2",
   "znver5",
   "raptorlake",
 ]
