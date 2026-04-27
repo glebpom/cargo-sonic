@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::{Artifact, Message, MetadataCommand, Package};
+use clap::{Arg, ArgAction, Command as ClapCommand};
 use serde::Deserialize;
 use sonic_loader::arch_x86_64;
 use sonic_loader::feature_mask::{Feature, FeatureMask, feature_by_name};
@@ -40,6 +41,7 @@ struct SonicMetadata {
 struct CargoArgs {
     release: bool,
     target: Option<String>,
+    target_dir: Option<Utf8PathBuf>,
     bin: Option<String>,
     package: Option<String>,
     manifest_path: Option<Utf8PathBuf>,
@@ -106,7 +108,7 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
     } else {
         "debug"
     };
-    let out_root = effective_target_directory(&metadata)?
+    let out_root = effective_target_directory(&metadata, cargo_args.target_dir.as_deref())?
         .join("sonic")
         .join(&target)
         .join(profile);
@@ -249,71 +251,87 @@ pub fn probe(options: ProbeOptions) -> Result<()> {
 }
 
 fn parse_cargo_args(args: &[String]) -> CargoArgs {
-    let mut out = CargoArgs {
-        release: false,
-        target: None,
-        bin: None,
-        package: None,
-        manifest_path: None,
-        forwarded: Vec::new(),
-    };
+    let matches = cargo_args_command()
+        .try_get_matches_from(known_cargo_args(args))
+        .expect("cargo args parser uses ignore_errors");
+    let profile = matches.get_one::<String>("profile").map(String::as_str);
+    let release = matches.get_flag("release") || profile == Some("release");
+    CargoArgs {
+        release,
+        target: matches.get_one::<String>("target").cloned(),
+        target_dir: matches
+            .get_one::<String>("target-dir")
+            .map(Utf8PathBuf::from),
+        bin: matches.get_one::<String>("bin").cloned(),
+        package: matches.get_one::<String>("package").cloned(),
+        manifest_path: matches
+            .get_one::<String>("manifest-path")
+            .map(Utf8PathBuf::from),
+        forwarded: forwarded_cargo_args(args),
+    }
+}
+
+fn known_cargo_args(args: &[String]) -> Vec<String> {
+    let mut known = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--release" => {
-                out.release = true;
-                out.forwarded.push(args[i].clone());
-            }
-            "--target" => {
-                if let Some(v) = args.get(i + 1) {
-                    out.target = Some(v.clone());
-                    out.forwarded.push(args[i].clone());
-                    out.forwarded.push(v.clone());
+            "--release" | "-r" => known.push(args[i].clone()),
+            "--profile" | "--target" | "--target-dir" | "--bin" | "--package" | "-p"
+            | "--manifest-path" => {
+                known.push(args[i].clone());
+                if let Some(value) = args.get(i + 1) {
+                    known.push(value.clone());
                     i += 1;
                 }
             }
-            "--bin" => {
-                if let Some(v) = args.get(i + 1) {
-                    out.bin = Some(v.clone());
-                    out.forwarded.push(args[i].clone());
-                    out.forwarded.push(v.clone());
-                    i += 1;
-                }
+            value
+                if value.starts_with("--profile=")
+                    || value.starts_with("--target=")
+                    || value.starts_with("--target-dir=")
+                    || value.starts_with("--bin=")
+                    || value.starts_with("--package=")
+                    || value.starts_with("--manifest-path=") =>
+            {
+                known.push(args[i].clone());
             }
-            "--package" | "-p" => {
-                if let Some(v) = args.get(i + 1) {
-                    out.package = Some(v.clone());
-                    out.forwarded.push(args[i].clone());
-                    out.forwarded.push(v.clone());
-                    i += 1;
-                }
-            }
-            "--manifest-path" => {
-                if let Some(v) = args.get(i + 1) {
-                    out.manifest_path = Some(Utf8PathBuf::from(v));
-                    i += 1;
-                }
-            }
-            v if v.starts_with("--target=") => {
-                out.target = Some(v["--target=".len()..].to_string());
-                out.forwarded.push(args[i].clone());
-            }
-            v if v.starts_with("--bin=") => {
-                out.bin = Some(v["--bin=".len()..].to_string());
-                out.forwarded.push(args[i].clone());
-            }
-            v if v.starts_with("--package=") => {
-                out.package = Some(v["--package=".len()..].to_string());
-                out.forwarded.push(args[i].clone());
-            }
-            v if v.starts_with("--manifest-path=") => {
-                out.manifest_path = Some(Utf8PathBuf::from(&v["--manifest-path=".len()..]));
-            }
-            _ => out.forwarded.push(args[i].clone()),
+            _ => {}
         }
         i += 1;
     }
-    out
+    known
+}
+
+fn cargo_args_command() -> ClapCommand {
+    ClapCommand::new("cargo-sonic-build-args")
+        .no_binary_name(true)
+        .ignore_errors(true)
+        .arg(
+            Arg::new("release")
+                .long("release")
+                .short('r')
+                .action(ArgAction::SetTrue),
+        )
+        .arg(Arg::new("profile").long("profile").num_args(1))
+        .arg(Arg::new("target").long("target").num_args(1))
+        .arg(Arg::new("target-dir").long("target-dir").num_args(1))
+        .arg(Arg::new("bin").long("bin").num_args(1))
+        .arg(Arg::new("package").long("package").short('p').num_args(1))
+        .arg(Arg::new("manifest-path").long("manifest-path").num_args(1))
+}
+
+fn forwarded_cargo_args(args: &[String]) -> Vec<String> {
+    let mut forwarded = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--manifest-path" | "--target-dir" => i += 1,
+            v if v.starts_with("--manifest-path=") || v.starts_with("--target-dir=") => {}
+            _ => forwarded.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    forwarded
 }
 
 fn leaked_str(value: &str) -> &'static str {
@@ -622,15 +640,30 @@ fn rustc_default_target() -> Result<String> {
         .context("failed to determine rustc host target")
 }
 
-fn effective_target_directory(metadata: &cargo_metadata::Metadata) -> Result<Utf8PathBuf> {
+fn effective_target_directory(
+    metadata: &cargo_metadata::Metadata,
+    target_dir_arg: Option<&Utf8Path>,
+) -> Result<Utf8PathBuf> {
+    if let Some(value) = target_dir_arg {
+        return absolute_path(value);
+    }
     if let Some(value) =
         std::env::var_os("CARGO_TARGET_DIR").or_else(|| std::env::var_os("CARGO_TARGET"))
     {
-        return Utf8PathBuf::from_path_buf(std::path::PathBuf::from(value))
-            .map_err(|_| anyhow!("CARGO_TARGET_DIR is not valid UTF-8"));
+        let value = Utf8PathBuf::from_path_buf(std::path::PathBuf::from(value))
+            .map_err(|_| anyhow!("CARGO_TARGET_DIR is not valid UTF-8"))?;
+        return absolute_path(&value);
     }
     Utf8PathBuf::from_path_buf(metadata.target_directory.clone().into_std_path_buf())
         .map_err(|_| anyhow!("target directory is not valid UTF-8"))
+}
+
+fn absolute_path(path: &Utf8Path) -> Result<Utf8PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Utf8PathBuf::from_path_buf(std::env::current_dir()?.join(path.as_std_path()))
+        .map_err(|_| anyhow!("path is not valid UTF-8: {path}"))
 }
 
 fn rustc_cfg(target: &str, cpu: Option<&str>) -> Result<String> {
@@ -992,7 +1025,7 @@ fn build_loader(loader_dir: &Utf8Path, target: &str, profile: &str) -> Result<Ut
 
 fn loader_rustflags(target: &str) -> &'static str {
     if target.contains("-musl") {
-        "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-static"
+        "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-nostartfiles -C link-arg=-static"
     } else {
         "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-arg=-nostartfiles -C link-arg=-static"
     }
@@ -1457,16 +1490,6 @@ fn detect_host(initial: &stack::InitialStack) -> HostInfo {
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn detect_aarch64_identity_from_cpuinfo() -> CpuIdentity {
-    let midr = unsafe { read_midr_el1() };
-    if midr != 0 {
-        return CpuIdentity::Aarch64 {
-            implementer: ((midr >> 24) & 0xff) as u16,
-            part: ((midr >> 4) & 0xfff) as u16,
-            variant: ((midr >> 20) & 0xf) as u8,
-            revision: (midr & 0xf) as u8,
-        };
-    }
-
     let midr = unsafe { read_small_file_hex(
         b"/sys/devices/system/cpu/cpu0/regs/identification/midr_el1\0".as_ptr(),
     ) };
@@ -1489,10 +1512,16 @@ unsafe fn detect_aarch64_identity_from_cpuinfo() -> CpuIdentity {
     if n <= 0 {
         return CpuIdentity::Unknown;
     }
-    parse_aarch64_cpuinfo(&buf[..n as usize])
+    let identity = parse_aarch64_cpuinfo(&buf[..n as usize]);
+    if identity != CpuIdentity::Unknown {
+        return identity;
+    }
+
+    CpuIdentity::Unknown
 }
 
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 unsafe fn read_midr_el1() -> u32 {
     let value: u64;
     unsafe { core::arch::asm!("mrs {}, MIDR_EL1", out(reg) value, options(nostack, nomem)); }
@@ -2146,6 +2175,78 @@ mod tests {
     }
 
     #[test]
+    fn cargo_args_recognize_release_aliases() {
+        let args = strings(&["-r"]);
+        let got = parse_cargo_args(&args);
+        assert!(got.release);
+        assert_eq!(got.forwarded, args);
+
+        let args = strings(&["--profile", "release"]);
+        let got = parse_cargo_args(&args);
+        assert!(got.release);
+        assert_eq!(got.forwarded, args);
+
+        let args = strings(&["--profile=release"]);
+        let got = parse_cargo_args(&args);
+        assert!(got.release);
+        assert_eq!(got.forwarded, args);
+    }
+
+    #[test]
+    fn cargo_args_consumes_target_dir_without_forwarding_duplicate() {
+        let args = strings(&[
+            "--target-dir",
+            "custom-target",
+            "--features",
+            "fast",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+        ]);
+        let got = parse_cargo_args(&args);
+        assert_eq!(
+            got.target_dir.as_deref(),
+            Some(Utf8Path::new("custom-target"))
+        );
+        assert_eq!(got.target.as_deref(), Some("x86_64-unknown-linux-gnu"));
+        assert_eq!(
+            got.forwarded,
+            strings(&["--features", "fast", "--target", "x86_64-unknown-linux-gnu"])
+        );
+
+        let args = strings(&["--target-dir=custom-target", "--release"]);
+        let got = parse_cargo_args(&args);
+        assert_eq!(
+            got.target_dir.as_deref(),
+            Some(Utf8Path::new("custom-target"))
+        );
+        assert_eq!(got.forwarded, strings(&["--release"]));
+    }
+
+    #[test]
+    fn cargo_args_consumes_manifest_path_without_forwarding_duplicate() {
+        let args = strings(&["--manifest-path", "examples/app/Cargo.toml", "--release"]);
+        let got = parse_cargo_args(&args);
+        assert_eq!(
+            got.manifest_path.as_deref(),
+            Some(Utf8Path::new("examples/app/Cargo.toml"))
+        );
+        assert_eq!(got.forwarded, strings(&["--release"]));
+    }
+
+    #[test]
+    fn musl_loader_rustflags_skip_startup_files() {
+        let flags = loader_rustflags("aarch64-unknown-linux-musl");
+        assert!(flags.contains("-C link-arg=-nostartfiles"));
+    }
+
+    #[test]
+    fn generated_aarch64_loader_does_not_read_midr_el1_before_fallbacks() {
+        let source = generated_main("aarch64-unknown-linux-musl");
+        assert!(source.contains("read_small_file_hex"));
+        assert!(!source.contains("let midr = unsafe { read_midr_el1() };"));
+    }
+
+    #[test]
     fn generic_required_mask_is_empty_but_rank_mask_is_recorded() {
         let rank = feature_mask(&["avx2".into()]).unwrap();
         assert_eq!(FeatureMask::EMPTY.count(), 0);
@@ -2327,5 +2428,9 @@ mod tests {
                 .unwrap();
             assert!(!String::from_utf8(dyns.stdout).unwrap().contains("NEEDED"));
         }
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
     }
 }
