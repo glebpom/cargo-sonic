@@ -123,6 +123,20 @@ cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- \
   sonic --target-cpus=x86-64-v3,znver5 build --package my-crate --bin worker
 ```
 
+## Auditable Binaries
+
+Pass `--auditable` to embed one cargo-auditable-compatible dependency list in
+the final fat binary:
+
+```bash
+cargo sonic --target-cpus=x86-64-v3,znver5 --auditable build --release
+```
+
+The audit data is collected once from `cargo metadata`, zlib-compressed, and
+linked into the generated loader as a non-loaded ELF `.dep-v0` section. Payload
+binaries are not individually annotated; the final executable carries the
+dependency list for the selected package.
+
 ## Probe
 
 Use `cargo sonic probe` to inspect the current host without building payloads:
