@@ -2,7 +2,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::{Artifact, Message, MetadataCommand, Package};
 use clap::{Arg, ArgAction, Command as ClapCommand};
-use serde::Deserialize;
 use sonic_loader::arch_x86_64;
 use sonic_loader::feature_mask::{Feature, FeatureMask, feature_by_name};
 use sonic_loader::select::{
@@ -11,12 +10,14 @@ use sonic_loader::select::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone)]
 pub struct BuildOptions {
     pub cargo_args: Vec<String>,
     pub manifest_path: Option<Utf8PathBuf>,
+    pub target_cpus: Vec<String>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -28,13 +29,7 @@ pub struct BuildOutput {
 #[derive(Debug, Clone)]
 pub struct ProbeOptions {
     pub cargo_args: Vec<String>,
-    pub manifest_path: Option<Utf8PathBuf>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-struct SonicMetadata {
-    target_cpus: Option<Vec<String>>,
+    pub target_cpus: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,7 +77,7 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
         .exec()
         .context("failed to read cargo metadata")?;
     let package = select_package(&metadata, cargo_args.package.as_deref())?;
-    let configured_cpus = normalize_target_cpus(effective_target_cpus(&metadata, package)?)?;
+    let configured_cpus = normalize_target_cpus(effective_target_cpus(options.target_cpus)?)?;
 
     let target = match cargo_args.target.clone() {
         Some(target) => target,
@@ -139,6 +134,7 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
         } else {
             feature_mask(&required_feature_names)?
         };
+        print_variant_build_prelude(cpu);
         let artifact = build_payload_variant(
             package,
             &cargo_args,
@@ -176,20 +172,7 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
 
 pub fn probe(options: ProbeOptions) -> Result<()> {
     let cargo_args = parse_cargo_args(&options.cargo_args);
-    let manifest_path = options
-        .manifest_path
-        .clone()
-        .or_else(|| cargo_args.manifest_path.clone());
-    let mut metadata_cmd = MetadataCommand::new();
-    metadata_cmd.no_deps();
-    if let Some(path) = &manifest_path {
-        metadata_cmd.manifest_path(path);
-    }
-    let metadata = metadata_cmd
-        .exec()
-        .context("failed to read cargo metadata")?;
-    let package = select_package(&metadata, cargo_args.package.as_deref())?;
-    let configured_cpus = normalize_target_cpus(effective_target_cpus(&metadata, package)?)?;
+    let configured_cpus = normalize_target_cpus(effective_target_cpus(options.target_cpus)?)?;
 
     let target = match cargo_args.target.clone() {
         Some(target) => target,
@@ -254,21 +237,24 @@ fn parse_cargo_args(args: &[String]) -> CargoArgs {
     let matches = cargo_args_command()
         .try_get_matches_from(known_cargo_args(args))
         .expect("cargo args parser uses ignore_errors");
-    let profile = matches.get_one::<String>("profile").map(String::as_str);
-    let release = matches.get_flag("release") || profile == Some("release");
+    let profile = last_match_value(&matches, "profile");
+    let release = matches.get_flag("release") || profile.as_deref() == Some("release");
     CargoArgs {
         release,
-        target: matches.get_one::<String>("target").cloned(),
-        target_dir: matches
-            .get_one::<String>("target-dir")
-            .map(Utf8PathBuf::from),
-        bin: matches.get_one::<String>("bin").cloned(),
-        package: matches.get_one::<String>("package").cloned(),
-        manifest_path: matches
-            .get_one::<String>("manifest-path")
-            .map(Utf8PathBuf::from),
+        target: last_match_value(&matches, "target"),
+        target_dir: last_match_value(&matches, "target-dir").map(Utf8PathBuf::from),
+        bin: last_match_value(&matches, "bin"),
+        package: last_match_value(&matches, "package"),
+        manifest_path: last_match_value(&matches, "manifest-path").map(Utf8PathBuf::from),
         forwarded: forwarded_cargo_args(args),
     }
+}
+
+fn last_match_value(matches: &clap::ArgMatches, id: &str) -> Option<String> {
+    matches
+        .get_many::<String>(id)?
+        .last()
+        .map(ToString::to_string)
 }
 
 fn known_cargo_args(args: &[String]) -> Vec<String> {
@@ -312,12 +298,16 @@ fn cargo_args_command() -> ClapCommand {
                 .short('r')
                 .action(ArgAction::SetTrue),
         )
-        .arg(Arg::new("profile").long("profile").num_args(1))
-        .arg(Arg::new("target").long("target").num_args(1))
-        .arg(Arg::new("target-dir").long("target-dir").num_args(1))
-        .arg(Arg::new("bin").long("bin").num_args(1))
-        .arg(Arg::new("package").long("package").short('p').num_args(1))
-        .arg(Arg::new("manifest-path").long("manifest-path").num_args(1))
+        .arg(repeated_arg("profile").long("profile"))
+        .arg(repeated_arg("target").long("target"))
+        .arg(repeated_arg("target-dir").long("target-dir"))
+        .arg(repeated_arg("bin").long("bin"))
+        .arg(repeated_arg("package").long("package").short('p'))
+        .arg(repeated_arg("manifest-path").long("manifest-path"))
+}
+
+fn repeated_arg(name: &'static str) -> Arg {
+    Arg::new(name).num_args(1).action(ArgAction::Append)
 }
 
 fn forwarded_cargo_args(args: &[String]) -> Vec<String> {
@@ -336,6 +326,11 @@ fn forwarded_cargo_args(args: &[String]) -> Vec<String> {
 
 fn leaked_str(value: &str) -> &'static str {
     Box::leak(value.to_string().into_boxed_str())
+}
+
+fn print_variant_build_prelude(target_cpu: &str) {
+    eprintln!("cargo-sonic: build to {target_cpu} CPU");
+    let _ = std::io::stderr().flush();
 }
 
 fn print_probe_report(target: &str, host: HostInfo, variants: &[ProbeVariant], selected: &str) {
@@ -598,32 +593,21 @@ fn select_package<'a>(
     bail!("cannot identify package; pass --package");
 }
 
-fn effective_target_cpus(
-    metadata: &cargo_metadata::Metadata,
-    package: &Package,
-) -> Result<Vec<String>> {
-    if let Some(v) = package.metadata.get("sonic") {
-        let sonic: SonicMetadata = serde_json::from_value(v.clone())?;
-        return sonic
-            .target_cpus
-            .context("package.metadata.sonic.target-cpus must exist");
+fn effective_target_cpus(target_cpus: Vec<String>) -> Result<Vec<String>> {
+    if target_cpus.is_empty() {
+        bail!("pass --target-cpus=<cpu>[,<cpu>...]");
     }
-    if let Some(v) = metadata.workspace_metadata.get("sonic") {
-        let sonic: SonicMetadata = serde_json::from_value(v.clone())?;
-        return sonic
-            .target_cpus
-            .context("workspace.metadata.sonic.target-cpus must exist");
-    }
-    bail!("target-cpus must exist under [package.metadata.sonic]");
+    Ok(target_cpus)
 }
 
 fn normalize_target_cpus(mut cpus: Vec<String>) -> Result<Vec<String>> {
     if cpus.iter().any(|cpu| cpu == "native") {
         bail!("target-cpu \"native\" is rejected because cargo-sonic builds portable artifacts");
     }
-    if !cpus.iter().any(|cpu| cpu == "generic") {
-        cpus.insert(0, "generic".to_string());
+    if cpus.iter().any(|cpu| cpu == "generic") {
+        bail!("target-cpu \"generic\" is implicit; remove it from --target-cpus");
     }
+    cpus.insert(0, "generic".to_string());
     Ok(cpus)
 }
 
@@ -1024,8 +1008,8 @@ fn build_loader(loader_dir: &Utf8Path, target: &str, profile: &str) -> Result<Ut
 }
 
 fn loader_rustflags(target: &str) -> &'static str {
-    if target.contains("-musl") {
-        "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-nostartfiles -C link-arg=-static"
+    if target.starts_with("x86_64-") {
+        "-C panic=abort -C code-model=large -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-nostartfiles -C link-arg=-static"
     } else {
         "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-arg=-nostartfiles -C link-arg=-static"
     }
@@ -1035,6 +1019,21 @@ fn generated_manifest(variants: &[VariantBuild]) -> String {
     let mut out = String::new();
     out.push_str("use crate::feature_mask::FeatureMask;\nuse crate::select::TargetKind;\n\n");
     out.push_str("pub static ENV_ENABLED: &[u8] = b\"CARGO_SONIC_ENABLED=1\\0\";\n\n");
+    out.push_str(
+        "#[repr(align(131072))]\npub struct AlignedPayload<const N: usize>(pub [u8; N]);\n\n",
+    );
+    for v in variants {
+        let payload_len = fs::metadata(&v.artifact)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "static PAYLOAD_{}: AlignedPayload<{}> = AlignedPayload(*include_bytes!(\"../payloads/{}.elf\"));\n",
+            sanitize_cpu(&v.target_cpu).to_ascii_uppercase(),
+            payload_len,
+            sanitize_cpu(&v.target_cpu)
+        ));
+    }
+    out.push('\n');
     out.push_str("pub struct Variant {\n    pub target_cpu: &'static str,\n    pub required_features: FeatureMask,\n    pub rank_features: FeatureMask,\n    pub rank_feature_count: u16,\n    pub feature_tier: u8,\n    pub target_kind: TargetKind,\n    pub env_selected_target_cpu: &'static [u8],\n    pub env_selected_flags: &'static [u8],\n    pub payload: &'static [u8],\n}\n\n");
     out.push_str("pub static VARIANTS: &[Variant] = &[\n");
     for v in variants {
@@ -1069,8 +1068,8 @@ fn generated_manifest(variants: &[VariantBuild]) -> String {
             escape_bytes(&flags)
         ));
         out.push_str(&format!(
-            "        payload: include_bytes!(\"../payloads/{}.elf\"),\n",
-            sanitize_cpu(&v.target_cpu)
+            "        payload: &PAYLOAD_{}.0,\n",
+            sanitize_cpu(&v.target_cpu).to_ascii_uppercase()
         ));
         out.push_str("    },\n");
     }
@@ -1275,8 +1274,169 @@ fn generic_meta<'a>(variants: &'a [VariantMeta]) -> &'a VariantMeta {
     &variants[0]
 }
 
+#[repr(C)]
+struct FileCloneRange {
+    src_fd: i64,
+    src_offset: u64,
+    src_length: u64,
+    dest_offset: u64,
+}
+
+unsafe fn exec_reflink_tmpfile(selected: &Variant, initial: &stack::InitialStack) -> isize {
+    unsafe {
+        let exe = linux_sys::openat(linux_sys::AT_FDCWD, b"/proc/self/exe\0".as_ptr(), 0, 0);
+        if exe < 0 {
+            return exe;
+        }
+        let offset = payload_file_offset(
+            exe,
+            selected.payload.as_ptr() as usize,
+            selected.payload.len(),
+            initial.phdr,
+        );
+        if offset == 0 {
+            let _ = linux_sys::close(exe);
+            return -1;
+        }
+        let tmp = linux_sys::openat(
+            linux_sys::AT_FDCWD,
+            b".\0".as_ptr(),
+            linux_sys::O_TMPFILE | linux_sys::O_RDWR,
+            0o700,
+        );
+        if tmp < 0 {
+            let _ = linux_sys::close(exe);
+            return tmp;
+        }
+        let clone_len = round_up_128k(selected.payload.len());
+        if linux_sys::ftruncate(tmp, clone_len) < 0 {
+            let _ = linux_sys::close(exe);
+            let _ = linux_sys::close(tmp);
+            return -1;
+        }
+        let mut range = FileCloneRange {
+            src_fd: exe as i64,
+            src_offset: offset as u64,
+            src_length: clone_len as u64,
+            dest_offset: 0,
+        };
+        let cloned = linux_sys::ioctl(tmp, linux_sys::FICLONERANGE, &mut range as *mut _ as usize);
+        let _ = linux_sys::close(exe);
+        if cloned < 0 {
+            let _ = linux_sys::close(tmp);
+            return cloned;
+        }
+        let read_fd = reopen_fd_readonly(tmp);
+        let _ = linux_sys::close(tmp);
+        if read_fd < 0 {
+            return read_fd;
+        }
+        let envp = stack::build_envp(initial, generated_manifest::ENV_ENABLED, selected.env_selected_target_cpu, selected.env_selected_flags);
+        if envp.is_null() {
+            let _ = linux_sys::close(read_fd);
+            return -1;
+        }
+        linux_sys::execveat(read_fd, b"\0".as_ptr(), initial.argv, envp, linux_sys::AT_EMPTY_PATH)
+    }
+}
+
+unsafe fn reopen_fd_readonly(fd: isize) -> isize {
+    unsafe {
+        let mut path = [0u8; 32];
+        let prefix = b"/proc/self/fd/";
+        let mut i = 0;
+        while i < prefix.len() {
+            path[i] = prefix[i];
+            i += 1;
+        }
+        let mut digits = [0u8; 20];
+        let mut n = fd as usize;
+        let mut count = 0;
+        if n == 0 {
+            digits[0] = b'0';
+            count = 1;
+        } else {
+            while n > 0 {
+                digits[count] = b'0' + (n % 10) as u8;
+                n /= 10;
+                count += 1;
+            }
+        }
+        while count > 0 {
+            count -= 1;
+            path[i] = digits[count];
+            i += 1;
+        }
+        path[i] = 0;
+        linux_sys::openat(linux_sys::AT_FDCWD, path.as_ptr(), linux_sys::O_RDONLY, 0)
+    }
+}
+
+fn round_up_128k(len: usize) -> usize {
+    (len + 131071) & !131071
+}
+
+unsafe fn payload_file_offset(exe: isize, payload_addr: usize, payload_len: usize, at_phdr: usize) -> usize {
+    unsafe {
+        let mut ehdr = [0u8; 64];
+        if linux_sys::pread(exe, ehdr.as_mut_ptr(), ehdr.len(), 0) != ehdr.len() as isize {
+            return 0;
+        }
+        if ehdr[0] != 0x7f || ehdr[1] != b'E' || ehdr[2] != b'L' || ehdr[3] != b'F' || ehdr[4] != 2 || ehdr[5] != 1 {
+            return 0;
+        }
+        let elf_type = read_u16(&ehdr, 16);
+        let phoff = read_u64(&ehdr, 32) as usize;
+        let phentsize = read_u16(&ehdr, 54) as usize;
+        let phnum = read_u16(&ehdr, 56) as usize;
+        if phoff == 0 || phentsize < 56 || phnum == 0 {
+            return 0;
+        }
+        let load_bias = if elf_type == 3 { at_phdr.wrapping_sub(phoff) } else { 0 };
+        let payload_vaddr = payload_addr.wrapping_sub(load_bias);
+        let mut phdr = [0u8; 64];
+        if phentsize > phdr.len() {
+            return 0;
+        }
+        let mut i = 0;
+        while i < phnum {
+            let offset = phoff + i * phentsize;
+            if linux_sys::pread(exe, phdr.as_mut_ptr(), phentsize, offset) != phentsize as isize {
+                return 0;
+            }
+            if read_u32(&phdr, 0) == 1 {
+                let file_offset = read_u64(&phdr, 8) as usize;
+                let vaddr = read_u64(&phdr, 16) as usize;
+                let filesz = read_u64(&phdr, 32) as usize;
+                let relative = payload_vaddr.wrapping_sub(vaddr);
+                if payload_vaddr >= vaddr && relative <= filesz && payload_len <= filesz - relative {
+                    return file_offset + (payload_vaddr - vaddr);
+                }
+            }
+            i += 1;
+        }
+        0
+    }
+}
+
+fn read_u16(buf: &[u8], offset: usize) -> u16 {
+    (buf[offset] as u16) | ((buf[offset + 1] as u16) << 8)
+}
+
+fn read_u32(buf: &[u8], offset: usize) -> u32 {
+    (buf[offset] as u32)
+        | ((buf[offset + 1] as u32) << 8)
+        | ((buf[offset + 2] as u32) << 16)
+        | ((buf[offset + 3] as u32) << 24)
+}
+
+fn read_u64(buf: &[u8], offset: usize) -> u64 {
+    (read_u32(buf, offset) as u64) | ((read_u32(buf, offset + 4) as u64) << 32)
+}
+
 unsafe fn exec_payload(selected: &Variant, initial: &stack::InitialStack) -> ! {
     unsafe {
+        let _ = exec_reflink_tmpfile(selected, initial);
         let fd = linux_sys::memfd_create_best_effort(b"cargo-sonic-payload\0".as_ptr());
         if fd < 0 {
             linux_sys::exit(111);
@@ -1724,14 +1884,24 @@ unsafe fn detect_x86_identity() -> CpuIdentity {
 
 fn generated_linux_sys() -> &'static str {
     r#"pub const AT_EMPTY_PATH: usize = 0x1000;
+pub const AT_FDCWD: isize = -100;
+pub const O_RDONLY: usize = 0;
+pub const O_RDWR: usize = 2;
+pub const O_TMPFILE: usize = 0x410000;
+pub const FICLONERANGE: usize = 0x4020940d;
 #[cfg(target_arch = "x86_64")]
 const SYS_WRITE: usize = 1;
 #[cfg(target_arch = "x86_64")]
 const SYS_READ: usize = 0;
 #[cfg(target_arch = "x86_64")]
+const SYS_PREAD64: usize = 17;
+#[cfg(target_arch = "x86_64")]
+const SYS_IOCTL: usize = 16;
 const SYS_CLOSE: usize = 3;
 #[cfg(target_arch = "x86_64")]
 const SYS_MMAP: usize = 9;
+#[cfg(target_arch = "x86_64")]
+const SYS_FTRUNCATE: usize = 77;
 #[cfg(target_arch = "x86_64")]
 const SYS_EXIT: usize = 60;
 #[cfg(target_arch = "x86_64")]
@@ -1740,7 +1910,6 @@ const SYS_OPENAT: usize = 257;
 const SYS_MEMFD_CREATE: usize = 319;
 #[cfg(target_arch = "x86_64")]
 const SYS_EXECVEAT: usize = 322;
-pub const AT_FDCWD: isize = -100;
 const PROT_READ: usize = 1;
 const PROT_WRITE: usize = 2;
 const MAP_PRIVATE: usize = 2;
@@ -1754,9 +1923,15 @@ const SYS_WRITE: usize = 64;
 #[cfg(target_arch = "aarch64")]
 const SYS_READ: usize = 63;
 #[cfg(target_arch = "aarch64")]
+const SYS_PREAD64: usize = 67;
+#[cfg(target_arch = "aarch64")]
+const SYS_IOCTL: usize = 29;
+#[cfg(target_arch = "aarch64")]
 const SYS_CLOSE: usize = 57;
 #[cfg(target_arch = "aarch64")]
 const SYS_MMAP: usize = 222;
+#[cfg(target_arch = "aarch64")]
+const SYS_FTRUNCATE: usize = 46;
 #[cfg(target_arch = "aarch64")]
 const SYS_EXIT: usize = 93;
 #[cfg(target_arch = "aarch64")]
@@ -1815,8 +1990,20 @@ pub unsafe fn read(fd: isize, ptr: *mut u8, len: usize) -> isize {
     unsafe { syscall6(SYS_READ, fd as usize, ptr as usize, len, 0, 0, 0) }
 }
 
+pub unsafe fn pread(fd: isize, ptr: *mut u8, len: usize, offset: usize) -> isize {
+    unsafe { syscall6(SYS_PREAD64, fd as usize, ptr as usize, len, offset, 0, 0) }
+}
+
+pub unsafe fn ioctl(fd: isize, request: usize, arg: usize) -> isize {
+    unsafe { syscall6(SYS_IOCTL, fd as usize, request, arg, 0, 0, 0) }
+}
+
 pub unsafe fn openat(dirfd: isize, path: *const u8, flags: usize, mode: usize) -> isize {
     unsafe { syscall6(SYS_OPENAT, dirfd as usize, path as usize, flags, mode, 0, 0) }
+}
+
+pub unsafe fn ftruncate(fd: isize, len: usize) -> isize {
+    unsafe { syscall6(SYS_FTRUNCATE, fd as usize, len, 0, 0, 0, 0) }
 }
 
 pub unsafe fn close(fd: isize) -> isize {
@@ -1842,6 +2029,7 @@ fn generated_stack() -> &'static str {
     r#"use crate::linux_sys;
 
 const AT_NULL: usize = 0;
+const AT_PHDR: usize = 3;
 const AT_HWCAP: usize = 16;
 const AT_HWCAP2: usize = 26;
 const AT_HWCAP3: usize = 29;
@@ -1851,6 +2039,7 @@ pub struct InitialStack {
     pub argv: *const *const u8,
     pub envp: *const *const u8,
     pub envc: usize,
+    pub phdr: usize,
     pub hwcap: usize,
     pub hwcap2: usize,
     pub hwcap3: usize,
@@ -1867,18 +2056,20 @@ impl InitialStack {
                 envc += 1;
             }
             let mut aux = envp.add(envc + 1) as *const usize;
+            let mut phdr = 0;
             let mut hwcap = 0;
             let mut hwcap2 = 0;
             let mut hwcap3 = 0;
             while *aux != AT_NULL {
                 let key = *aux;
                 let val = *aux.add(1);
+                if key == AT_PHDR { phdr = val; }
                 if key == AT_HWCAP { hwcap = val; }
                 if key == AT_HWCAP2 { hwcap2 = val; }
                 if key == AT_HWCAP3 { hwcap3 = val; }
                 aux = aux.add(2);
             }
-            Self { argc, argv, envp, envc, hwcap, hwcap2, hwcap3 }
+            Self { argc, argv, envp, envc, phdr, hwcap, hwcap2, hwcap3 }
         }
     }
 }
@@ -2234,9 +2425,42 @@ mod tests {
     }
 
     #[test]
+    fn cargo_args_tolerate_repeated_cargo_selectors() {
+        let args = strings(&[
+            "--manifest-path",
+            "tests/fixtures/env-printer/Cargo.toml",
+            "--bin",
+            "foo",
+            "--bin",
+            "bar",
+            "-p",
+            "one",
+            "-p",
+            "two",
+        ]);
+        let got = parse_cargo_args(&args);
+        assert_eq!(
+            got.manifest_path.as_deref(),
+            Some(Utf8Path::new("tests/fixtures/env-printer/Cargo.toml"))
+        );
+        assert_eq!(got.bin.as_deref(), Some("bar"));
+        assert_eq!(got.package.as_deref(), Some("two"));
+        assert_eq!(
+            got.forwarded,
+            strings(&["--bin", "foo", "--bin", "bar", "-p", "one", "-p", "two"])
+        );
+    }
+
+    #[test]
     fn musl_loader_rustflags_skip_startup_files() {
         let flags = loader_rustflags("aarch64-unknown-linux-musl");
         assert!(flags.contains("-C link-arg=-nostartfiles"));
+    }
+
+    #[test]
+    fn x86_64_loader_rustflags_use_large_code_model() {
+        let flags = loader_rustflags("x86_64-unknown-linux-gnu");
+        assert!(flags.contains("-C code-model=large"));
     }
 
     #[test]
@@ -2276,6 +2500,15 @@ mod tests {
         assert_eq!(
             normalize_target_cpus(vec!["haswell".into()]).unwrap(),
             vec!["generic", "haswell"]
+        );
+    }
+
+    #[test]
+    fn explicit_generic_target_cpu_is_rejected() {
+        let err = normalize_target_cpus(vec!["generic".into()]).unwrap_err();
+        assert!(
+            err.to_string().contains("generic"),
+            "unexpected error: {err:#}"
         );
     }
 
@@ -2400,11 +2633,13 @@ mod tests {
         let output = build(BuildOptions {
             cargo_args: Vec::new(),
             manifest_path: Some(manifest),
+            target_cpus: vec!["x86-64".into()],
         })
         .unwrap();
         let run = Command::new(&output.final_binary)
             .arg("one")
             .env("KEEP_ME", "yes")
+            .env("CARGO_SONIC_ENABLE", "false")
             .env("CARGO_SONIC_ENABLED", "old")
             .output()
             .unwrap();

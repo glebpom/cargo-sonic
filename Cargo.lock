@@ -408,11 +408,8 @@ dependencies = [
  "camino",
  "cargo_metadata",
  "clap",
- "serde",
- "serde_json",
  "sonic-loader",
  "tempfile",
- "toml",
 ]
 
 [[package]]

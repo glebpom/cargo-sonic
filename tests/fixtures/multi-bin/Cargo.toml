@@ -3,7 +3,4 @@ name = "multi-bin"
 version = "0.1.0"
 edition = "2024"
 
-[package.metadata.sonic]
-target-cpus = ["generic"]
-
 [workspace]

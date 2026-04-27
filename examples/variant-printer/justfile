@@ -8,7 +8,7 @@ default: build
 
 # Build the local cargo-sonic tool and then build this example as a fat executable.
 build:
-    cargo run --manifest-path {{sonic_manifest}} -- sonic build --release
+    cargo run --manifest-path {{sonic_manifest}} -- sonic --target-cpus=x86-64-v3,znver5,raptorlake build --release
 
 # Run the generated fat executable. The loader is silent; this output comes from the app.
 run: build

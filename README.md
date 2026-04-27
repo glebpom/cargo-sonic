@@ -15,7 +15,7 @@ variant through environment variables.
 
 This repository currently has a working Linux x86_64/AArch64 vertical slice:
 
-- Cargo metadata config under `[package.metadata.sonic]`
+- CLI target CPU selection through `--target-cpus`
 - implicit `generic` payload, always built
 - target-cpu validation through `rustc --print target-cpus`
 - payload builds with isolated target directories
@@ -32,21 +32,38 @@ This repository currently has a working Linux x86_64/AArch64 vertical slice:
 Known incomplete areas:
 
 - Build-time warning analysis is still partial.
-- `sonic-survey` is a placeholder.
+
+## Startup Cost
+
+`cargo-sonic` optimizes code generation for the selected CPU, not process
+startup. The generated executable is a selector plus embedded payload binaries,
+so startup can be slower than the plain binary, especially for very large debug
+builds or short-lived CLI tools.
+
+On reflink-capable filesystems, the loader tries to execute the selected payload
+through an unnamed cloned tmpfile. If that fast path is unavailable, it falls
+back to copying the selected payload into a `memfd` before `execveat`, and that
+copy cost is proportional to the payload size.
+
+Benchmark before using `cargo-sonic` for startup-sensitive commands. It is a
+better fit for servers, daemons, and other long-running applications where the
+one-time startup cost is amortized.
 
 ## Run Locally
 
 From a target crate directory:
 
 ```bash
-cargo run --manifest-path /path/to/cargo-sonic/crates/cargo-sonic/Cargo.toml -- sonic build
+cargo run --manifest-path /path/to/cargo-sonic/crates/cargo-sonic/Cargo.toml -- \
+  sonic --target-cpus=x86-64-v3,znver5 build
 ```
 
 From this repository root, build the included example by passing the target
 crate manifest through Cargo's normal `--manifest-path` flag:
 
 ```bash
-cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- sonic build \
+cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- \
+  sonic --target-cpus=x86-64-v3,znver5,raptorlake build \
   --manifest-path examples/variant-printer/Cargo.toml
 ```
 
@@ -71,26 +88,22 @@ For example:
 examples/variant-printer/target/sonic/x86_64-unknown-linux-gnu/debug/sonic-variant-printer
 ```
 
-## Configuration
+## Target CPUs
 
-Configure variants in `Cargo.toml`:
+Choose variants at build time with `--target-cpus`:
 
-```toml
-[package.metadata.sonic]
-target-cpus = [
-  "x86-64-v3",
-  "raptorlake",
-  "znver5",
-]
+```bash
+cargo sonic --target-cpus=znver5,x86-64-v4,icelake-server build --release
 ```
 
 `generic` is implicit. It is always built and is always eligible at runtime, so
-do not list it unless you want to be explicit.
+do not list it in `--target-cpus`. Pass at least one non-generic CPU; with only
+one generic payload there is no reason to use `cargo-sonic`.
 
 Rules:
 
-- `target-cpus` must exist.
-- `generic` is added automatically.
+- `--target-cpus` is required.
+- `generic` is added automatically and rejected if listed explicitly.
 - `native` is rejected.
 - CPU names must exactly match local `rustc --print target-cpus` names.
 - Cross-architecture CPU names are skipped for the current target.
@@ -99,15 +112,19 @@ Rules:
 The target triple comes from normal Cargo arguments:
 
 ```bash
-cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- sonic build --release
-cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- sonic build --target x86_64-unknown-linux-gnu
+cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- \
+  sonic --target-cpus=x86-64-v3,znver5 build --release
+cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- \
+  sonic --target-cpus=x86-64-v3,znver5 build --target x86_64-unknown-linux-gnu
 ```
 
 Binary/package selection also uses normal Cargo arguments:
 
 ```bash
-cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- sonic build --bin server
-cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- sonic build --package my-crate --bin worker
+cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- \
+  sonic --target-cpus=x86-64-v3,znver5 build --bin server
+cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- \
+  sonic --target-cpus=x86-64-v3,znver5 build --package my-crate --bin worker
 ```
 
 ## Probe
@@ -115,14 +132,14 @@ cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- sonic build --package
 Use `cargo sonic probe` to inspect the current host without building payloads:
 
 ```bash
-cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- sonic probe \
-  --manifest-path examples/variant-printer/Cargo.toml
+cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- \
+  sonic --target-cpus=x86-64-v3,znver5,raptorlake probe
 ```
 
-The probe reads the same `[package.metadata.sonic]` configuration, asks rustc
-for each configured target-cpu's feature contract, detects the current CPU, and
-prints which configured target-cpus are eligible. It uses the same selection
-logic as the loader, but runs as a normal `std` command.
+The probe uses the same `--target-cpus` list, asks rustc for each target-cpu's
+feature contract, detects the current CPU, and prints which target-cpus are
+eligible. It uses the same selection logic as the loader, but runs as a normal
+`std` command.
 
 ## Runtime Environment
 

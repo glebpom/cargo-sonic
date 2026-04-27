@@ -15,6 +15,9 @@ enum CargoSonicCommand {
 
 #[derive(Parser)]
 struct Sonic {
+    #[arg(long, value_delimiter = ',')]
+    target_cpus: Vec<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -41,19 +44,22 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         CargoSonicCommand::Sonic(Sonic {
+            target_cpus,
             command: Command::Build(build),
         }) => sonic_build::build(sonic_build::BuildOptions {
             cargo_args: build.cargo_args,
             manifest_path: None,
+            target_cpus,
         })
         .map(|output| {
             println!("{}", output.final_binary);
         }),
         CargoSonicCommand::Sonic(Sonic {
+            target_cpus,
             command: Command::Probe(probe),
         }) => sonic_build::probe(sonic_build::ProbeOptions {
             cargo_args: probe.cargo_args,
-            manifest_path: None,
+            target_cpus,
         }),
     }
     .map_err(|err| {

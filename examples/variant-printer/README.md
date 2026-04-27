@@ -1,7 +1,8 @@
 # sonic-variant-printer
 
-Minimal `cargo-sonic` example. `generic` is implicit and is always built, so it is
-not listed in `Cargo.toml`.
+Minimal `cargo-sonic` example. The target CPU variants are selected by the
+`justfile` build command with `--target-cpus`; they are not stored in
+`Cargo.toml`.
 
 Build the fat executable:
 

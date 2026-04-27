@@ -620,24 +620,14 @@ fn build_qemu_test_app(root: &Path, asset_dir: &Path, arch: &SystemArch) -> Resu
     fs::create_dir_all(project.join("src"))?;
     fs::write(
         project.join("Cargo.toml"),
-        format!(
-            r#"[package]
+        r#"[package]
 name = "sonic-qemu-app"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
-[package.metadata.sonic]
-target-cpus = [{}]
-
 [workspace]
 "#,
-            variants
-                .iter()
-                .map(|variant| format!("{variant:?}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
     )?;
     fs::write(
         project.join("src/main.rs"),
@@ -667,6 +657,7 @@ target-cpus = [{}]
     if arch.target == "aarch64-unknown-linux-musl" {
         command.env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER", "rust-lld");
     }
+    let target_cpus = variants.join(",");
     let output = command
         .args([
             "run",
@@ -674,6 +665,8 @@ target-cpus = [{}]
             "cargo-sonic",
             "--",
             "sonic",
+            "--target-cpus",
+            &target_cpus,
             "build",
             "--release",
             "--target",
