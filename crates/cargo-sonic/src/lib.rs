@@ -717,7 +717,7 @@ pub fn parse_target_features_from_rustc_cfg(cfg: &str) -> Vec<String> {
 pub fn filter_runtime_features(features: &[String]) -> Vec<String> {
     features
         .iter()
-        .filter(|feature| !matches!(feature.as_str(), "crt-static" | "x87"))
+        .filter(|feature| !matches!(feature.as_str(), "crt-static" | "lahfsahf" | "x87"))
         .cloned()
         .collect()
 }
@@ -2613,15 +2613,21 @@ mod tests {
     #[test]
     fn filters_non_runtime_features() {
         assert_eq!(
-            filter_runtime_features(&["crt-static".into(), "x87".into(), "avx2".into()]),
+            filter_runtime_features(&[
+                "crt-static".into(),
+                "lahfsahf".into(),
+                "x87".into(),
+                "avx2".into()
+            ]),
             vec!["avx2"]
         );
     }
 
     #[test]
-    fn skylake_style_features_with_x87_are_supported() {
+    fn skylake_style_features_with_baseline_non_runtime_features_are_supported() {
         let features = filter_runtime_features(&[
             "x87".into(),
+            "lahfsahf".into(),
             "fxsr".into(),
             "sse".into(),
             "sse2".into(),
@@ -2634,6 +2640,7 @@ mod tests {
         ]);
         unsupported_runtime_features(&features).unwrap();
         assert!(!features.iter().any(|feature| feature == "x87"));
+        assert!(!features.iter().any(|feature| feature == "lahfsahf"));
     }
 
     #[test]
