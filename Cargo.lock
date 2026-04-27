@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-sonic"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "sonic-build"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "anyhow",
  "camino",
@@ -414,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "sonic-loader"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 
 [[package]]
 name = "strsim"
@@ -697,7 +697,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "anyhow",
  "serde",
