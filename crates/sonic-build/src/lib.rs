@@ -929,7 +929,7 @@ fn generate_loader_crate(
             r#"[package]
 name = "sonic-generated-loader"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 
 [profile.dev]
 panic = "abort"
@@ -1072,6 +1072,7 @@ fn target_kind_expr(kind: TargetKind) -> String {
 fn generated_main(_target: &str) -> &'static str {
     r#"#![no_std]
 #![no_main]
+#![allow(dead_code)]
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("cargo-sonic loader supports Linux only");
@@ -1099,46 +1100,52 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     unsafe { linux_sys::exit(101) }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     let mut i = 0;
-    while i < n {
-        *dst.add(i) = *src.add(i);
-        i += 1;
+    unsafe {
+        while i < n {
+            *dst.add(i) = *src.add(i);
+            i += 1;
+        }
     }
     dst
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe extern "C" fn memset(dst: *mut u8, value: i32, n: usize) -> *mut u8 {
     let mut i = 0;
-    while i < n {
-        *dst.add(i) = value as u8;
-        i += 1;
+    unsafe {
+        while i < n {
+            *dst.add(i) = value as u8;
+            i += 1;
+        }
     }
     dst
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
     let mut i = 0;
-    while i < n {
-        let av = *a.add(i);
-        let bv = *b.add(i);
-        if av != bv {
-            return av as i32 - bv as i32;
+    unsafe {
+        while i < n {
+            let av = *a.add(i);
+            let bv = *b.add(i);
+            if av != bv {
+                return av as i32 - bv as i32;
+            }
+            i += 1;
         }
-        i += 1;
     }
     0
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe extern "C" fn bcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
-    memcmp(a, b, n)
+    unsafe { memcmp(a, b, n) }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn rust_eh_personality() {}
 
 #[cfg(target_arch = "x86_64")]
@@ -1160,9 +1167,9 @@ core::arch::global_asm!(
     entry = sym loader_entry,
 );
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe extern "C" fn loader_entry(stack: *const usize) -> ! {
-    let initial = stack::InitialStack::parse(stack);
+    let initial = unsafe { stack::InitialStack::parse(stack) };
     let host = detect_host(&initial);
     let mut metas = [VariantMeta {
         target_cpu: "",
@@ -1186,17 +1193,17 @@ unsafe extern "C" fn loader_entry(stack: *const usize) -> ! {
         };
         i += 1;
     }
-    let sonic_enabled = stack::sonic_enabled(&initial);
+    let sonic_enabled = unsafe { stack::sonic_enabled(&initial) };
     let selected_meta = if sonic_enabled {
         select::select_variant(host, &metas[..count])
     } else {
         generic_meta(&metas[..count])
     };
-    if stack::debug_enabled(&initial) {
+    if unsafe { stack::debug_enabled(&initial) } {
         debug_selection(host, &metas[..count], selected_meta.target_cpu, sonic_enabled);
     }
     let selected = find_variant(selected_meta.target_cpu);
-    exec_payload(selected, &initial)
+    unsafe { exec_payload(selected, &initial) }
 }
 
 fn find_variant(name: &str) -> &'static Variant {
@@ -1236,19 +1243,21 @@ fn generic_meta<'a>(variants: &'a [VariantMeta]) -> &'a VariantMeta {
 }
 
 unsafe fn exec_payload(selected: &Variant, initial: &stack::InitialStack) -> ! {
-    let fd = linux_sys::memfd_create_best_effort(b"cargo-sonic-payload\0".as_ptr());
-    if fd < 0 {
-        linux_sys::exit(111);
+    unsafe {
+        let fd = linux_sys::memfd_create_best_effort(b"cargo-sonic-payload\0".as_ptr());
+        if fd < 0 {
+            linux_sys::exit(111);
+        }
+        if linux_sys::write_all(fd, selected.payload.as_ptr(), selected.payload.len()) < 0 {
+            linux_sys::exit(112);
+        }
+        let envp = stack::build_envp(initial, generated_manifest::ENV_ENABLED, selected.env_selected_target_cpu, selected.env_selected_flags);
+        if envp.is_null() {
+            linux_sys::exit(113);
+        }
+        linux_sys::execveat(fd, b"\0".as_ptr(), initial.argv, envp, linux_sys::AT_EMPTY_PATH);
+        linux_sys::exit(114)
     }
-    if linux_sys::write_all(fd, selected.payload.as_ptr(), selected.payload.len()) < 0 {
-        linux_sys::exit(112);
-    }
-    let envp = stack::build_envp(initial, generated_manifest::ENV_ENABLED, selected.env_selected_target_cpu, selected.env_selected_flags);
-    if envp.is_null() {
-        linux_sys::exit(113);
-    }
-    linux_sys::execveat(fd, b"\0".as_ptr(), initial.argv, envp, linux_sys::AT_EMPTY_PATH);
-    linux_sys::exit(114)
 }
 
 fn debug_selection(host: HostInfo, variants: &[VariantMeta], selected: &str, sonic_enabled: bool) {
@@ -1425,6 +1434,7 @@ fn debug_u16(mut value: u16) {
 }
 
 fn detect_host(initial: &stack::InitialStack) -> HostInfo {
+    let _ = initial;
     #[cfg(target_arch = "x86_64")]
     {
         HostInfo {
@@ -1447,7 +1457,7 @@ fn detect_host(initial: &stack::InitialStack) -> HostInfo {
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn detect_aarch64_identity_from_cpuinfo() -> CpuIdentity {
-    let midr = read_midr_el1();
+    let midr = unsafe { read_midr_el1() };
     if midr != 0 {
         return CpuIdentity::Aarch64 {
             implementer: ((midr >> 24) & 0xff) as u16,
@@ -1457,9 +1467,9 @@ unsafe fn detect_aarch64_identity_from_cpuinfo() -> CpuIdentity {
         };
     }
 
-    let midr = read_small_file_hex(
+    let midr = unsafe { read_small_file_hex(
         b"/sys/devices/system/cpu/cpu0/regs/identification/midr_el1\0".as_ptr(),
-    );
+    ) };
     if let Some(midr) = midr {
         return CpuIdentity::Aarch64 {
             implementer: ((midr >> 24) & 0xff) as u16,
@@ -1469,13 +1479,13 @@ unsafe fn detect_aarch64_identity_from_cpuinfo() -> CpuIdentity {
         };
     }
 
-    let fd = linux_sys::openat(linux_sys::AT_FDCWD, b"/proc/cpuinfo\0".as_ptr(), 0, 0);
+    let fd = unsafe { linux_sys::openat(linux_sys::AT_FDCWD, b"/proc/cpuinfo\0".as_ptr(), 0, 0) };
     if fd < 0 {
         return CpuIdentity::Unknown;
     }
     let mut buf = [0u8; 4096];
-    let n = linux_sys::read(fd, buf.as_mut_ptr(), buf.len());
-    let _ = linux_sys::close(fd);
+    let n = unsafe { linux_sys::read(fd, buf.as_mut_ptr(), buf.len()) };
+    let _ = unsafe { linux_sys::close(fd) };
     if n <= 0 {
         return CpuIdentity::Unknown;
     }
@@ -1485,19 +1495,19 @@ unsafe fn detect_aarch64_identity_from_cpuinfo() -> CpuIdentity {
 #[cfg(target_arch = "aarch64")]
 unsafe fn read_midr_el1() -> u32 {
     let value: u64;
-    core::arch::asm!("mrs {}, MIDR_EL1", out(reg) value, options(nostack, nomem));
+    unsafe { core::arch::asm!("mrs {}, MIDR_EL1", out(reg) value, options(nostack, nomem)); }
     value as u32
 }
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn read_small_file_hex(path: *const u8) -> Option<u32> {
-    let fd = linux_sys::openat(linux_sys::AT_FDCWD, path, 0, 0);
+    let fd = unsafe { linux_sys::openat(linux_sys::AT_FDCWD, path, 0, 0) };
     if fd < 0 {
         return None;
     }
     let mut buf = [0u8; 64];
-    let n = linux_sys::read(fd, buf.as_mut_ptr(), buf.len());
-    let _ = linux_sys::close(fd);
+    let n = unsafe { linux_sys::read(fd, buf.as_mut_ptr(), buf.len()) };
+    let _ = unsafe { linux_sys::close(fd) };
     if n <= 0 {
         return None;
     }
@@ -1640,7 +1650,7 @@ unsafe fn detect_x86() -> feature_mask::FeatureMask {
     let ld1 = core::arch::x86_64::__cpuid_count(0xd, 1);
     let l8 = core::arch::x86_64::__cpuid_count(0x80000001, 0);
     let xcr0 = if (l1.ecx & (1 << 26)) != 0 && (l1.ecx & (1 << 27)) != 0 {
-        core::arch::x86_64::_xgetbv(0)
+        unsafe { core::arch::x86_64::_xgetbv(0) }
     } else {
         0
     };
@@ -1730,66 +1740,70 @@ const SYS_EXECVEAT: usize = 281;
 #[cfg(target_arch = "x86_64")]
 unsafe fn syscall6(n: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
     let ret: isize;
-    core::arch::asm!("syscall", inlateout("rax") n as isize => ret, in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3, in("r8") a4, in("r9") a5, lateout("rcx") _, lateout("r11") _, options(nostack));
+    unsafe {
+        core::arch::asm!("syscall", inlateout("rax") n as isize => ret, in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3, in("r8") a4, in("r9") a5, lateout("rcx") _, lateout("r11") _, options(nostack));
+    }
     ret
 }
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn syscall6(n: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
     let ret: isize;
-    core::arch::asm!("svc #0", inlateout("x8") n as isize => _, inlateout("x0") a0 as isize => ret, in("x1") a1, in("x2") a2, in("x3") a3, in("x4") a4, in("x5") a5, options(nostack));
+    unsafe {
+        core::arch::asm!("svc #0", inlateout("x8") n as isize => _, inlateout("x0") a0 as isize => ret, in("x1") a1, in("x2") a2, in("x3") a3, in("x4") a4, in("x5") a5, options(nostack));
+    }
     ret
 }
 
 pub unsafe fn mmap(len: usize) -> *mut usize {
-    syscall6(SYS_MMAP, 0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, !0usize, 0) as *mut usize
+    unsafe { syscall6(SYS_MMAP, 0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, !0usize, 0) as *mut usize }
 }
 
 pub unsafe fn memfd_create_best_effort(name: *const u8) -> isize {
-    let mut fd = syscall6(SYS_MEMFD_CREATE, name as usize, MFD_ALLOW_SEALING | MFD_EXEC, 0, 0, 0, 0);
+    let mut fd = unsafe { syscall6(SYS_MEMFD_CREATE, name as usize, MFD_ALLOW_SEALING | MFD_EXEC, 0, 0, 0, 0) };
     if fd == EINVAL_NEG {
-        fd = syscall6(SYS_MEMFD_CREATE, name as usize, MFD_ALLOW_SEALING, 0, 0, 0, 0);
+        fd = unsafe { syscall6(SYS_MEMFD_CREATE, name as usize, MFD_ALLOW_SEALING, 0, 0, 0, 0) };
     }
     if fd == EINVAL_NEG {
-        fd = syscall6(SYS_MEMFD_CREATE, name as usize, 0, 0, 0, 0, 0);
+        fd = unsafe { syscall6(SYS_MEMFD_CREATE, name as usize, 0, 0, 0, 0, 0) };
     }
     fd
 }
 
 pub unsafe fn write_all(fd: isize, mut ptr: *const u8, mut len: usize) -> isize {
     while len > 0 {
-        let n = syscall6(SYS_WRITE, fd as usize, ptr as usize, len, 0, 0, 0);
+        let n = unsafe { syscall6(SYS_WRITE, fd as usize, ptr as usize, len, 0, 0, 0) };
         if n <= 0 {
             return n;
         }
-        ptr = ptr.add(n as usize);
+        ptr = unsafe { ptr.add(n as usize) };
         len -= n as usize;
     }
     0
 }
 
 pub unsafe fn read(fd: isize, ptr: *mut u8, len: usize) -> isize {
-    syscall6(SYS_READ, fd as usize, ptr as usize, len, 0, 0, 0)
+    unsafe { syscall6(SYS_READ, fd as usize, ptr as usize, len, 0, 0, 0) }
 }
 
 pub unsafe fn openat(dirfd: isize, path: *const u8, flags: usize, mode: usize) -> isize {
-    syscall6(SYS_OPENAT, dirfd as usize, path as usize, flags, mode, 0, 0)
+    unsafe { syscall6(SYS_OPENAT, dirfd as usize, path as usize, flags, mode, 0, 0) }
 }
 
 pub unsafe fn close(fd: isize) -> isize {
-    syscall6(SYS_CLOSE, fd as usize, 0, 0, 0, 0, 0)
+    unsafe { syscall6(SYS_CLOSE, fd as usize, 0, 0, 0, 0, 0) }
 }
 
 pub unsafe fn write_stderr(buf: &[u8]) {
-    let _ = write_all(2, buf.as_ptr(), buf.len());
+    let _ = unsafe { write_all(2, buf.as_ptr(), buf.len()) };
 }
 
 pub unsafe fn execveat(fd: isize, path: *const u8, argv: *const *const u8, envp: *const *const u8, flags: usize) -> isize {
-    syscall6(SYS_EXECVEAT, fd as usize, path as usize, argv as usize, envp as usize, flags, 0)
+    unsafe { syscall6(SYS_EXECVEAT, fd as usize, path as usize, argv as usize, envp as usize, flags, 0) }
 }
 
 pub unsafe fn exit(code: i32) -> ! {
-    let _ = syscall6(SYS_EXIT, code as usize, 0, 0, 0, 0, 0);
+    let _ = unsafe { syscall6(SYS_EXIT, code as usize, 0, 0, 0, 0, 0) };
     loop {}
 }
 "#
@@ -1815,126 +1829,142 @@ pub struct InitialStack {
 
 impl InitialStack {
     pub unsafe fn parse(sp: *const usize) -> Self {
-        let argc = *sp;
-        let argv = sp.add(1) as *const *const u8;
-        let mut envp = argv.add(argc + 1);
-        let mut envc = 0;
-        while !(*envp.add(envc)).is_null() {
-            envc += 1;
+        unsafe {
+            let argc = *sp;
+            let argv = sp.add(1) as *const *const u8;
+            let envp = argv.add(argc + 1);
+            let mut envc = 0;
+            while !(*envp.add(envc)).is_null() {
+                envc += 1;
+            }
+            let mut aux = envp.add(envc + 1) as *const usize;
+            let mut hwcap = 0;
+            let mut hwcap2 = 0;
+            let mut hwcap3 = 0;
+            while *aux != AT_NULL {
+                let key = *aux;
+                let val = *aux.add(1);
+                if key == AT_HWCAP { hwcap = val; }
+                if key == AT_HWCAP2 { hwcap2 = val; }
+                if key == AT_HWCAP3 { hwcap3 = val; }
+                aux = aux.add(2);
+            }
+            Self { argc, argv, envp, envc, hwcap, hwcap2, hwcap3 }
         }
-        let mut aux = envp.add(envc + 1) as *const usize;
-        let mut hwcap = 0;
-        let mut hwcap2 = 0;
-        let mut hwcap3 = 0;
-        while *aux != AT_NULL {
-            let key = *aux;
-            let val = *aux.add(1);
-            if key == AT_HWCAP { hwcap = val; }
-            if key == AT_HWCAP2 { hwcap2 = val; }
-            if key == AT_HWCAP3 { hwcap3 = val; }
-            aux = aux.add(2);
-        }
-        Self { argc, argv, envp, envc, hwcap, hwcap2, hwcap3 }
     }
 }
 
 pub unsafe fn build_envp(initial: &InitialStack, enabled: &'static [u8], cpu: &'static [u8], flags: &'static [u8]) -> *const *const u8 {
-    let mut kept = 0;
-    let mut i = 0;
-    while i < initial.envc {
-        let p = *initial.envp.add(i);
-        if !is_sonic_key(p) {
-            kept += 1;
+    unsafe {
+        let mut kept = 0;
+        let mut i = 0;
+        while i < initial.envc {
+            let p = *initial.envp.add(i);
+            if !is_sonic_key(p) {
+                kept += 1;
+            }
+            i += 1;
         }
-        i += 1;
-    }
-    let total = kept + 3 + 1;
-    let bytes = total * core::mem::size_of::<*const u8>();
-    let out = linux_sys::mmap(bytes) as *mut *const u8;
-    if out.is_null() || out as isize == -1 {
-        return core::ptr::null();
-    }
-    let mut j = 0;
-    i = 0;
-    while i < initial.envc {
-        let p = *initial.envp.add(i);
-        if !is_sonic_key(p) {
-            *out.add(j) = p;
-            j += 1;
+        let total = kept + 3 + 1;
+        let bytes = total * core::mem::size_of::<*const u8>();
+        let out = linux_sys::mmap(bytes) as *mut *const u8;
+        if out.is_null() || out as isize == -1 {
+            return core::ptr::null();
         }
-        i += 1;
+        let mut j = 0;
+        i = 0;
+        while i < initial.envc {
+            let p = *initial.envp.add(i);
+            if !is_sonic_key(p) {
+                *out.add(j) = p;
+                j += 1;
+            }
+            i += 1;
+        }
+        *out.add(j) = enabled.as_ptr(); j += 1;
+        *out.add(j) = cpu.as_ptr(); j += 1;
+        *out.add(j) = flags.as_ptr(); j += 1;
+        *out.add(j) = core::ptr::null();
+        out
     }
-    *out.add(j) = enabled.as_ptr(); j += 1;
-    *out.add(j) = cpu.as_ptr(); j += 1;
-    *out.add(j) = flags.as_ptr(); j += 1;
-    *out.add(j) = core::ptr::null();
-    out
 }
 
 pub unsafe fn debug_enabled(initial: &InitialStack) -> bool {
-    let mut i = 0;
-    while i < initial.envc {
-        if env_name_matches(*initial.envp.add(i), b"CARGO_SONIC_DEBUG") {
-            return true;
+    unsafe {
+        let mut i = 0;
+        while i < initial.envc {
+            if env_name_matches(*initial.envp.add(i), b"CARGO_SONIC_DEBUG") {
+                return true;
+            }
+            i += 1;
         }
-        i += 1;
+        false
     }
-    false
 }
 
 pub unsafe fn sonic_enabled(initial: &InitialStack) -> bool {
-    let mut i = 0;
-    while i < initial.envc {
-        let p = *initial.envp.add(i);
-        if starts_with(p, b"CARGO_SONIC_ENABLE=") {
-            let value = p.add(b"CARGO_SONIC_ENABLE=".len());
-            return !is_disabled_value(value);
+    unsafe {
+        let mut i = 0;
+        while i < initial.envc {
+            let p = *initial.envp.add(i);
+            if starts_with(p, b"CARGO_SONIC_ENABLE=") {
+                let value = p.add(b"CARGO_SONIC_ENABLE=".len());
+                return !is_disabled_value(value);
+            }
+            i += 1;
         }
-        i += 1;
+        true
     }
-    true
 }
 
 unsafe fn is_sonic_key(p: *const u8) -> bool {
-    starts_with(p, b"CARGO_SONIC_ENABLED=")
-        || starts_with(p, b"CARGO_SONIC_SELECTED_TARGET_CPU=")
-        || starts_with(p, b"CARGO_SONIC_SELECTED_FLAGS=")
+    unsafe {
+        starts_with(p, b"CARGO_SONIC_ENABLED=")
+            || starts_with(p, b"CARGO_SONIC_SELECTED_TARGET_CPU=")
+            || starts_with(p, b"CARGO_SONIC_SELECTED_FLAGS=")
+    }
 }
 
 unsafe fn env_name_matches(p: *const u8, name: &[u8]) -> bool {
-    let mut i = 0;
-    while i < name.len() {
-        if *p.add(i) != name[i] {
-            return false;
+    unsafe {
+        let mut i = 0;
+        while i < name.len() {
+            if *p.add(i) != name[i] {
+                return false;
+            }
+            i += 1;
         }
-        i += 1;
+        let next = *p.add(i);
+        next == 0 || next == b'='
     }
-    let next = *p.add(i);
-    next == 0 || next == b'='
 }
 
 unsafe fn is_disabled_value(p: *const u8) -> bool {
-    if *p == b'0' && *p.add(1) == 0 {
-        return true;
+    unsafe {
+        if *p == b'0' && *p.add(1) == 0 {
+            return true;
+        }
+        (*p == b'f' || *p == b'F')
+            && (*p.add(1) == b'a' || *p.add(1) == b'A')
+            && (*p.add(2) == b'l' || *p.add(2) == b'L')
+            && (*p.add(3) == b's' || *p.add(3) == b'S')
+            && (*p.add(4) == b'e' || *p.add(4) == b'E')
+            && *p.add(5) == 0
     }
-    (*p == b'f' || *p == b'F')
-        && (*p.add(1) == b'a' || *p.add(1) == b'A')
-        && (*p.add(2) == b'l' || *p.add(2) == b'L')
-        && (*p.add(3) == b's' || *p.add(3) == b'S')
-        && (*p.add(4) == b'e' || *p.add(4) == b'E')
-        && *p.add(5) == 0
 }
 
 unsafe fn starts_with(mut p: *const u8, prefix: &[u8]) -> bool {
-    let mut i = 0;
-    while i < prefix.len() {
-        if *p != prefix[i] {
-            return false;
+    unsafe {
+        let mut i = 0;
+        while i < prefix.len() {
+            if *p != prefix[i] {
+                return false;
+            }
+            p = p.add(1);
+            i += 1;
         }
-        p = p.add(1);
-        i += 1;
+        true
     }
-    true
 }
 "#
 }

@@ -624,7 +624,7 @@ fn build_qemu_test_app(root: &Path, asset_dir: &Path, arch: &SystemArch) -> Resu
             r#"[package]
 name = "sonic-qemu-app"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [package.metadata.sonic]
