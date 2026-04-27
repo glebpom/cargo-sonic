@@ -717,7 +717,7 @@ pub fn parse_target_features_from_rustc_cfg(cfg: &str) -> Vec<String> {
 pub fn filter_runtime_features(features: &[String]) -> Vec<String> {
     features
         .iter()
-        .filter(|feature| feature.as_str() != "crt-static")
+        .filter(|feature| !matches!(feature.as_str(), "crt-static" | "x87"))
         .cloned()
         .collect()
 }
@@ -2611,11 +2611,29 @@ mod tests {
     }
 
     #[test]
-    fn filters_crt_static() {
+    fn filters_non_runtime_features() {
         assert_eq!(
-            filter_runtime_features(&["crt-static".into(), "avx2".into()]),
+            filter_runtime_features(&["crt-static".into(), "x87".into(), "avx2".into()]),
             vec!["avx2"]
         );
+    }
+
+    #[test]
+    fn skylake_style_features_with_x87_are_supported() {
+        let features = filter_runtime_features(&[
+            "x87".into(),
+            "fxsr".into(),
+            "sse".into(),
+            "sse2".into(),
+            "sse3".into(),
+            "ssse3".into(),
+            "sse4.1".into(),
+            "sse4.2".into(),
+            "avx".into(),
+            "avx2".into(),
+        ]);
+        unsupported_runtime_features(&features).unwrap();
+        assert!(!features.iter().any(|feature| feature == "x87"));
     }
 
     #[test]
@@ -2771,6 +2789,23 @@ mod tests {
         let union = current.clone();
         assert!(
             filter_target_cpus(&["generic".into(), "zenver5".into()], &current, &union).is_err()
+        );
+    }
+
+    #[test]
+    fn x86_64_v1_spelling_is_not_accepted() {
+        let current = BTreeSet::from(["generic".into(), "x86-64".into(), "x86-64-v2".into()]);
+        let union = current.clone();
+
+        let got =
+            filter_target_cpus(&["generic".into(), "x86-64".into()], &current, &union).unwrap();
+        assert_eq!(got, vec!["generic", "x86-64"]);
+
+        let err = filter_target_cpus(&["generic".into(), "x86-64-v1".into()], &current, &union)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("x86-64-v1"),
+            "unexpected error: {err:#}"
         );
     }
 
