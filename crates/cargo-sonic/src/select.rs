@@ -100,7 +100,7 @@ struct Score {
     generic_tie: u8,
 }
 
-pub fn select_variant<'a>(host: HostInfo, variants: &'a [VariantMeta]) -> &'a VariantMeta {
+pub fn select_variant(host: HostInfo, variants: &[VariantMeta]) -> &VariantMeta {
     let mut best = None::<(&VariantMeta, Score)>;
 
     for variant in variants {

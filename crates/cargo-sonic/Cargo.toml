@@ -3,8 +3,15 @@ name = "cargo-sonic"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+description = "Cargo subcommand for building Linux CPU-dispatched fat binaries"
+readme = "../../README.md"
+keywords = ["cargo", "target-cpu", "cpuid", "simd", "dispatch"]
+categories = ["command-line-utilities", "development-tools::cargo-plugins"]
+publish = true
 
 [dependencies]
 anyhow = "1"
+camino = "1"
+cargo_metadata = "0.19"
 clap = { version = "4", features = ["derive"] }
-sonic-build = { path = "../sonic-build" }
+tempfile = "3"

@@ -177,7 +177,7 @@ struct QemuCaseJob<'a> {
 struct QemuCaseResult {
     arch: String,
     cpu: String,
-    outcome: std::result::Result<(), QemuCaseFailure>,
+    outcome: std::result::Result<(), Box<QemuCaseFailure>>,
 }
 
 struct QemuCaseFailure {
@@ -779,7 +779,7 @@ fn rustc_target_cpus(target: &str) -> Result<Vec<String>> {
     let mut cpus = stdout
         .lines()
         .filter_map(|line| {
-            let cpu = line.trim_start().split_whitespace().next()?;
+            let cpu = line.split_whitespace().next()?;
             if line.starts_with("    ") && cpu != "native" && cpu != "generic" {
                 Some(cpu.to_string())
             } else {
@@ -830,7 +830,7 @@ fn run_qemu_case(
     arch: &SystemArch,
     case: &SystemCase,
     initrd: &Path,
-) -> std::result::Result<(), QemuCaseFailure> {
+) -> std::result::Result<(), Box<QemuCaseFailure>> {
     let qemu = asset_dir.join(&arch.qemu_binary);
     let kernel = asset_dir.join(&arch.kernel);
     let mut args = vec![
@@ -860,11 +860,13 @@ fn run_qemu_case(
         .arg(qemu)
         .args(args)
         .output()
-        .map_err(|err| QemuCaseFailure {
-            comparison: None,
-            status: "spawn-error".to_string(),
-            message: format!("failed to run qemu: {err}"),
-            log_path: None,
+        .map_err(|err| {
+            Box::new(QemuCaseFailure {
+                comparison: None,
+                status: "spawn-error".to_string(),
+                message: format!("failed to run qemu: {err}"),
+                log_path: None,
+            })
         })?;
     let combined = format!(
         "{}{}",
@@ -882,12 +884,12 @@ fn run_qemu_case(
                 None
             }
         };
-        return Err(QemuCaseFailure {
+        return Err(Box::new(QemuCaseFailure {
             comparison: parse_guest_comparison(&combined),
             status: output.status.to_string(),
             message: "guest oracle failed".to_string(),
             log_path,
-        });
+        }));
     }
     Ok(())
 }
@@ -1111,7 +1113,7 @@ fn write_qemu_readme(asset_dir: &Path, manifest: &SystemManifest) -> Result<()> 
 
 fn integration() -> Result<()> {
     let status = Command::new("cargo")
-        .args(["test", "-p", "sonic-build"])
+        .args(["test", "-p", "cargo-sonic"])
         .status()?;
     if !status.success() {
         bail!("integration command failed");

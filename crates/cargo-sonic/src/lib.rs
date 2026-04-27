@@ -2,9 +2,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::{Artifact, Message, MetadataCommand, Package};
 use clap::{Arg, ArgAction, Command as ClapCommand};
-use sonic_loader::arch_x86_64;
-use sonic_loader::feature_mask::{Feature, FeatureMask, feature_by_name};
-use sonic_loader::select::{
+pub mod arch_aarch64;
+pub mod arch_x86_64;
+pub mod feature_mask;
+pub mod select;
+
+use crate::feature_mask::{Feature, FeatureMask, feature_by_name};
+use crate::select::{
     CpuIdentity, HostInfo, TargetArch, TargetKind, VariantMeta, X86Vendor, select_variant,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -253,7 +257,7 @@ fn parse_cargo_args(args: &[String]) -> CargoArgs {
 fn last_match_value(matches: &clap::ArgMatches, id: &str) -> Option<String> {
     matches
         .get_many::<String>(id)?
-        .last()
+        .next_back()
         .map(ToString::to_string)
 }
 
@@ -387,11 +391,11 @@ fn host_arch_name(arch: TargetArch) -> &'static str {
 }
 
 fn feature_names(mask: FeatureMask) -> Vec<&'static str> {
-    sonic_loader::feature_mask::ALL_FEATURES
+    crate::feature_mask::ALL_FEATURES
         .iter()
         .copied()
         .filter(|feature| mask.contains(*feature))
-        .map(sonic_loader::feature_mask::feature_name)
+        .map(crate::feature_mask::feature_name)
         .collect()
 }
 
@@ -523,9 +527,7 @@ fn detect_current_aarch64_host() -> Result<HostInfo> {
     let (hwcap, hwcap2, hwcap3) = read_auxv_hwcaps()?;
     Ok(HostInfo {
         arch: TargetArch::Aarch64,
-        features: sonic_loader::arch_aarch64::detect_aarch64_features_from_hwcap(
-            hwcap, hwcap2, hwcap3,
-        ),
+        features: crate::arch_aarch64::detect_aarch64_features_from_hwcap(hwcap, hwcap2, hwcap3),
         identity: CpuIdentity::Unknown,
         heterogeneous: false,
     })
@@ -861,17 +863,15 @@ fn build_payload_variant(
             package_id,
             ..
         }) = message?
+            && package_id == package.id
+            && artifact_target
+                .kind
+                .iter()
+                .any(|k| matches!(k, cargo_metadata::TargetKind::Bin))
         {
-            if package_id == package.id
-                && artifact_target
-                    .kind
-                    .iter()
-                    .any(|k| matches!(k, cargo_metadata::TargetKind::Bin))
-            {
-                let exe = Utf8PathBuf::from_path_buf(exe.into_std_path_buf())
-                    .map_err(|_| anyhow!("artifact path is not valid UTF-8"))?;
-                executables.push(exe);
-            }
+            let exe = Utf8PathBuf::from_path_buf(exe.into_std_path_buf())
+                .map_err(|_| anyhow!("artifact path is not valid UTF-8"))?;
+            executables.push(exe);
         }
     }
     let status = child.wait()?;
@@ -942,8 +942,7 @@ fn generate_loader_crate(
     fs::create_dir_all(loader_dir.join("src"))?;
     fs::write(
         loader_dir.join("Cargo.toml"),
-        format!(
-            r#"[package]
+        r#"[package]
 name = "sonic-generated-loader"
 version = "0.0.0"
 edition = "2024"
@@ -955,24 +954,20 @@ panic = "abort"
 panic = "abort"
 
 [workspace]
-"#
-        ),
+"#,
     )?;
     fs::write(
         loader_dir.join("src/feature_mask.rs"),
-        include_str!("../../sonic-loader/src/feature_mask.rs"),
+        include_str!("feature_mask.rs"),
     )?;
-    fs::write(
-        loader_dir.join("src/select.rs"),
-        include_str!("../../sonic-loader/src/select.rs"),
-    )?;
+    fs::write(loader_dir.join("src/select.rs"), include_str!("select.rs"))?;
     fs::write(
         loader_dir.join("src/arch_x86_64.rs"),
-        include_str!("../../sonic-loader/src/arch_x86_64.rs"),
+        include_str!("arch_x86_64.rs"),
     )?;
     fs::write(
         loader_dir.join("src/arch_aarch64.rs"),
-        include_str!("../../sonic-loader/src/arch_aarch64.rs"),
+        include_str!("arch_aarch64.rs"),
     )?;
     fs::write(loader_dir.join("src/linux_sys.rs"), generated_linux_sys())?;
     fs::write(loader_dir.join("src/stack.rs"), generated_stack())?;
@@ -2321,12 +2316,11 @@ fn analyze_warnings(features_by_cpu: &BTreeMap<String, Vec<String>>, arch: &str)
                 "x86-64" | "x86-64-v2" | "x86-64-v3" | "x86-64-v4"
             )
         })
+        && features_by_cpu.keys().any(|cpu| cpu != "generic")
     {
-        if features_by_cpu.keys().any(|cpu| cpu != "generic") {
-            warnings.push(
-                "vendor-specific x86 targets configured without a neutral x86 fallback".to_string(),
-            );
-        }
+        warnings.push(
+            "vendor-specific x86 targets configured without a neutral x86 fallback".to_string(),
+        );
     }
     warnings
 }

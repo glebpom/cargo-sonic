@@ -1,4 +1,5 @@
 use anyhow::{Result, bail};
+use cargo_sonic::{BuildOptions, ProbeOptions};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -46,7 +47,7 @@ fn main() -> Result<()> {
         CargoSonicCommand::Sonic(Sonic {
             target_cpus,
             command: Command::Build(build),
-        }) => sonic_build::build(sonic_build::BuildOptions {
+        }) => cargo_sonic::build(BuildOptions {
             cargo_args: build.cargo_args,
             manifest_path: None,
             target_cpus,
@@ -57,7 +58,7 @@ fn main() -> Result<()> {
         CargoSonicCommand::Sonic(Sonic {
             target_cpus,
             command: Command::Probe(probe),
-        }) => sonic_build::probe(sonic_build::ProbeOptions {
+        }) => cargo_sonic::probe(ProbeOptions {
             cargo_args: probe.cargo_args,
             target_cpus,
         }),
