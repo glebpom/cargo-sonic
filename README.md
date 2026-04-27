@@ -38,8 +38,9 @@ The difference between a generic build and one tuned for a specific
 microarchitecture can be substantial, particularly for compute-heavy tasks where
 the compiler can leverage auto-vectorization.
 
-In a benchmark of naive matrix operations, included in the examples folder,
-running on a Raptor Lake host, the performance delta is clear:
+In the CPU benchmark included in the examples folder, a CPU-heavy floating point
+kernel repeatedly updates three large `f32` buffers and accumulates a checksum.
+On a Raptor Lake host, the performance delta is clear:
 
 | Selection Mode | Target CPU | Execution Time |
 | --- | --- | ---: |
