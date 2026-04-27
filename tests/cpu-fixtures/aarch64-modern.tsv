@@ -1,0 +1,16 @@
+# name	implementer	part	expected	features
+# ARM implementer/part mappings follow LLVM Host.cpp MIDR heuristics.
+Cortex-A510	0x41	0xd46	cortex-a510	neon,aes,crc,dotprod,dpb,fp16,lse,rcpc,rdm,sha2
+Cortex-A520	0x41	0xd80	cortex-a520	neon,aes,crc,dotprod,dpb,fp16,lse,rcpc,rdm,sha2
+Cortex-A710	0x41	0xd47	cortex-a710	neon,aes,crc,dotprod,dpb,dpb2,fp16,lse,rcpc,rcpc2,rdm,sha2,bf16,i8mm
+Cortex-A715	0x41	0xd4d	cortex-a715	neon,aes,crc,dotprod,dpb,dpb2,fp16,lse,rcpc,rcpc2,rdm,sha2,bf16,i8mm
+Cortex-A720	0x41	0xd81	cortex-a720	neon,aes,crc,dotprod,dpb,dpb2,fp16,lse,rcpc,rcpc2,rdm,sha2,bf16,i8mm
+Cortex-A725	0x41	0xd87	cortex-a725	neon,aes,crc,dotprod,dpb,dpb2,fp16,lse,rcpc,rcpc2,rdm,sha2,bf16,i8mm
+Neoverse-E1	0x41	0xd4a	neoverse-e1	neon,aes,crc,dotprod,dpb,fp16,lse,rcpc,rdm,sha2
+Neoverse-N2	0x41	0xd49	neoverse-n2	neon,aes,crc,dotprod,dpb,dpb2,fp16,lse,rcpc,rcpc2,rdm,sha2,bf16,i8mm,sve,sve2
+Neoverse-N3	0x41	0xd8e	neoverse-n3	neon,aes,crc,dotprod,dpb,dpb2,fp16,lse,rcpc,rcpc2,rdm,sha2,bf16,i8mm,sve,sve2
+Neoverse-V1	0x41	0xd40	neoverse-v1	neon,aes,crc,dotprod,dpb,fp16,lse,rcpc,rdm,sha2,sve
+Neoverse-V2	0x41	0xd4f	neoverse-v2	neon,aes,crc,dotprod,dpb,dpb2,fp16,lse,rcpc,rcpc2,rdm,sha2,bf16,i8mm,sve,sve2
+Neoverse-V3	0x41	0xd84	neoverse-v3	neon,aes,crc,dotprod,dpb,dpb2,fp16,lse,rcpc,rcpc2,rdm,sha2,bf16,i8mm,sve,sve2
+Neoverse-V3AE	0x41	0xd83	neoverse-v3ae	neon,aes,crc,dotprod,dpb,dpb2,fp16,lse,rcpc,rcpc2,rdm,sha2,bf16,i8mm,sve,sve2
+Fujitsu A64FX	0x46	0x001	a64fx	neon,aes,crc,dpb,fcma,fp16,lse,sha2,sve

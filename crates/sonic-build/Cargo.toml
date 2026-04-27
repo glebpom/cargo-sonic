@@ -1,0 +1,13 @@
+[package]
+name = "sonic-build"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = "1"
+camino = "1"
+cargo_metadata = "0.19"
+clap = "4"
+tempfile = "3"
+sonic-loader = { path = "../sonic-loader" }

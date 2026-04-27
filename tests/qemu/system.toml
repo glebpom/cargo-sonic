@@ -1,0 +1,182 @@
+# System-mode QEMU is the production correctness suite.
+#
+# The runner boots a real Linux guest for each CPU model in [[arch.case]], runs
+# rustc inside that guest with `-C target-cpu=native`, runs the cargo-sonic fat
+# executable in the same guest, and compares the loader-selected target against
+# the rustc-derived native target.
+#
+# Do not add selected-target goldens here. CPU model names are the matrix inputs;
+# the oracle is guest rustc running inside qemu-system.
+#
+# QEMU CPU models that are not valid strict oracle cases are listed explicitly
+# in [[arch.exception]] with the reason.
+
+[qemu]
+version = "11.0.0"
+source_url = "https://download.qemu.org/qemu-11.0.0.tar.xz"
+source_sha256 = "c04ca36012653f32d11c674d370cf52a710e7d3f18c2d8b63e4932052a4854d6"
+install_dir = "qemu/11.0.0"
+
+[[arch]]
+name = "x86_64"
+target = "x86_64-unknown-linux-gnu"
+qemu_system = "qemu-system-x86_64"
+qemu_binary = "qemu/11.0.0/bin/qemu-system-x86_64"
+kernel = "guests/x86_64/vmlinuz"
+initrd = "guests/x86_64/initrd.img"
+guest_archive_url = "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/x86_64/alpine-netboot-3.23.4-x86_64.tar.gz"
+guest_archive_sha256 = "6929377b64d6bea9820e40b51ba98c1f72e5320206cdd4821cb11f5b1751c58a"
+guest_kernel_member = "boot/vmlinuz-virt"
+guest_initrd_member = "boot/initramfs-virt"
+rootfs_archive_url = "https://cdimages.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.3-base-amd64.tar.gz"
+rootfs_archive_sha256 = "6bc2cde3930ad088b3bb46fa45279e96d25bc3810f209850ecbe4722711874f9"
+rust_archive_url = "https://static.rust-lang.org/dist/2026-03-26/rust-1.94.1-x86_64-unknown-linux-gnu.tar.xz"
+rust_archive_sha256 = "294b3d81fa72e62581276290c60c81eb8b58498d333d422ca1dfc432877d0c40"
+# Generic / neutral QEMU CPU models.
+[[arch.case]]
+cpu = "qemu64"
+
+[[arch.case]]
+cpu = "kvm64"
+
+# AMD and older x86_64 models that boot the x86_64 guest and map to rustc
+# target-cpu contracts available in this architecture.
+[[arch.case]]
+cpu = "phenom"
+
+[[arch.case]]
+cpu = "Opteron_G2"
+
+[[arch.case]]
+cpu = "Opteron_G3"
+
+# Intel client/server models with rustc target-cpu equivalents.
+[[arch.case]]
+cpu = "Penryn"
+
+[[arch.case]]
+cpu = "Nehalem"
+
+[[arch.case]]
+cpu = "Westmere"
+
+[[arch.case]]
+cpu = "SandyBridge"
+
+[[arch.case]]
+cpu = "IvyBridge"
+
+[[arch.case]]
+cpu = "Haswell-v4"
+
+[[arch.case]]
+cpu = "Broadwell-v4"
+
+[[arch.exception]]
+cpu = "486, pentium, pentium2, pentium3, athlon, qemu32, kvm32, n270"
+reason = "32-bit-only QEMU CPU models cannot boot the x86_64 Linux guest used by this suite."
+
+[[arch.exception]]
+cpu = "base, host, max"
+reason = "QEMU meta CPU models are host/configuration dependent and are not stable matrix targets."
+
+[[arch.exception]]
+cpu = "EPYC, EPYC-IBPB, EPYC-Rome, EPYC-Milan, EPYC-Genoa, EPYC-Turin and versioned aliases"
+reason = "QEMU TCG reports AMD Zen native names to rustc but does not expose the complete runtime feature contracts required by those rustc target-cpus, so exact selection would require choosing an ineligible payload."
+
+[[arch.exception]]
+cpu = "Denverton, Snowridge"
+reason = "QEMU CPU model names do not have exact rustc target-cpu equivalents in the configured x86_64 target-cpu set."
+
+[[arch.exception]]
+cpu = "Conroe"
+reason = "QEMU 11.0.0 TCG reports rustc native target-cpu `core2`, but the guest CPUID lacks cmpxchg16b, which rustc's `core2` target-cpu requires; cargo-sonic must not select an ineligible payload."
+
+[[arch.exception]]
+cpu = "Opteron_G1"
+reason = "QEMU 11.0.0 TCG reports rustc native target-cpu `k8-sse3`, but the guest CPUID lacks cmpxchg16b, which rustc's `k8-sse3` target-cpu requires; cargo-sonic must not select an ineligible payload."
+
+[[arch.exception]]
+cpu = "Opteron_G4, Opteron_G5"
+reason = "These QEMU 11.0.0 TCG models time out before the guest oracle completes in the pinned Alpine/Ubuntu system-mode image."
+
+[[arch.exception]]
+cpu = "Skylake-Client-v4, Skylake-Server-v5, Cascadelake-Server-v5, Cooperlake-v2, Icelake-Server-v7, SapphireRapids-v4, GraniteRapids-v3, SierraForest-v3, ClearwaterForest-v1"
+reason = "QEMU 11.0.0 TCG reports matching rustc native target-cpus, but does not expose required runtime features such as xsavec/xsaves and, for AVX512-class CPUs, required AVX512 state/features. cargo-sonic must keep these payloads ineligible."
+
+[[arch.exception]]
+cpu = "Dhyana, YongFeng"
+reason = "QEMU exposes these vendor CPU models, but rustc 1.94.1 does not provide matching x86_64 target-cpu names."
+
+[[arch.exception]]
+cpu = "KnightsMill"
+reason = "QEMU exposes the CPU model, but rustc's closest target-cpu names are not exact matches for this strict native-target oracle."
+
+[[arch]]
+name = "aarch64"
+target = "aarch64-unknown-linux-musl"
+qemu_system = "qemu-system-aarch64"
+qemu_binary = "qemu/11.0.0/bin/qemu-system-aarch64"
+kernel = "guests/aarch64/Image"
+initrd = "guests/aarch64/initrd.img"
+guest_archive_url = "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/aarch64/alpine-netboot-3.23.4-aarch64.tar.gz"
+guest_archive_sha256 = "6686bd5e1e98213d3847ae44172e502ac51e078ef43f86b003ff4ec03decb857"
+guest_kernel_member = "boot/vmlinuz-virt"
+guest_initrd_member = "boot/initramfs-virt"
+rootfs_archive_url = "https://cdimages.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.3-base-arm64.tar.gz"
+rootfs_archive_sha256 = "7b2dced6dd56ad5e4a813fa25c8de307b655fdabc6ea9213175a92c48dabb048"
+rust_archive_url = "https://static.rust-lang.org/dist/2026-03-26/rust-1.94.1-aarch64-unknown-linux-gnu.tar.xz"
+rust_archive_sha256 = "bb1267e956ef7887049236d26b37e987da383e190c7d95c80731a302af01b650"
+[[arch.case]]
+cpu = "cortex-a35"
+
+[[arch.case]]
+cpu = "cortex-a53"
+
+[[arch.case]]
+cpu = "cortex-a55"
+
+[[arch.case]]
+cpu = "cortex-a57"
+
+[[arch.case]]
+cpu = "cortex-a72"
+
+[[arch.case]]
+cpu = "cortex-a76"
+
+[[arch.case]]
+cpu = "cortex-a710"
+
+[[arch.case]]
+cpu = "neoverse-n1"
+
+[[arch.case]]
+cpu = "neoverse-n2"
+
+[[arch.case]]
+cpu = "neoverse-v1"
+
+[[arch.exception]]
+cpu = "arm1026, arm1136, arm1136-r2, arm1176, arm11mpcore, arm926, arm946, cortex-a7, cortex-a8, cortex-a9, cortex-a15, cortex-r5, cortex-r5f, cortex-r52, sa1100, sa1110, ti925t"
+reason = "32-bit Arm QEMU CPU models cannot boot the aarch64 Linux guest used by this suite."
+
+[[arch.exception]]
+cpu = "cortex-m0, cortex-m3, cortex-m4, cortex-m7, cortex-m33, cortex-m55"
+reason = "Microcontroller-profile QEMU CPU models cannot boot the Linux aarch64 guest used by this suite."
+
+[[arch.exception]]
+cpu = "max"
+reason = "QEMU meta CPU model is configuration dependent and not a stable strict matrix target."
+
+[[arch.exception]]
+cpu = "neoverse-512tvb"
+reason = "rustc exposes this as a target-cpu but QEMU 11.0.0 does not expose it as a system CPU model."
+
+[[arch.exception]]
+cpu = "cortex-a78ae"
+reason = "rustc exposes this as a target-cpu but qemu-system-aarch64 11.0.0 rejects it as an invalid CPU model."
+
+[[arch.exception]]
+cpu = "a64fx"
+reason = "The pinned qemu-system-aarch64 11.0.0 a64fx case times out before the guest oracle completes in the pinned Alpine/Ubuntu system-mode image."
