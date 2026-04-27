@@ -19,14 +19,15 @@ This repository currently has a working Linux x86_64/AArch64 vertical slice:
 - implicit `generic` payload, always built
 - target-cpu validation through `rustc --print target-cpus`
 - payload builds with isolated target directories
-- generated `no_std`/`no_main` loader
+- generated Rust 2024 `no_std`/`no_main` loader
 - `include_bytes!` payload embedding
 - `memfd_create` plus `execveat`
 - `CARGO_SONIC_*` env replacement
 - x86_64 CPUID and AArch64 auxv feature detection for the implemented feature set
 - x86_64 CPU identity detection for selection affinity
-- unit tests and a generic fixture integration test
-- pinned system-mode QEMU correctness suite via `just qemu`
+- unit tests, generated-loader integration tests, and fixture-driven modern CPU
+  selector tests
+- pinned QEMU 11.0.0 system-mode correctness suite via `just qemu`
 
 Known incomplete areas:
 
@@ -77,6 +78,7 @@ Configure variants in `Cargo.toml`:
 ```toml
 [package.metadata.sonic]
 target-cpus = [
+  "x86-64-v3",
   "raptorlake",
   "znver5",
 ]
@@ -213,11 +215,25 @@ The currently verified paths are Linux x86_64 and Linux AArch64.
 
 ## Testing
 
-Run pure unit tests and the current integration fixture:
+Run pure unit tests, generated-loader integration tests, and fixture-driven
+selector tests:
 
 ```bash
 cargo test
 ```
+
+Run only the modern CPU fixture suites:
+
+```bash
+cargo test -p sonic-loader fixture_modern
+```
+
+These tests parse `tests/cpu-fixtures/x86_64-modern.tsv` and
+`tests/cpu-fixtures/aarch64-modern.tsv`, synthesize loader `HostInfo` values
+from CPUID family/model or AArch64 MIDR implementer/part rows, and assert that
+the real loader selector chooses the expected rustc/LLVM target-cpu. They are
+not QEMU tests and do not execute a generated binary; they cover modern CPU
+identity cases that QEMU TCG cannot model as strict guest oracles.
 
 Run the QEMU system-mode suite:
 
@@ -249,7 +265,7 @@ base rootfs directories, and leaves a generated asset README in that directory.
 
 The default matrix is intentionally limited to CPU models where pinned QEMU TCG
 can expose a runtime feature set consistent with the rustc native target. For
-example, QEMU 10.2.1 reports `EPYC-Turin` as `znver5` to rustc, but TCG cannot
+example, QEMU 11.0.0 reports `EPYC-Turin` as `znver5` to rustc, but TCG cannot
 expose the AVX512 features required by rustc's `znver5` contract, so that model
 is documented in `tests/qemu/system.toml` rather than kept as a permanently
 failing exact-oracle case.
@@ -285,6 +301,7 @@ crates/sonic-build          build orchestration and loader generation
 crates/sonic-loader         testable no_std loader logic
 crates/xtask                automation and QEMU matrix runner
 examples/variant-printer    minimal runnable example
+tests/cpu-fixtures          fixture-driven modern CPU selector suites
 tests/fixtures              integration fixtures
 tests/qemu                  QEMU system-mode matrix
 ```
