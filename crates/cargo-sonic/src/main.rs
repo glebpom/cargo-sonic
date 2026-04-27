@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -22,10 +22,17 @@ struct Sonic {
 #[derive(Subcommand)]
 enum Command {
     Build(Build),
+    Probe(Probe),
 }
 
 #[derive(Parser)]
 struct Build {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    cargo_args: Vec<String>,
+}
+
+#[derive(Parser)]
+struct Probe {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     cargo_args: Vec<String>,
 }
@@ -41,6 +48,12 @@ fn main() -> Result<()> {
         })
         .map(|output| {
             println!("{}", output.final_binary);
+        }),
+        CargoSonicCommand::Sonic(Sonic {
+            command: Command::Probe(probe),
+        }) => sonic_build::probe(sonic_build::ProbeOptions {
+            cargo_args: probe.cargo_args,
+            manifest_path: None,
         }),
     }
     .map_err(|err| {

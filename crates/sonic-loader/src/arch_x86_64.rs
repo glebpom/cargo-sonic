@@ -28,68 +28,180 @@ pub fn detect_x86_features_from_cpuid(leaves: X86Cpuid, xcr0: u64) -> FeatureMas
     let ad1 = leaves.leaf_d_1.eax;
     let c8 = leaves.leaf80000001.ecx;
 
-    if bit(c1, 0) { out.insert(Feature::Sse3); }
-    if bit(c1, 9) { out.insert(Feature::Ssse3); }
-    if bit(c1, 12) { out.insert(Feature::Fma); }
-    if bit(c1, 13) { out.insert(Feature::Cmpxchg16b); }
-    if bit(c1, 19) { out.insert(Feature::Sse4_1); }
-    if bit(c1, 20) { out.insert(Feature::Sse4_2); }
-    if bit(c1, 22) { out.insert(Feature::Movbe); }
-    if bit(c1, 23) { out.insert(Feature::Popcnt); }
-    if bit(c1, 25) { out.insert(Feature::Aes); }
-    if bit(c1, 26) { out.insert(Feature::Xsave); }
-    if bit(c1, 29) { out.insert(Feature::F16c); }
-    if bit(c1, 30) { out.insert(Feature::Rdrand); }
-    if bit(d1, 24) { out.insert(Feature::Fxsr); }
-    if bit(d1, 25) { out.insert(Feature::Sse); }
-    if bit(d1, 26) { out.insert(Feature::Sse2); }
-    if bit(c1, 1) { out.insert(Feature::Pclmulqdq); }
+    if bit(c1, 0) {
+        out.insert(Feature::Sse3);
+    }
+    if bit(c1, 9) {
+        out.insert(Feature::Ssse3);
+    }
+    if bit(c1, 12) {
+        out.insert(Feature::Fma);
+    }
+    if bit(c1, 13) {
+        out.insert(Feature::Cmpxchg16b);
+    }
+    if bit(c1, 19) {
+        out.insert(Feature::Sse4_1);
+    }
+    if bit(c1, 20) {
+        out.insert(Feature::Sse4_2);
+    }
+    if bit(c1, 22) {
+        out.insert(Feature::Movbe);
+    }
+    if bit(c1, 23) {
+        out.insert(Feature::Popcnt);
+    }
+    if bit(c1, 25) {
+        out.insert(Feature::Aes);
+    }
+    if bit(c1, 26) {
+        out.insert(Feature::Xsave);
+    }
+    if bit(c1, 29) {
+        out.insert(Feature::F16c);
+    }
+    if bit(c1, 30) {
+        out.insert(Feature::Rdrand);
+    }
+    if bit(d1, 24) {
+        out.insert(Feature::Fxsr);
+    }
+    if bit(d1, 25) {
+        out.insert(Feature::Sse);
+    }
+    if bit(d1, 26) {
+        out.insert(Feature::Sse2);
+    }
+    if bit(c1, 1) {
+        out.insert(Feature::Pclmulqdq);
+    }
 
     let avx_state = bit(c1, 27) && bit(c1, 28) && (xcr0 & 0b110) == 0b110;
-    if avx_state { out.insert(Feature::Avx); }
+    if avx_state {
+        out.insert(Feature::Avx);
+    }
 
-    if avx_state && bit(b7, 5) { out.insert(Feature::Avx2); }
-    if bit(b7, 3) { out.insert(Feature::Bmi1); }
-    if bit(b7, 8) { out.insert(Feature::Bmi2); }
-    if bit(b7, 18) { out.insert(Feature::Rdseed); }
-    if bit(b7, 19) { out.insert(Feature::Adx); }
-    if bit(b7, 29) { out.insert(Feature::Sha); }
-    if bit(c8, 5) { out.insert(Feature::Lzcnt); }
-    if bit(c8, 6) { out.insert(Feature::Sse4a); }
-    if bit(c8, 21) { out.insert(Feature::Tbm); }
+    if avx_state && bit(b7, 5) {
+        out.insert(Feature::Avx2);
+    }
+    if bit(b7, 3) {
+        out.insert(Feature::Bmi1);
+    }
+    if bit(b7, 8) {
+        out.insert(Feature::Bmi2);
+    }
+    if bit(b7, 18) {
+        out.insert(Feature::Rdseed);
+    }
+    if bit(b7, 19) {
+        out.insert(Feature::Adx);
+    }
+    if bit(b7, 29) {
+        out.insert(Feature::Sha);
+    }
+    if bit(c8, 5) {
+        out.insert(Feature::Lzcnt);
+    }
+    if bit(c8, 6) {
+        out.insert(Feature::Sse4a);
+    }
+    if bit(c8, 21) {
+        out.insert(Feature::Tbm);
+    }
     let avx512_state = avx_state && (xcr0 & 0b1110_0000) == 0b1110_0000;
     if avx512_state {
-        if bit(b7, 16) { out.insert(Feature::Avx512F); }
-        if bit(b7, 17) { out.insert(Feature::Avx512Dq); }
-        if bit(b7, 21) { out.insert(Feature::Avx512Ifma); }
-        if bit(b7, 28) { out.insert(Feature::Avx512Cd); }
-        if bit(b7, 30) { out.insert(Feature::Avx512Bw); }
-        if bit(b7, 31) { out.insert(Feature::Avx512Vl); }
-        if bit(c7, 1) { out.insert(Feature::Avx512Vbmi); }
-        if bit(c7, 6) { out.insert(Feature::Avx512Vbmi2); }
-        if bit(c7, 11) { out.insert(Feature::Avx512Vnni); }
-        if bit(c7, 12) { out.insert(Feature::Avx512Bitalg); }
-        if bit(c7, 14) { out.insert(Feature::Avx512Vpopcntdq); }
-        if bit(d7, 8) { out.insert(Feature::Avx512Vp2intersect); }
-        if bit(d7, 22) { out.insert(Feature::Avx512Fp16); }
-        if bit(a71, 5) { out.insert(Feature::Avx512Bf16); }
+        if bit(b7, 16) {
+            out.insert(Feature::Avx512F);
+        }
+        if bit(b7, 17) {
+            out.insert(Feature::Avx512Dq);
+        }
+        if bit(b7, 21) {
+            out.insert(Feature::Avx512Ifma);
+        }
+        if bit(b7, 28) {
+            out.insert(Feature::Avx512Cd);
+        }
+        if bit(b7, 30) {
+            out.insert(Feature::Avx512Bw);
+        }
+        if bit(b7, 31) {
+            out.insert(Feature::Avx512Vl);
+        }
+        if bit(c7, 1) {
+            out.insert(Feature::Avx512Vbmi);
+        }
+        if bit(c7, 6) {
+            out.insert(Feature::Avx512Vbmi2);
+        }
+        if bit(c7, 11) {
+            out.insert(Feature::Avx512Vnni);
+        }
+        if bit(c7, 12) {
+            out.insert(Feature::Avx512Bitalg);
+        }
+        if bit(c7, 14) {
+            out.insert(Feature::Avx512Vpopcntdq);
+        }
+        if bit(d7, 8) {
+            out.insert(Feature::Avx512Vp2intersect);
+        }
+        if bit(d7, 22) {
+            out.insert(Feature::Avx512Fp16);
+        }
+        if bit(a71, 5) {
+            out.insert(Feature::Avx512Bf16);
+        }
     }
-    if bit(c7, 8) { out.insert(Feature::Gfni); }
-    if avx_state && bit(c7, 9) { out.insert(Feature::Vaes); }
-    if avx_state && bit(c7, 10) { out.insert(Feature::Vpclmulqdq); }
-    if avx_state && bit(c7, 22) { out.insert(Feature::AvxIfma); }
-    if avx_state && bit(c7, 23) { out.insert(Feature::AvxNeConvert); }
-    if avx_state && bit(a71, 4) { out.insert(Feature::AvxVnni); }
-    if avx_state && bit(d7, 4) { out.insert(Feature::AvxVnniInt8); }
-    if avx_state && bit(d7, 5) { out.insert(Feature::AvxVnniInt16); }
-    if bit(c7, 2) { out.insert(Feature::Widekl); }
-    if bit(c7, 23) { out.insert(Feature::Kl); }
-    if bit(d7, 29) { out.insert(Feature::Sha512); }
-    if bit(d7, 30) { out.insert(Feature::Sm3); }
-    if bit(d7, 31) { out.insert(Feature::Sm4); }
-    if bit(ad1, 0) { out.insert(Feature::Xsaveopt); }
-    if bit(ad1, 1) { out.insert(Feature::Xsavec); }
-    if bit(ad1, 3) { out.insert(Feature::Xsaves); }
+    if bit(c7, 8) {
+        out.insert(Feature::Gfni);
+    }
+    if avx_state && bit(c7, 9) {
+        out.insert(Feature::Vaes);
+    }
+    if avx_state && bit(c7, 10) {
+        out.insert(Feature::Vpclmulqdq);
+    }
+    if avx_state && bit(c7, 22) {
+        out.insert(Feature::AvxIfma);
+    }
+    if avx_state && bit(c7, 23) {
+        out.insert(Feature::AvxNeConvert);
+    }
+    if avx_state && bit(a71, 4) {
+        out.insert(Feature::AvxVnni);
+    }
+    if avx_state && bit(d7, 4) {
+        out.insert(Feature::AvxVnniInt8);
+    }
+    if avx_state && bit(d7, 5) {
+        out.insert(Feature::AvxVnniInt16);
+    }
+    if bit(c7, 2) {
+        out.insert(Feature::Widekl);
+    }
+    if bit(c7, 23) {
+        out.insert(Feature::Kl);
+    }
+    if bit(d7, 29) {
+        out.insert(Feature::Sha512);
+    }
+    if bit(d7, 30) {
+        out.insert(Feature::Sm3);
+    }
+    if bit(d7, 31) {
+        out.insert(Feature::Sm4);
+    }
+    if bit(ad1, 0) {
+        out.insert(Feature::Xsaveopt);
+    }
+    if bit(ad1, 1) {
+        out.insert(Feature::Xsavec);
+    }
+    if bit(ad1, 3) {
+        out.insert(Feature::Xsaves);
+    }
     out
 }
 

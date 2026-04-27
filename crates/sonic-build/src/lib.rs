@@ -1,9 +1,12 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::{Artifact, Message, MetadataCommand, Package};
 use serde::Deserialize;
-use sonic_loader::feature_mask::{feature_by_name, Feature, FeatureMask};
-use sonic_loader::select::TargetKind;
+use sonic_loader::arch_x86_64;
+use sonic_loader::feature_mask::{Feature, FeatureMask, feature_by_name};
+use sonic_loader::select::{
+    CpuIdentity, HostInfo, TargetArch, TargetKind, VariantMeta, X86Vendor, select_variant,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
@@ -19,6 +22,12 @@ pub struct BuildOptions {
 pub struct BuildOutput {
     pub final_binary: Utf8PathBuf,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProbeOptions {
+    pub cargo_args: Vec<String>,
+    pub manifest_path: Option<Utf8PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +57,14 @@ struct VariantBuild {
     artifact: Utf8PathBuf,
 }
 
+struct ProbeVariant {
+    target_cpu: String,
+    required_features: FeatureMask,
+    rank_features: FeatureMask,
+    feature_names: Vec<String>,
+    feature_tier: u8,
+}
+
 pub fn build(options: BuildOptions) -> Result<BuildOutput> {
     let cargo_args = parse_cargo_args(&options.cargo_args);
     let manifest_path = options
@@ -59,7 +76,9 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
     if let Some(path) = &manifest_path {
         metadata_cmd.manifest_path(path);
     }
-    let metadata = metadata_cmd.exec().context("failed to read cargo metadata")?;
+    let metadata = metadata_cmd
+        .exec()
+        .context("failed to read cargo metadata")?;
     let package = select_package(&metadata, cargo_args.package.as_deref())?;
     let configured_cpus = normalize_target_cpus(effective_target_cpus(&metadata, package)?)?;
 
@@ -74,15 +93,20 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
         bail!("cargo-sonic supports Linux targets only; `{target}` has target_os={target_os:?}");
     }
     if target_arch != "x86_64" && target_arch != "aarch64" {
-        bail!("cargo-sonic currently supports x86_64 and aarch64 only; `{target}` has target_arch={target_arch:?}");
+        bail!(
+            "cargo-sonic currently supports x86_64 and aarch64 only; `{target}` has target_arch={target_arch:?}"
+        );
     }
 
     let current_valid = rustc_target_cpus(&target)?;
     let union_valid = known_supported_cpu_union()?;
     let included = filter_target_cpus(&configured_cpus, &current_valid, &union_valid)?;
-    let profile = if cargo_args.release { "release" } else { "debug" };
-    let out_root = Utf8PathBuf::from_path_buf(metadata.target_directory.clone().into_std_path_buf())
-        .map_err(|_| anyhow!("target directory is not valid UTF-8"))?
+    let profile = if cargo_args.release {
+        "release"
+    } else {
+        "debug"
+    };
+    let out_root = effective_target_directory(&metadata)?
         .join("sonic")
         .join(&target)
         .join(profile);
@@ -113,7 +137,15 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
         } else {
             feature_mask(&required_feature_names)?
         };
-        let artifact = build_payload_variant(package, &cargo_args, manifest_path.as_deref(), &target, profile, cpu, &out_root)?;
+        let artifact = build_payload_variant(
+            package,
+            &cargo_args,
+            manifest_path.as_deref(),
+            &target,
+            profile,
+            cpu,
+            &out_root,
+        )?;
         variants.push(VariantBuild {
             target_cpu: cpu.clone(),
             required_features,
@@ -134,7 +166,86 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
     fs::copy(&loader_artifact, &final_binary)
         .with_context(|| format!("failed to copy final fat binary to {final_binary}"))?;
     make_executable(&final_binary)?;
-    Ok(BuildOutput { final_binary, warnings })
+    Ok(BuildOutput {
+        final_binary,
+        warnings,
+    })
+}
+
+pub fn probe(options: ProbeOptions) -> Result<()> {
+    let cargo_args = parse_cargo_args(&options.cargo_args);
+    let manifest_path = options
+        .manifest_path
+        .clone()
+        .or_else(|| cargo_args.manifest_path.clone());
+    let mut metadata_cmd = MetadataCommand::new();
+    metadata_cmd.no_deps();
+    if let Some(path) = &manifest_path {
+        metadata_cmd.manifest_path(path);
+    }
+    let metadata = metadata_cmd
+        .exec()
+        .context("failed to read cargo metadata")?;
+    let package = select_package(&metadata, cargo_args.package.as_deref())?;
+    let configured_cpus = normalize_target_cpus(effective_target_cpus(&metadata, package)?)?;
+
+    let target = match cargo_args.target.clone() {
+        Some(target) => target,
+        None => rustc_default_target()?,
+    };
+    let cfg = rustc_cfg(&target, None)?;
+    let target_os = cfg_value(&cfg, "target_os").unwrap_or_default();
+    let target_arch = cfg_value(&cfg, "target_arch").unwrap_or_default();
+    if target_os != "linux" {
+        bail!("cargo-sonic supports Linux targets only; `{target}` has target_os={target_os:?}");
+    }
+    if target_arch != "x86_64" && target_arch != "aarch64" {
+        bail!(
+            "cargo-sonic currently supports x86_64 and aarch64 only; `{target}` has target_arch={target_arch:?}"
+        );
+    }
+
+    let host = detect_current_host(&target_arch)?;
+    let current_valid = rustc_target_cpus(&target)?;
+    let union_valid = known_supported_cpu_union()?;
+    let included = filter_target_cpus(&configured_cpus, &current_valid, &union_valid)?;
+
+    let mut metas = Vec::new();
+    let mut display = Vec::new();
+    for cpu in &included {
+        let features = parse_target_features_from_rustc_cfg(&rustc_cfg(&target, Some(cpu))?);
+        let feature_names = filter_runtime_features(&features);
+        if cpu != "generic" {
+            unsupported_runtime_features(&feature_names)?;
+        }
+        let rank_features = feature_mask(&feature_names)?;
+        let required_feature_names = safety_required_features(&feature_names);
+        let required_features = if cpu == "generic" {
+            FeatureMask::EMPTY
+        } else {
+            feature_mask(&required_feature_names)?
+        };
+        let target_kind = classify_target_cpu(cpu, &target_arch);
+        metas.push(VariantMeta {
+            target_cpu: leaked_str(cpu),
+            required_features,
+            rank_features,
+            rank_feature_count: rank_features.count(),
+            feature_tier: feature_tier(&target_arch, rank_features),
+            target_kind,
+        });
+        display.push(ProbeVariant {
+            target_cpu: cpu.clone(),
+            required_features,
+            rank_features,
+            feature_names,
+            feature_tier: feature_tier(&target_arch, rank_features),
+        });
+    }
+
+    let selected = select_variant(host, &metas);
+    print_probe_report(&target, host, &display, selected.target_cpu);
+    Ok(())
 }
 
 fn parse_cargo_args(args: &[String]) -> CargoArgs {
@@ -205,7 +316,249 @@ fn parse_cargo_args(args: &[String]) -> CargoArgs {
     out
 }
 
-fn select_package<'a>(metadata: &'a cargo_metadata::Metadata, package: Option<&str>) -> Result<&'a Package> {
+fn leaked_str(value: &str) -> &'static str {
+    Box::leak(value.to_string().into_boxed_str())
+}
+
+fn print_probe_report(target: &str, host: HostInfo, variants: &[ProbeVariant], selected: &str) {
+    println!("cargo-sonic probe");
+    println!("  target={target}");
+    println!("  host.arch={}", host_arch_name(host.arch));
+    println!("  host.features={}", format_words(host.features));
+    println!(
+        "  host.feature_names=[{}]",
+        feature_names(host.features).join(",")
+    );
+    println!("  host.identity={}", format_identity(host.identity));
+    println!("  variants:");
+    for variant in variants {
+        let eligible = variant.target_cpu == "generic"
+            || variant.required_features.is_subset_of(host.features);
+        let missing = FeatureMask::from_words([
+            variant.required_features.words()[0] & !host.features.words()[0],
+            variant.required_features.words()[1] & !host.features.words()[1],
+        ]);
+        print!(
+            "    {} eligible={} tier={} count={} required={}",
+            variant.target_cpu,
+            if eligible { "yes" } else { "no" },
+            variant.feature_tier,
+            variant.rank_features.count(),
+            format_words(variant.required_features)
+        );
+        if !eligible {
+            print!(
+                " missing={} missing_features=[{}]",
+                format_words(missing),
+                feature_names(missing).join(",")
+            );
+        }
+        println!(" flags=[{}]", variant.feature_names.join(","));
+    }
+    let eligible = variants
+        .iter()
+        .filter(|variant| {
+            variant.target_cpu == "generic" || variant.required_features.is_subset_of(host.features)
+        })
+        .map(|variant| variant.target_cpu.as_str())
+        .collect::<Vec<_>>();
+    println!("  fits=[{}]", eligible.join(","));
+    println!("  selected={selected}");
+}
+
+fn host_arch_name(arch: TargetArch) -> &'static str {
+    match arch {
+        TargetArch::X86_64 => "x86_64",
+        TargetArch::Aarch64 => "aarch64",
+    }
+}
+
+fn feature_names(mask: FeatureMask) -> Vec<&'static str> {
+    sonic_loader::feature_mask::ALL_FEATURES
+        .iter()
+        .copied()
+        .filter(|feature| mask.contains(*feature))
+        .map(sonic_loader::feature_mask::feature_name)
+        .collect()
+}
+
+fn format_words(mask: FeatureMask) -> String {
+    let words = mask.words();
+    format!("[{:#018x},{:#018x}]", words[0], words[1])
+}
+
+fn format_identity(identity: CpuIdentity) -> String {
+    match identity {
+        CpuIdentity::Unknown => "unknown".to_string(),
+        CpuIdentity::X86 {
+            vendor,
+            family,
+            model,
+            stepping,
+        } => {
+            let vendor = match vendor {
+                X86Vendor::Intel => "intel",
+                X86Vendor::Amd => "amd",
+                X86Vendor::Other => "other",
+            };
+            format!("x86({vendor} family={family} model={model} stepping={stepping})")
+        }
+        CpuIdentity::Aarch64 {
+            implementer,
+            part,
+            variant,
+            revision,
+        } => format!(
+            "aarch64(implementer={implementer:#x} part={part:#x} variant={variant} revision={revision})"
+        ),
+    }
+}
+
+fn detect_current_host(target_arch: &str) -> Result<HostInfo> {
+    match target_arch {
+        "x86_64" => detect_current_x86_64_host(),
+        "aarch64" => detect_current_aarch64_host(),
+        _ => bail!("unsupported target_arch `{target_arch}`"),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn detect_current_x86_64_host() -> Result<HostInfo> {
+    let leaf1 = core::arch::x86_64::__cpuid_count(1, 0);
+    let leaf7_0 = core::arch::x86_64::__cpuid_count(7, 0);
+    let leaf7_1 = core::arch::x86_64::__cpuid_count(7, 1);
+    let leaf_d_1 = core::arch::x86_64::__cpuid_count(0xd, 1);
+    let leaf80000001 = core::arch::x86_64::__cpuid_count(0x80000001, 0);
+    let xcr0 = if (leaf1.ecx & (1 << 26)) != 0 && (leaf1.ecx & (1 << 27)) != 0 {
+        unsafe { core::arch::x86_64::_xgetbv(0) }
+    } else {
+        0
+    };
+    Ok(HostInfo {
+        arch: TargetArch::X86_64,
+        features: arch_x86_64::detect_x86_features_from_cpuid(
+            arch_x86_64::X86Cpuid {
+                leaf1: cpuid_leaf(leaf1),
+                leaf7_0: cpuid_leaf(leaf7_0),
+                leaf7_1: cpuid_leaf(leaf7_1),
+                leaf_d_1: cpuid_leaf(leaf_d_1),
+                leaf80000001: cpuid_leaf(leaf80000001),
+            },
+            xcr0,
+        ),
+        identity: detect_current_x86_64_identity(),
+        heterogeneous: false,
+    })
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn detect_current_x86_64_host() -> Result<HostInfo> {
+    bail!("cannot probe x86_64 target on this host architecture")
+}
+
+#[cfg(target_arch = "x86_64")]
+fn cpuid_leaf(leaf: core::arch::x86_64::CpuidResult) -> arch_x86_64::CpuidLeaf {
+    arch_x86_64::CpuidLeaf {
+        eax: leaf.eax,
+        ebx: leaf.ebx,
+        ecx: leaf.ecx,
+        edx: leaf.edx,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn detect_current_x86_64_identity() -> CpuIdentity {
+    let vendor_leaf = core::arch::x86_64::__cpuid_count(0, 0);
+    let vendor = if vendor_leaf.ebx == 0x756e6547
+        && vendor_leaf.edx == 0x49656e69
+        && vendor_leaf.ecx == 0x6c65746e
+    {
+        X86Vendor::Intel
+    } else if vendor_leaf.ebx == 0x68747541
+        && vendor_leaf.edx == 0x69746e65
+        && vendor_leaf.ecx == 0x444d4163
+    {
+        X86Vendor::Amd
+    } else {
+        X86Vendor::Other
+    };
+    let leaf1 = core::arch::x86_64::__cpuid_count(1, 0);
+    let base_family = ((leaf1.eax >> 8) & 0xf) as u16;
+    let ext_family = ((leaf1.eax >> 20) & 0xff) as u16;
+    let base_model = ((leaf1.eax >> 4) & 0xf) as u16;
+    let ext_model = ((leaf1.eax >> 16) & 0xf) as u16;
+    let family = if base_family == 0xf {
+        base_family + ext_family
+    } else {
+        base_family
+    };
+    let model = if base_family == 0x6 || base_family == 0xf {
+        base_model | (ext_model << 4)
+    } else {
+        base_model
+    };
+    CpuIdentity::X86 {
+        vendor,
+        family,
+        model,
+        stepping: (leaf1.eax & 0xf) as u8,
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn detect_current_aarch64_host() -> Result<HostInfo> {
+    let (hwcap, hwcap2, hwcap3) = read_auxv_hwcaps()?;
+    Ok(HostInfo {
+        arch: TargetArch::Aarch64,
+        features: sonic_loader::arch_aarch64::detect_aarch64_features_from_hwcap(
+            hwcap, hwcap2, hwcap3,
+        ),
+        identity: CpuIdentity::Unknown,
+        heterogeneous: false,
+    })
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn detect_current_aarch64_host() -> Result<HostInfo> {
+    bail!("cannot probe aarch64 target on this host architecture")
+}
+
+#[cfg(target_arch = "aarch64")]
+fn read_auxv_hwcaps() -> Result<(usize, usize, usize)> {
+    const AT_HWCAP: usize = 16;
+    const AT_HWCAP2: usize = 26;
+    const AT_HWCAP3: usize = 29;
+    let bytes = fs::read("/proc/self/auxv").context("failed to read /proc/self/auxv")?;
+    let word = core::mem::size_of::<usize>();
+    let mut hwcap = 0;
+    let mut hwcap2 = 0;
+    let mut hwcap3 = 0;
+    for entry in bytes.chunks_exact(word * 2) {
+        let key = usize_from_ne_bytes(&entry[..word]);
+        let value = usize_from_ne_bytes(&entry[word..]);
+        match key {
+            AT_HWCAP => hwcap = value,
+            AT_HWCAP2 => hwcap2 = value,
+            AT_HWCAP3 => hwcap3 = value,
+            _ => {}
+        }
+    }
+    Ok((hwcap, hwcap2, hwcap3))
+}
+
+#[cfg(target_arch = "aarch64")]
+fn usize_from_ne_bytes(bytes: &[u8]) -> usize {
+    let mut out = 0usize;
+    for (i, byte) in bytes.iter().enumerate() {
+        out |= (*byte as usize) << (i * 8);
+    }
+    out
+}
+
+fn select_package<'a>(
+    metadata: &'a cargo_metadata::Metadata,
+    package: Option<&str>,
+) -> Result<&'a Package> {
     if let Some(package) = package {
         return metadata
             .packages
@@ -227,14 +580,21 @@ fn select_package<'a>(metadata: &'a cargo_metadata::Metadata, package: Option<&s
     bail!("cannot identify package; pass --package");
 }
 
-fn effective_target_cpus(metadata: &cargo_metadata::Metadata, package: &Package) -> Result<Vec<String>> {
+fn effective_target_cpus(
+    metadata: &cargo_metadata::Metadata,
+    package: &Package,
+) -> Result<Vec<String>> {
     if let Some(v) = package.metadata.get("sonic") {
         let sonic: SonicMetadata = serde_json::from_value(v.clone())?;
-        return sonic.target_cpus.context("package.metadata.sonic.target-cpus must exist");
+        return sonic
+            .target_cpus
+            .context("package.metadata.sonic.target-cpus must exist");
     }
     if let Some(v) = metadata.workspace_metadata.get("sonic") {
         let sonic: SonicMetadata = serde_json::from_value(v.clone())?;
-        return sonic.target_cpus.context("workspace.metadata.sonic.target-cpus must exist");
+        return sonic
+            .target_cpus
+            .context("workspace.metadata.sonic.target-cpus must exist");
     }
     bail!("target-cpus must exist under [package.metadata.sonic]");
 }
@@ -262,23 +622,42 @@ fn rustc_default_target() -> Result<String> {
         .context("failed to determine rustc host target")
 }
 
+fn effective_target_directory(metadata: &cargo_metadata::Metadata) -> Result<Utf8PathBuf> {
+    if let Some(value) =
+        std::env::var_os("CARGO_TARGET_DIR").or_else(|| std::env::var_os("CARGO_TARGET"))
+    {
+        return Utf8PathBuf::from_path_buf(std::path::PathBuf::from(value))
+            .map_err(|_| anyhow!("CARGO_TARGET_DIR is not valid UTF-8"));
+    }
+    Utf8PathBuf::from_path_buf(metadata.target_directory.clone().into_std_path_buf())
+        .map_err(|_| anyhow!("target directory is not valid UTF-8"))
+}
+
 fn rustc_cfg(target: &str, cpu: Option<&str>) -> Result<String> {
     let mut cmd = Command::new("rustc");
     cmd.args(["--print", "cfg", "--target", target]);
     if let Some(cpu) = cpu {
         cmd.args(["-C", &format!("target-cpu={cpu}")]);
     }
-    let output = cmd.output().with_context(|| "failed to run rustc --print cfg")?;
+    let output = cmd
+        .output()
+        .with_context(|| "failed to run rustc --print cfg")?;
     if !output.status.success() {
-        bail!("rustc --print cfg failed: {}", String::from_utf8_lossy(&output.stderr));
+        bail!(
+            "rustc --print cfg failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     Ok(String::from_utf8(output.stdout)?)
 }
 
 fn cfg_value(cfg: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=\"");
-    cfg.lines()
-        .find_map(|line| line.strip_prefix(&prefix)?.strip_suffix('"').map(str::to_string))
+    cfg.lines().find_map(|line| {
+        line.strip_prefix(&prefix)?
+            .strip_suffix('"')
+            .map(str::to_string)
+    })
 }
 
 pub fn parse_target_features_from_rustc_cfg(cfg: &str) -> Vec<String> {
@@ -308,7 +687,10 @@ fn rustc_target_cpus(target: &str) -> Result<BTreeSet<String>> {
         .output()
         .with_context(|| "failed to run rustc --print target-cpus")?;
     if !output.status.success() {
-        bail!("rustc --print target-cpus failed: {}", String::from_utf8_lossy(&output.stderr));
+        bail!(
+            "rustc --print target-cpus failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     Ok(parse_rustc_target_cpus(&String::from_utf8(output.stdout)?))
 }
@@ -372,7 +754,10 @@ fn unsupported_runtime_features(features: &[String]) -> Result<()> {
         .cloned()
         .collect();
     if !unsupported.is_empty() {
-        bail!("unsupported runtime feature mapping(s): {}", unsupported.join(", "));
+        bail!(
+            "unsupported runtime feature mapping(s): {}",
+            unsupported.join(", ")
+        );
     }
     Ok(())
 }
@@ -399,11 +784,26 @@ fn safety_required_features(features: &[String]) -> Vec<String> {
 fn is_safety_required_feature(feature: &str) -> bool {
     !matches!(
         feature,
-        // These instructions are not normal compiler codegen targets. They are
-        // kept in rank_features / CARGO_SONIC_SELECTED_FLAGS, but do not make a
-        // CPU-tuned payload ineligible when firmware, virtualization, or kernel
-        // policy hides hardware RNG support.
-        "rdrand" | "rdseed"
+        // These are not normal user-space compiler codegen safety requirements.
+        // Keep them in rank_features / CARGO_SONIC_SELECTED_FLAGS, but do not
+        // make a CPU-tuned payload ineligible when firmware, virtualization,
+        // kernel policy, or QEMU user-mode hides monitoring/profiling/RNG state.
+        "bti"
+            | "dit"
+            | "lor"
+            | "mte"
+            | "paca"
+            | "pacg"
+            | "pan"
+            | "pmuv3"
+            | "rand"
+            | "ras"
+            | "rdrand"
+            | "rdseed"
+            | "sb"
+            | "spe"
+            | "ssbs"
+            | "vh"
     )
 }
 
@@ -431,13 +831,26 @@ fn build_payload_variant(
     cmd.args(["--target-dir", target_dir.as_str()]);
     cmd.env("CARGO_ENCODED_RUSTFLAGS", encoded_rustflags(cpu));
     cmd.stdout(Stdio::piped());
-    let mut child = cmd.spawn().with_context(|| format!("failed to spawn cargo for target-cpu `{cpu}`"))?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn cargo for target-cpu `{cpu}`"))?;
     let stdout = child.stdout.take().context("failed to read cargo stdout")?;
     let reader = std::io::BufReader::new(stdout);
     let mut executables = Vec::new();
     for message in Message::parse_stream(reader) {
-        if let Message::CompilerArtifact(Artifact { executable: Some(exe), target: artifact_target, package_id, .. }) = message? {
-            if package_id == package.id && artifact_target.kind.iter().any(|k| matches!(k, cargo_metadata::TargetKind::Bin)) {
+        if let Message::CompilerArtifact(Artifact {
+            executable: Some(exe),
+            target: artifact_target,
+            package_id,
+            ..
+        }) = message?
+        {
+            if package_id == package.id
+                && artifact_target
+                    .kind
+                    .iter()
+                    .any(|k| matches!(k, cargo_metadata::TargetKind::Bin))
+            {
                 let exe = Utf8PathBuf::from_path_buf(exe.into_std_path_buf())
                     .map_err(|_| anyhow!("artifact path is not valid UTF-8"))?;
                 executables.push(exe);
@@ -477,14 +890,23 @@ fn sanitize_cpu(cpu: &str) -> String {
         .collect()
 }
 
-fn resolve_bin_name(package: &Package, explicit_bin: Option<&str>, variants: &[VariantBuild]) -> Result<String> {
+fn resolve_bin_name(
+    package: &Package,
+    explicit_bin: Option<&str>,
+    variants: &[VariantBuild],
+) -> Result<String> {
     if let Some(bin) = explicit_bin {
         return Ok(bin.to_string());
     }
     let bins: Vec<_> = package
         .targets
         .iter()
-        .filter(|target| target.kind.iter().any(|k| matches!(k, cargo_metadata::TargetKind::Bin)))
+        .filter(|target| {
+            target
+                .kind
+                .iter()
+                .any(|k| matches!(k, cargo_metadata::TargetKind::Bin))
+        })
         .collect();
     if bins.len() == 1 {
         return Ok(bins[0].name.clone());
@@ -495,7 +917,11 @@ fn resolve_bin_name(package: &Package, explicit_bin: Option<&str>, variants: &[V
     bail!("multiple binary artifacts are possible; pass --bin");
 }
 
-fn generate_loader_crate(loader_dir: &Utf8Path, target: &str, variants: &[VariantBuild]) -> Result<()> {
+fn generate_loader_crate(
+    loader_dir: &Utf8Path,
+    target: &str,
+    variants: &[VariantBuild],
+) -> Result<()> {
     fs::create_dir_all(loader_dir.join("src"))?;
     fs::write(
         loader_dir.join("Cargo.toml"),
@@ -515,13 +941,28 @@ panic = "abort"
 "#
         ),
     )?;
-    fs::write(loader_dir.join("src/feature_mask.rs"), include_str!("../../sonic-loader/src/feature_mask.rs"))?;
-    fs::write(loader_dir.join("src/select.rs"), include_str!("../../sonic-loader/src/select.rs"))?;
-    fs::write(loader_dir.join("src/arch_x86_64.rs"), include_str!("../../sonic-loader/src/arch_x86_64.rs"))?;
-    fs::write(loader_dir.join("src/arch_aarch64.rs"), include_str!("../../sonic-loader/src/arch_aarch64.rs"))?;
+    fs::write(
+        loader_dir.join("src/feature_mask.rs"),
+        include_str!("../../sonic-loader/src/feature_mask.rs"),
+    )?;
+    fs::write(
+        loader_dir.join("src/select.rs"),
+        include_str!("../../sonic-loader/src/select.rs"),
+    )?;
+    fs::write(
+        loader_dir.join("src/arch_x86_64.rs"),
+        include_str!("../../sonic-loader/src/arch_x86_64.rs"),
+    )?;
+    fs::write(
+        loader_dir.join("src/arch_aarch64.rs"),
+        include_str!("../../sonic-loader/src/arch_aarch64.rs"),
+    )?;
     fs::write(loader_dir.join("src/linux_sys.rs"), generated_linux_sys())?;
     fs::write(loader_dir.join("src/stack.rs"), generated_stack())?;
-    fs::write(loader_dir.join("src/generated_manifest.rs"), generated_manifest(variants))?;
+    fs::write(
+        loader_dir.join("src/generated_manifest.rs"),
+        generated_manifest(variants),
+    )?;
     fs::write(loader_dir.join("src/main.rs"), generated_main(target))?;
     Ok(())
 }
@@ -535,8 +976,10 @@ fn build_loader(loader_dir: &Utf8Path, target: &str, profile: &str) -> Result<Ut
     if profile == "release" {
         cmd.arg("--release");
     }
-    cmd.env("RUSTFLAGS", "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-arg=-nostartfiles -C link-arg=-static");
-    let status = cmd.status().context("failed to spawn cargo for generated loader")?;
+    cmd.env("RUSTFLAGS", loader_rustflags(target));
+    let status = cmd
+        .status()
+        .context("failed to spawn cargo for generated loader")?;
     if !status.success() {
         bail!("generated loader failed to compile");
     }
@@ -545,6 +988,14 @@ fn build_loader(loader_dir: &Utf8Path, target: &str, profile: &str) -> Result<Ut
         .join(profile)
         .join("sonic-generated-loader");
     Ok(exe)
+}
+
+fn loader_rustflags(target: &str) -> &'static str {
+    if target.contains("-musl") {
+        "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-static"
+    } else {
+        "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-arg=-nostartfiles -C link-arg=-static"
+    }
 }
 
 fn generated_manifest(variants: &[VariantBuild]) -> String {
@@ -559,14 +1010,35 @@ fn generated_manifest(variants: &[VariantBuild]) -> String {
         let flags = v.feature_names.join(",");
         out.push_str("    Variant {\n");
         out.push_str(&format!("        target_cpu: {:?},\n", v.target_cpu));
-        out.push_str(&format!("        required_features: FeatureMask::from_words([{:#x}, {:#x}]),\n", req[0], req[1]));
-        out.push_str(&format!("        rank_features: FeatureMask::from_words([{:#x}, {:#x}]),\n", rank[0], rank[1]));
-        out.push_str(&format!("        rank_feature_count: {},\n", v.rank_features.count()));
+        out.push_str(&format!(
+            "        required_features: FeatureMask::from_words([{:#x}, {:#x}]),\n",
+            req[0], req[1]
+        ));
+        out.push_str(&format!(
+            "        rank_features: FeatureMask::from_words([{:#x}, {:#x}]),\n",
+            rank[0], rank[1]
+        ));
+        out.push_str(&format!(
+            "        rank_feature_count: {},\n",
+            v.rank_features.count()
+        ));
         out.push_str(&format!("        feature_tier: {},\n", v.feature_tier));
-        out.push_str(&format!("        target_kind: {},\n", target_kind_expr(v.target_kind)));
-        out.push_str(&format!("        env_selected_target_cpu: b\"CARGO_SONIC_SELECTED_TARGET_CPU={}\\0\",\n", escape_bytes(&v.target_cpu)));
-        out.push_str(&format!("        env_selected_flags: b\"CARGO_SONIC_SELECTED_FLAGS={}\\0\",\n", escape_bytes(&flags)));
-        out.push_str(&format!("        payload: include_bytes!(\"../payloads/{}.elf\"),\n", sanitize_cpu(&v.target_cpu)));
+        out.push_str(&format!(
+            "        target_kind: {},\n",
+            target_kind_expr(v.target_kind)
+        ));
+        out.push_str(&format!(
+            "        env_selected_target_cpu: b\"CARGO_SONIC_SELECTED_TARGET_CPU={}\\0\",\n",
+            escape_bytes(&v.target_cpu)
+        ));
+        out.push_str(&format!(
+            "        env_selected_flags: b\"CARGO_SONIC_SELECTED_FLAGS={}\\0\",\n",
+            escape_bytes(&flags)
+        ));
+        out.push_str(&format!(
+            "        payload: include_bytes!(\"../payloads/{}.elf\"),\n",
+            sanitize_cpu(&v.target_cpu)
+        ));
         out.push_str("    },\n");
     }
     out.push_str("];\n");
@@ -576,11 +1048,15 @@ fn generated_manifest(variants: &[VariantBuild]) -> String {
 fn target_kind_expr(kind: TargetKind) -> String {
     match kind {
         TargetKind::Generic => "TargetKind::Generic".to_string(),
-        TargetKind::X86NeutralLevel { level } => format!("TargetKind::X86NeutralLevel {{ level: {level} }}"),
+        TargetKind::X86NeutralLevel { level } => {
+            format!("TargetKind::X86NeutralLevel {{ level: {level} }}")
+        }
         TargetKind::X86IntelCore => "TargetKind::X86IntelCore".to_string(),
         TargetKind::X86IntelXeon => "TargetKind::X86IntelXeon".to_string(),
         TargetKind::X86IntelAtom => "TargetKind::X86IntelAtom".to_string(),
-        TargetKind::X86AmdZen { generation } => format!("TargetKind::X86AmdZen {{ generation: {generation} }}"),
+        TargetKind::X86AmdZen { generation } => {
+            format!("TargetKind::X86AmdZen {{ generation: {generation} }}")
+        }
         TargetKind::X86AmdOther => "TargetKind::X86AmdOther".to_string(),
         TargetKind::Aarch64ArmNeoverseN => "TargetKind::Aarch64ArmNeoverseN".to_string(),
         TargetKind::Aarch64ArmNeoverseV => "TargetKind::Aarch64ArmNeoverseV".to_string(),
@@ -658,6 +1134,11 @@ unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
 }
 
 #[no_mangle]
+unsafe extern "C" fn bcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    memcmp(a, b, n)
+}
+
+#[no_mangle]
 extern "C" fn rust_eh_personality() {}
 
 #[cfg(target_arch = "x86_64")]
@@ -690,7 +1171,7 @@ unsafe extern "C" fn loader_entry(stack: *const usize) -> ! {
         rank_feature_count: 0,
         feature_tier: 0,
         target_kind: select::TargetKind::Generic,
-    }; 64];
+    }; 256];
     let count = VARIANTS.len();
     let mut i = 0;
     while i < count {
@@ -721,12 +1202,26 @@ unsafe extern "C" fn loader_entry(stack: *const usize) -> ! {
 fn find_variant(name: &str) -> &'static Variant {
     let mut i = 0;
     while i < VARIANTS.len() {
-        if VARIANTS[i].target_cpu.as_bytes() == name.as_bytes() {
+        if bytes_eq(VARIANTS[i].target_cpu.as_bytes(), name.as_bytes()) {
             return &VARIANTS[i];
         }
         i += 1;
     }
     &VARIANTS[0]
+}
+
+fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 fn generic_meta<'a>(variants: &'a [VariantMeta]) -> &'a VariantMeta {
@@ -944,10 +1439,197 @@ fn detect_host(initial: &stack::InitialStack) -> HostInfo {
         HostInfo {
             arch: TargetArch::Aarch64,
             features: arch_aarch64::detect_aarch64_features_from_hwcap(initial.hwcap, initial.hwcap2, initial.hwcap3),
-            identity: CpuIdentity::Unknown,
+            identity: unsafe { detect_aarch64_identity_from_cpuinfo() },
             heterogeneous: false,
         }
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn detect_aarch64_identity_from_cpuinfo() -> CpuIdentity {
+    let midr = read_midr_el1();
+    if midr != 0 {
+        return CpuIdentity::Aarch64 {
+            implementer: ((midr >> 24) & 0xff) as u16,
+            part: ((midr >> 4) & 0xfff) as u16,
+            variant: ((midr >> 20) & 0xf) as u8,
+            revision: (midr & 0xf) as u8,
+        };
+    }
+
+    let midr = read_small_file_hex(
+        b"/sys/devices/system/cpu/cpu0/regs/identification/midr_el1\0".as_ptr(),
+    );
+    if let Some(midr) = midr {
+        return CpuIdentity::Aarch64 {
+            implementer: ((midr >> 24) & 0xff) as u16,
+            part: ((midr >> 4) & 0xfff) as u16,
+            variant: ((midr >> 20) & 0xf) as u8,
+            revision: (midr & 0xf) as u8,
+        };
+    }
+
+    let fd = linux_sys::openat(linux_sys::AT_FDCWD, b"/proc/cpuinfo\0".as_ptr(), 0, 0);
+    if fd < 0 {
+        return CpuIdentity::Unknown;
+    }
+    let mut buf = [0u8; 4096];
+    let n = linux_sys::read(fd, buf.as_mut_ptr(), buf.len());
+    let _ = linux_sys::close(fd);
+    if n <= 0 {
+        return CpuIdentity::Unknown;
+    }
+    parse_aarch64_cpuinfo(&buf[..n as usize])
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn read_midr_el1() -> u32 {
+    let value: u64;
+    core::arch::asm!("mrs {}, MIDR_EL1", out(reg) value, options(nostack, nomem));
+    value as u32
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn read_small_file_hex(path: *const u8) -> Option<u32> {
+    let fd = linux_sys::openat(linux_sys::AT_FDCWD, path, 0, 0);
+    if fd < 0 {
+        return None;
+    }
+    let mut buf = [0u8; 64];
+    let n = linux_sys::read(fd, buf.as_mut_ptr(), buf.len());
+    let _ = linux_sys::close(fd);
+    if n <= 0 {
+        return None;
+    }
+    parse_hex_u32(&buf[..n as usize])
+}
+
+#[cfg(target_arch = "aarch64")]
+fn parse_hex_u32(buf: &[u8]) -> Option<u32> {
+    let mut out = 0u32;
+    let mut seen = false;
+    let mut i = 0;
+    while i < buf.len() {
+        let b = buf[i];
+        let digit = if b >= b'0' && b <= b'9' {
+            b - b'0'
+        } else if b >= b'a' && b <= b'f' {
+            b - b'a' + 10
+        } else if b >= b'A' && b <= b'F' {
+            b - b'A' + 10
+        } else if b == b'x' || b == b'X' || b == b' ' || b == b'\t' || b == b'\n' {
+            i += 1;
+            continue;
+        } else {
+            break;
+        };
+        out = (out << 4) | digit as u32;
+        seen = true;
+        i += 1;
+    }
+    if seen { Some(out) } else { None }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn parse_aarch64_cpuinfo(buf: &[u8]) -> CpuIdentity {
+    let implementer = cpuinfo_hex_value(buf, b"CPU implementer");
+    let part = cpuinfo_hex_value(buf, b"CPU part");
+    let variant = cpuinfo_hex_value(buf, b"CPU variant");
+    let revision = cpuinfo_decimal_value(buf, b"CPU revision");
+    if let (Some(implementer), Some(part)) = (implementer, part) {
+        CpuIdentity::Aarch64 {
+            implementer,
+            part,
+            variant: variant.unwrap_or(0) as u8,
+            revision: revision.unwrap_or(0) as u8,
+        }
+    } else {
+        CpuIdentity::Unknown
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn cpuinfo_hex_value(buf: &[u8], key: &[u8]) -> Option<u16> {
+    let value = cpuinfo_value(buf, key)?;
+    let mut out = 0u16;
+    let mut seen = false;
+    let mut i = 0;
+    while i < value.len() {
+        let b = value[i];
+        let digit = if b >= b'0' && b <= b'9' {
+            b - b'0'
+        } else if b >= b'a' && b <= b'f' {
+            b - b'a' + 10
+        } else if b >= b'A' && b <= b'F' {
+            b - b'A' + 10
+        } else if b == b'x' || b == b'X' || b == b' ' || b == b'\t' {
+            i += 1;
+            continue;
+        } else {
+            break;
+        };
+        out = (out << 4) | digit as u16;
+        seen = true;
+        i += 1;
+    }
+    if seen { Some(out) } else { None }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn cpuinfo_decimal_value(buf: &[u8], key: &[u8]) -> Option<u16> {
+    let value = cpuinfo_value(buf, key)?;
+    let mut out = 0u16;
+    let mut seen = false;
+    let mut i = 0;
+    while i < value.len() {
+        let b = value[i];
+        if b >= b'0' && b <= b'9' {
+            out = out.saturating_mul(10).saturating_add((b - b'0') as u16);
+            seen = true;
+        } else if seen {
+            break;
+        }
+        i += 1;
+    }
+    if seen { Some(out) } else { None }
+}
+
+#[cfg(target_arch = "aarch64")]
+fn cpuinfo_value<'a>(buf: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let mut start = 0;
+    while start < buf.len() {
+        let mut end = start;
+        while end < buf.len() && buf[end] != b'\n' {
+            end += 1;
+        }
+        let line = &buf[start..end];
+        if starts_with_bytes(line, key) {
+            let mut colon = 0;
+            while colon < line.len() && line[colon] != b':' {
+                colon += 1;
+            }
+            if colon < line.len() {
+                return Some(&line[colon + 1..]);
+            }
+        }
+        start = end + 1;
+    }
+    None
+}
+
+#[cfg(target_arch = "aarch64")]
+fn starts_with_bytes(buf: &[u8], prefix: &[u8]) -> bool {
+    if buf.len() < prefix.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < prefix.len() {
+        if buf[i] != prefix[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -957,7 +1639,11 @@ unsafe fn detect_x86() -> feature_mask::FeatureMask {
     let l71 = core::arch::x86_64::__cpuid_count(7, 1);
     let ld1 = core::arch::x86_64::__cpuid_count(0xd, 1);
     let l8 = core::arch::x86_64::__cpuid_count(0x80000001, 0);
-    let xcr0 = core::arch::x86_64::_xgetbv(0);
+    let xcr0 = if (l1.ecx & (1 << 26)) != 0 && (l1.ecx & (1 << 27)) != 0 {
+        core::arch::x86_64::_xgetbv(0)
+    } else {
+        0
+    };
     arch_x86_64::detect_x86_features_from_cpuid(
         arch_x86_64::X86Cpuid {
             leaf1: arch_x86_64::CpuidLeaf { eax: l1.eax, ebx: l1.ebx, ecx: l1.ecx, edx: l1.edx },
@@ -1002,13 +1688,20 @@ fn generated_linux_sys() -> &'static str {
 #[cfg(target_arch = "x86_64")]
 const SYS_WRITE: usize = 1;
 #[cfg(target_arch = "x86_64")]
+const SYS_READ: usize = 0;
+#[cfg(target_arch = "x86_64")]
+const SYS_CLOSE: usize = 3;
+#[cfg(target_arch = "x86_64")]
 const SYS_MMAP: usize = 9;
 #[cfg(target_arch = "x86_64")]
 const SYS_EXIT: usize = 60;
 #[cfg(target_arch = "x86_64")]
+const SYS_OPENAT: usize = 257;
+#[cfg(target_arch = "x86_64")]
 const SYS_MEMFD_CREATE: usize = 319;
 #[cfg(target_arch = "x86_64")]
 const SYS_EXECVEAT: usize = 322;
+pub const AT_FDCWD: isize = -100;
 const PROT_READ: usize = 1;
 const PROT_WRITE: usize = 2;
 const MAP_PRIVATE: usize = 2;
@@ -1020,9 +1713,15 @@ const EINVAL_NEG: isize = -22;
 #[cfg(target_arch = "aarch64")]
 const SYS_WRITE: usize = 64;
 #[cfg(target_arch = "aarch64")]
+const SYS_READ: usize = 63;
+#[cfg(target_arch = "aarch64")]
+const SYS_CLOSE: usize = 57;
+#[cfg(target_arch = "aarch64")]
 const SYS_MMAP: usize = 222;
 #[cfg(target_arch = "aarch64")]
 const SYS_EXIT: usize = 93;
+#[cfg(target_arch = "aarch64")]
+const SYS_OPENAT: usize = 56;
 #[cfg(target_arch = "aarch64")]
 const SYS_MEMFD_CREATE: usize = 279;
 #[cfg(target_arch = "aarch64")]
@@ -1067,6 +1766,18 @@ pub unsafe fn write_all(fd: isize, mut ptr: *const u8, mut len: usize) -> isize 
         len -= n as usize;
     }
     0
+}
+
+pub unsafe fn read(fd: isize, ptr: *mut u8, len: usize) -> isize {
+    syscall6(SYS_READ, fd as usize, ptr as usize, len, 0, 0, 0)
+}
+
+pub unsafe fn openat(dirfd: isize, path: *const u8, flags: usize, mode: usize) -> isize {
+    syscall6(SYS_OPENAT, dirfd as usize, path as usize, flags, mode, 0, 0)
+}
+
+pub unsafe fn close(fd: isize) -> isize {
+    syscall6(SYS_CLOSE, fd as usize, 0, 0, 0, 0, 0)
 }
 
 pub unsafe fn write_stderr(buf: &[u8]) {
@@ -1234,21 +1945,53 @@ fn escape_bytes(s: &str) -> String {
 
 fn feature_tier(arch: &str, mask: FeatureMask) -> u8 {
     if arch == "x86_64" {
-        if has_any(mask, &[Feature::Avx512Vnni, Feature::Avx512Bf16, Feature::Avx512Fp16]) { 5 }
-        else if mask.contains(Feature::Avx512F) && (mask.contains(Feature::Avx512Bw) || mask.contains(Feature::Avx512Dq) || mask.contains(Feature::Avx512Vl)) { 4 }
-        else if has_any(mask, &[Feature::Avx2, Feature::Bmi1, Feature::Bmi2]) { 3 }
-        else if has_any(mask, &[Feature::Avx, Feature::Fma]) { 2 }
-        else if has_any(mask, &[Feature::Sse3, Feature::Ssse3, Feature::Sse4_1, Feature::Sse4_2]) { 1 }
-        else { 0 }
+        if has_any(
+            mask,
+            &[
+                Feature::Avx512Vnni,
+                Feature::Avx512Bf16,
+                Feature::Avx512Fp16,
+            ],
+        ) {
+            5
+        } else if mask.contains(Feature::Avx512F)
+            && (mask.contains(Feature::Avx512Bw)
+                || mask.contains(Feature::Avx512Dq)
+                || mask.contains(Feature::Avx512Vl))
+        {
+            4
+        } else if has_any(mask, &[Feature::Avx2, Feature::Bmi1, Feature::Bmi2]) {
+            3
+        } else if has_any(mask, &[Feature::Avx, Feature::Fma]) {
+            2
+        } else if has_any(
+            mask,
+            &[
+                Feature::Sse3,
+                Feature::Ssse3,
+                Feature::Sse4_1,
+                Feature::Sse4_2,
+            ],
+        ) {
+            1
+        } else {
+            0
+        }
     } else if has_any(mask, &[Feature::Sve2]) {
         5
     } else if mask.contains(Feature::Sve) {
         4
     } else if has_any(mask, &[Feature::Bf16, Feature::I8mm]) {
         3
-    } else if has_any(mask, &[Feature::Lse, Feature::Fp16, Feature::Dotprod, Feature::Rdm]) {
+    } else if has_any(
+        mask,
+        &[Feature::Lse, Feature::Fp16, Feature::Dotprod, Feature::Rdm],
+    ) {
         2
-    } else if has_any(mask, &[Feature::Crc, Feature::Aes, Feature::Sha2, Feature::Sha3]) {
+    } else if has_any(
+        mask,
+        &[Feature::Crc, Feature::Aes, Feature::Sha2, Feature::Sha3],
+    ) {
         1
     } else {
         0
@@ -1272,15 +2015,33 @@ fn classify_target_cpu(cpu: &str, arch: &str) -> TargetKind {
             c if c.starts_with("znver") => TargetKind::X86AmdZen {
                 generation: c.trim_start_matches("znver").parse().unwrap_or(0),
             },
-            c if c.contains("atom") || c.contains("silvermont") || c.contains("goldmont") || c.contains("gracemont") => TargetKind::X86IntelAtom,
-            c if c.contains("lake") || c.contains("well") || c.contains("bridge") => TargetKind::X86IntelCore,
-            c if c.contains("rapids") || c.contains("skx") || c.contains("skylake-avx512") => TargetKind::X86IntelXeon,
+            c if c.contains("atom")
+                || c.contains("silvermont")
+                || c.contains("goldmont")
+                || c.contains("gracemont")
+                || c.contains("forest")
+                || c == "grandridge" =>
+            {
+                TargetKind::X86IntelAtom
+            }
+            c if c.contains("lake")
+                || c.contains("well")
+                || c.contains("bridge")
+                || matches!(c, "nocona" | "core2" | "penryn" | "nehalem" | "westmere") =>
+            {
+                TargetKind::X86IntelCore
+            }
+            c if c.contains("rapids") || c.contains("skx") || c.contains("skylake-avx512") => {
+                TargetKind::X86IntelXeon
+            }
             _ => TargetKind::X86AmdOther,
         };
     }
     match cpu {
         c if c.starts_with("neoverse-n") => TargetKind::Aarch64ArmNeoverseN,
-        c if c.starts_with("neoverse-v") || c == "neoverse-512tvb" => TargetKind::Aarch64ArmNeoverseV,
+        c if c.starts_with("neoverse-v") || c == "neoverse-512tvb" => {
+            TargetKind::Aarch64ArmNeoverseV
+        }
         c if c.starts_with("neoverse-e") => TargetKind::Aarch64ArmNeoverseE,
         c if c.starts_with("cortex-a") => TargetKind::Aarch64ArmCortexA,
         c if c.starts_with("cortex-x") => TargetKind::Aarch64ArmCortexX,
@@ -1303,9 +2064,18 @@ fn analyze_warnings(features_by_cpu: &BTreeMap<String, Vec<String>>, arch: &str)
             }
         }
     }
-    if arch == "x86_64" && !features_by_cpu.keys().any(|cpu| matches!(cpu.as_str(), "x86-64" | "x86-64-v2" | "x86-64-v3" | "x86-64-v4")) {
+    if arch == "x86_64"
+        && !features_by_cpu.keys().any(|cpu| {
+            matches!(
+                cpu.as_str(),
+                "x86-64" | "x86-64-v2" | "x86-64-v3" | "x86-64-v4"
+            )
+        })
+    {
         if features_by_cpu.keys().any(|cpu| cpu != "generic") {
-            warnings.push("vendor-specific x86 targets configured without a neutral x86 fallback".to_string());
+            warnings.push(
+                "vendor-specific x86 targets configured without a neutral x86 fallback".to_string(),
+            );
         }
     }
     warnings
@@ -1321,7 +2091,9 @@ fn make_executable(path: &Utf8Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn make_executable(_path: &Utf8Path) -> Result<()> { Ok(()) }
+fn make_executable(_path: &Utf8Path) -> Result<()> {
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {
@@ -1329,13 +2101,18 @@ mod tests {
 
     #[test]
     fn parse_target_features_from_rustc_cfg_test() {
-        let got = parse_target_features_from_rustc_cfg("target_feature=\"sse2\"\ntarget_feature=\"avx2\"\n");
+        let got = parse_target_features_from_rustc_cfg(
+            "target_feature=\"sse2\"\ntarget_feature=\"avx2\"\n",
+        );
         assert_eq!(got, vec!["avx2", "sse2"]);
     }
 
     #[test]
     fn filters_crt_static() {
-        assert_eq!(filter_runtime_features(&["crt-static".into(), "avx2".into()]), vec!["avx2"]);
+        assert_eq!(
+            filter_runtime_features(&["crt-static".into(), "avx2".into()]),
+            vec!["avx2"]
+        );
     }
 
     #[test]
@@ -1346,8 +2123,15 @@ mod tests {
     }
 
     #[test]
-    fn rng_features_are_rank_only_not_safety_required() {
-        let required = safety_required_features(&["avx2".into(), "rdseed".into(), "rdrand".into()]);
+    fn non_codegen_features_are_rank_only_not_safety_required() {
+        let required = safety_required_features(&[
+            "avx2".into(),
+            "pmuv3".into(),
+            "rdseed".into(),
+            "rdrand".into(),
+            "spe".into(),
+            "ssbs".into(),
+        ]);
         assert_eq!(required, vec!["avx2"]);
     }
 
@@ -1368,14 +2152,21 @@ mod tests {
     fn unknown_target_cpu_is_error() {
         let current = BTreeSet::from(["generic".into(), "znver5".into()]);
         let union = current.clone();
-        assert!(filter_target_cpus(&["generic".into(), "zenver5".into()], &current, &union).is_err());
+        assert!(
+            filter_target_cpus(&["generic".into(), "zenver5".into()], &current, &union).is_err()
+        );
     }
 
     #[test]
     fn cross_arch_target_cpu_is_skipped_not_error() {
         let current = BTreeSet::from(["generic".into(), "znver5".into()]);
         let union = BTreeSet::from(["generic".into(), "znver5".into(), "neoverse-v1".into()]);
-        let got = filter_target_cpus(&["generic".into(), "znver5".into(), "neoverse-v1".into()], &current, &union).unwrap();
+        let got = filter_target_cpus(
+            &["generic".into(), "znver5".into(), "neoverse-v1".into()],
+            &current,
+            &union,
+        )
+        .unwrap();
         assert_eq!(got, vec!["generic", "znver5"]);
     }
 
@@ -1386,25 +2177,86 @@ mod tests {
 
     #[test]
     fn configured_collision_emits_warning() {
-        let warnings = analyze_warnings(&BTreeMap::from([
-            ("a".into(), vec!["avx2".into()]),
-            ("b".into(), vec!["avx2".into()]),
-        ]), "x86_64");
+        let warnings = analyze_warnings(
+            &BTreeMap::from([
+                ("a".into(), vec!["avx2".into()]),
+                ("b".into(), vec!["avx2".into()]),
+            ]),
+            "x86_64",
+        );
         assert!(warnings.iter().any(|w| w.contains("identical")));
     }
 
     #[test]
     fn configured_incomparable_overlap_emits_warning() {
-        let warnings = analyze_warnings(&BTreeMap::from([
-            ("haswell".into(), vec!["avx2".into()]),
-            ("znver5".into(), vec!["avx2".into(), "avx512f".into()]),
-        ]), "x86_64");
+        let warnings = analyze_warnings(
+            &BTreeMap::from([
+                ("haswell".into(), vec!["avx2".into()]),
+                ("znver5".into(), vec!["avx2".into(), "avx512f".into()]),
+            ]),
+            "x86_64",
+        );
         assert!(warnings.iter().any(|w| w.contains("neutral")));
     }
 
     #[test]
     fn linux_only_target_is_enforced() {
-        assert_eq!(cfg_value("target_os=\"linux\"\ntarget_arch=\"x86_64\"", "target_os").as_deref(), Some("linux"));
+        assert_eq!(
+            cfg_value("target_os=\"linux\"\ntarget_arch=\"x86_64\"", "target_os").as_deref(),
+            Some("linux")
+        );
+    }
+
+    #[test]
+    fn classifies_modern_x86_target_cpus_for_selector_affinity() {
+        assert_eq!(
+            classify_target_cpu("sierraforest", "x86_64"),
+            TargetKind::X86IntelAtom
+        );
+        assert_eq!(
+            classify_target_cpu("clearwaterforest", "x86_64"),
+            TargetKind::X86IntelAtom
+        );
+        assert_eq!(
+            classify_target_cpu("grandridge", "x86_64"),
+            TargetKind::X86IntelAtom
+        );
+        assert_eq!(
+            classify_target_cpu("sapphirerapids", "x86_64"),
+            TargetKind::X86IntelXeon
+        );
+        assert_eq!(
+            classify_target_cpu("graniterapids-d", "x86_64"),
+            TargetKind::X86IntelXeon
+        );
+        assert_eq!(
+            classify_target_cpu("arrowlake", "x86_64"),
+            TargetKind::X86IntelCore
+        );
+        assert_eq!(
+            classify_target_cpu("znver5", "x86_64"),
+            TargetKind::X86AmdZen { generation: 5 }
+        );
+    }
+
+    #[test]
+    fn classifies_modern_aarch64_target_cpus_for_selector_affinity() {
+        assert_eq!(
+            classify_target_cpu("cortex-a725", "aarch64"),
+            TargetKind::Aarch64ArmCortexA
+        );
+        assert_eq!(
+            classify_target_cpu("neoverse-n3", "aarch64"),
+            TargetKind::Aarch64ArmNeoverseN
+        );
+        assert_eq!(
+            classify_target_cpu("neoverse-v3ae", "aarch64"),
+            TargetKind::Aarch64ArmNeoverseV
+        );
+        assert_eq!(
+            classify_target_cpu("a64fx", "aarch64"),
+            TargetKind::Aarch64Other
+        );
     }
 
     #[test]

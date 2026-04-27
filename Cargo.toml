@@ -4,8 +4,6 @@ members = [
   "crates/cargo-sonic",
   "crates/sonic-build",
   "crates/sonic-loader",
-  "crates/sonic-loader-probe",
-  "crates/sonic-survey",
   "crates/xtask",
 ]
 

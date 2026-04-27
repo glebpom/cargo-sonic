@@ -9,6 +9,4 @@ pub mod feature_mask;
 pub mod select;
 
 pub use feature_mask::{Feature, FeatureMask};
-pub use select::{
-    select_variant, CpuIdentity, HostInfo, TargetArch, TargetKind, VariantMeta,
-};
+pub use select::{CpuIdentity, HostInfo, TargetArch, TargetKind, VariantMeta, select_variant};

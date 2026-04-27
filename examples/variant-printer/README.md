@@ -45,3 +45,9 @@ The generated executable is written to:
 ```text
 target/sonic/x86_64-unknown-linux-gnu/release/sonic-variant-printer
 ```
+
+If `CARGO_TARGET_DIR` is set, the example `justfile` uses:
+
+```text
+$CARGO_TARGET_DIR/sonic/x86_64-unknown-linux-gnu/release/sonic-variant-printer
+```

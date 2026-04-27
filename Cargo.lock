@@ -419,20 +419,6 @@ name = "sonic-loader"
 version = "0.1.0"
 
 [[package]]
-name = "sonic-loader-probe"
-version = "0.1.0"
-dependencies = [
- "sonic-loader",
-]
-
-[[package]]
-name = "sonic-survey"
-version = "0.1.0"
-dependencies = [
- "anyhow",
-]
-
-[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

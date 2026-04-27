@@ -13,7 +13,7 @@ variant through environment variables.
 
 ## Status
 
-This repository currently has a working Linux/x86_64 vertical slice:
+This repository currently has a working Linux x86_64/AArch64 vertical slice:
 
 - Cargo metadata config under `[package.metadata.sonic]`
 - implicit `generic` payload, always built
@@ -23,14 +23,13 @@ This repository currently has a working Linux/x86_64 vertical slice:
 - `include_bytes!` payload embedding
 - `memfd_create` plus `execveat`
 - `CARGO_SONIC_*` env replacement
-- x86_64 CPUID feature detection for the implemented feature set
+- x86_64 CPUID and AArch64 auxv feature detection for the implemented feature set
 - x86_64 CPU identity detection for selection affinity
 - unit tests and a generic fixture integration test
+- pinned system-mode QEMU correctness suite via `just qemu`
 
 Known incomplete areas:
 
-- AArch64 end-to-end runtime testing is not complete.
-- QEMU user/system test runners are scaffolds, not full matrix executors yet.
 - Build-time warning analysis is still partial.
 - `sonic-survey` is a placeholder.
 
@@ -55,6 +54,15 @@ The final executable is written under the target crate:
 ```text
 target/sonic/<target-triple>/<profile>/<bin-name>
 ```
+
+If `CARGO_TARGET_DIR` is set, `cargo-sonic` writes under that directory instead:
+
+```text
+$CARGO_TARGET_DIR/sonic/<target-triple>/<profile>/<bin-name>
+```
+
+`CARGO_TARGET` is also accepted as a compatibility alias, but
+`CARGO_TARGET_DIR` is the Cargo-standard variable.
 
 For example:
 
@@ -99,6 +107,20 @@ Binary/package selection also uses normal Cargo arguments:
 cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- sonic build --bin server
 cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- sonic build --package my-crate --bin worker
 ```
+
+## Probe
+
+Use `cargo sonic probe` to inspect the current host without building payloads:
+
+```bash
+cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- sonic probe \
+  --manifest-path examples/variant-printer/Cargo.toml
+```
+
+The probe reads the same `[package.metadata.sonic]` configuration, asks rustc
+for each configured target-cpu's feature contract, detects the current CPU, and
+prints which configured target-cpus are eligible. It uses the same selection
+logic as the loader, but runs as a normal `std` command.
 
 ## Runtime Environment
 
@@ -187,7 +209,7 @@ target_os = "linux"
 target_arch = "x86_64" | "aarch64"
 ```
 
-The currently verified path is Linux x86_64.
+The currently verified paths are Linux x86_64 and Linux AArch64.
 
 ## Testing
 
@@ -197,20 +219,40 @@ Run pure unit tests and the current integration fixture:
 cargo test
 ```
 
-Run the QEMU discovery scaffold:
+Run the QEMU system-mode suite:
 
 ```bash
-cargo run -p xtask -- qemu-user
+just qemu-prepare
+just qemu
 ```
 
-Run the opt-in system-mode scaffold:
+The QEMU correctness suite is system-mode only. It must boot a controlled Linux
+guest for each CPU model listed in `tests/qemu/system.toml`, run rustc inside
+that guest with `-C target-cpu=native`, run the cargo-sonic fat executable inside
+the same guest, and compare the loader-selected target against the rustc-derived
+expectation. Host `qemu-user`, host rustc, and checked-in selected-target goldens
+are intentionally not used as correctness oracles.
+
+QEMU cases run in parallel. The default worker count is the number of available
+CPU cores; override it with `SONIC_QEMU_JOBS=<n>` when needed:
 
 ```bash
-SONIC_QEMU_SYSTEM=1 cargo run -p xtask -- qemu-system
+SONIC_QEMU_JOBS=4 just qemu
 ```
 
-System-mode runs require kernel/initrd environment variables and currently skip
-cleanly when those inputs are absent.
+`just qemu-prepare` owns the asset directory under
+`$CARGO_TARGET_DIR/sonic-qemu-system` when `CARGO_TARGET_DIR` is set, otherwise
+`target/sonic-qemu-system`.
+It downloads and builds the pinned QEMU version from source, downloads pinned
+guest kernels/initrds, installs pinned guest Rust toolchains into cached Ubuntu
+base rootfs directories, and leaves a generated asset README in that directory.
+
+The default matrix is intentionally limited to CPU models where pinned QEMU TCG
+can expose a runtime feature set consistent with the rustc native target. For
+example, QEMU 10.2.1 reports `EPYC-Turin` as `znver5` to rustc, but TCG cannot
+expose the AVX512 features required by rustc's `znver5` contract, so that model
+is documented in `tests/qemu/system.toml` rather than kept as a permanently
+failing exact-oracle case.
 
 ## Loader Minimalism Check
 
@@ -241,10 +283,8 @@ no NEEDED libc
 crates/cargo-sonic          Cargo subcommand entrypoint
 crates/sonic-build          build orchestration and loader generation
 crates/sonic-loader         testable no_std loader logic
-crates/sonic-loader-probe   probe placeholder
-crates/sonic-survey         survey placeholder
-crates/xtask                automation scaffolding
+crates/xtask                automation and QEMU matrix runner
 examples/variant-printer    minimal runnable example
 tests/fixtures              integration fixtures
-tests/qemu                  QEMU matrix files
+tests/qemu                  QEMU system-mode matrix
 ```
