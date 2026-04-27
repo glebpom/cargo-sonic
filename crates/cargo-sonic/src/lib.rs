@@ -14,7 +14,7 @@ pub mod arch_x86_64;
 pub mod feature_mask;
 pub mod select;
 
-use crate::feature_mask::{Feature, FeatureMask, feature_by_name};
+use crate::feature_mask::{FeatureMask, feature_by_name};
 use crate::select::{
     CpuIdentity, HostInfo, TargetArch, TargetKind, VariantMeta, X86Vendor, select_variant,
 };
@@ -186,13 +186,14 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
             cpu,
             &out_root,
         )?;
+        let target_kind = classify_target_cpu(cpu, &target_arch);
         variants.push(VariantBuild {
             target_cpu: cpu.clone(),
             required_features,
             rank_features,
             feature_names,
-            feature_tier: feature_tier(&target_arch, rank_features),
-            target_kind: classify_target_cpu(cpu, &target_arch),
+            feature_tier: target_feature_tier(&target_arch, target_kind),
+            target_kind,
             artifact,
         });
     }
@@ -272,7 +273,7 @@ pub fn probe(options: ProbeOptions) -> Result<()> {
             required_features,
             rank_features,
             rank_feature_count: rank_features.count(),
-            feature_tier: feature_tier(&target_arch, rank_features),
+            feature_tier: target_feature_tier(&target_arch, target_kind),
             target_kind,
         });
         display.push(ProbeVariant {
@@ -280,7 +281,7 @@ pub fn probe(options: ProbeOptions) -> Result<()> {
             required_features,
             rank_features,
             feature_names,
-            feature_tier: feature_tier(&target_arch, rank_features),
+            feature_tier: target_feature_tier(&target_arch, target_kind),
         });
     }
 
@@ -1344,8 +1345,12 @@ fn build_loader(loader_dir: &Utf8Path, target: &str, profile: &str) -> Result<Ut
 }
 
 fn loader_rustflags(target: &str) -> &'static str {
-    if target.starts_with("x86_64-") {
+    if target.starts_with("x86_64-") && target.contains("-musl") {
+        "-C panic=abort -C code-model=large -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-static"
+    } else if target.starts_with("x86_64-") {
         "-C panic=abort -C code-model=large -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-nostartfiles -C link-arg=-static"
+    } else if target.contains("-musl") {
+        "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-static"
     } else {
         "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-arg=-nostartfiles -C link-arg=-static"
     }
@@ -2233,6 +2238,7 @@ const SYS_READ: usize = 0;
 const SYS_PREAD64: usize = 17;
 #[cfg(target_arch = "x86_64")]
 const SYS_IOCTL: usize = 16;
+#[cfg(target_arch = "x86_64")]
 const SYS_CLOSE: usize = 3;
 #[cfg(target_arch = "x86_64")]
 const SYS_MMAP: usize = 9;
@@ -2529,63 +2535,25 @@ fn escape_bytes(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn feature_tier(arch: &str, mask: FeatureMask) -> u8 {
+const X86_NEUTRAL_TIER: u8 = 1;
+const X86_SPECIFIC_TIER: u8 = 2;
+const AARCH64_SPECIFIC_TIER: u8 = 2;
+
+fn target_feature_tier(arch: &str, target_kind: TargetKind) -> u8 {
     if arch == "x86_64" {
-        if has_any(
-            mask,
-            &[
-                Feature::Avx512Vnni,
-                Feature::Avx512Bf16,
-                Feature::Avx512Fp16,
-            ],
-        ) {
-            5
-        } else if mask.contains(Feature::Avx512F)
-            && (mask.contains(Feature::Avx512Bw)
-                || mask.contains(Feature::Avx512Dq)
-                || mask.contains(Feature::Avx512Vl))
-        {
-            4
-        } else if has_any(mask, &[Feature::Avx2, Feature::Bmi1, Feature::Bmi2]) {
-            3
-        } else if has_any(mask, &[Feature::Avx, Feature::Fma]) {
-            2
-        } else if has_any(
-            mask,
-            &[
-                Feature::Sse3,
-                Feature::Ssse3,
-                Feature::Sse4_1,
-                Feature::Sse4_2,
-            ],
-        ) {
-            1
-        } else {
-            0
+        match target_kind {
+            TargetKind::Generic => 0,
+            TargetKind::X86NeutralLevel { .. } => X86_NEUTRAL_TIER,
+            _ => X86_SPECIFIC_TIER,
         }
-    } else if has_any(mask, &[Feature::Sve2]) {
-        5
-    } else if mask.contains(Feature::Sve) {
-        4
-    } else if has_any(mask, &[Feature::Bf16, Feature::I8mm]) {
-        3
-    } else if has_any(
-        mask,
-        &[Feature::Lse, Feature::Fp16, Feature::Dotprod, Feature::Rdm],
-    ) {
-        2
-    } else if has_any(
-        mask,
-        &[Feature::Crc, Feature::Aes, Feature::Sha2, Feature::Sha3],
-    ) {
-        1
+    } else if arch == "aarch64" {
+        match target_kind {
+            TargetKind::Generic => 0,
+            _ => AARCH64_SPECIFIC_TIER,
+        }
     } else {
         0
     }
-}
-
-fn has_any(mask: FeatureMask, features: &[Feature]) -> bool {
-    features.iter().any(|feature| mask.contains(*feature))
 }
 
 fn classify_target_cpu(cpu: &str, arch: &str) -> TargetKind {
@@ -2819,7 +2787,8 @@ mod tests {
     #[test]
     fn musl_loader_rustflags_skip_startup_files() {
         let flags = loader_rustflags("aarch64-unknown-linux-musl");
-        assert!(flags.contains("-C link-arg=-nostartfiles"));
+        assert!(flags.contains("-C link-self-contained=no"));
+        assert!(!flags.contains("-C link-arg=-nostartfiles"));
     }
 
     #[test]
@@ -2937,6 +2906,16 @@ mod tests {
     }
 
     #[test]
+    fn generated_linux_sys_gates_arch_specific_syscalls() {
+        let text = generated_linux_sys();
+        let close_x86 = "#[cfg(target_arch = \"x86_64\")]\nconst SYS_CLOSE: usize = 3;";
+        let close_aarch64 = "#[cfg(target_arch = \"aarch64\")]\nconst SYS_CLOSE: usize = 57;";
+
+        assert!(text.contains(close_x86));
+        assert!(text.contains(close_aarch64));
+    }
+
+    #[test]
     fn unknown_runtime_features_are_reported_for_variant_skipping() {
         let features = classify_runtime_features(&["avx2".into(), "not-real".into()]);
         assert_eq!(features.known, vec!["avx2"]);
@@ -3034,6 +3013,33 @@ mod tests {
             classify_target_cpu("znver5", "x86_64"),
             TargetKind::X86AmdZen { generation: 5 }
         );
+    }
+
+    #[test]
+    fn x86_tiers_rank_target_kind_not_neutral_version() {
+        assert_eq!(
+            target_feature_tier("x86_64", TargetKind::X86NeutralLevel { level: 1 }),
+            1
+        );
+        assert_eq!(
+            target_feature_tier("x86_64", TargetKind::X86NeutralLevel { level: 4 }),
+            1
+        );
+        assert_eq!(target_feature_tier("x86_64", TargetKind::X86IntelCore), 2);
+    }
+
+    #[test]
+    fn aarch64_tiers_rank_target_kind_not_feature_generation() {
+        assert_eq!(target_feature_tier("aarch64", TargetKind::Generic), 0);
+        assert_eq!(
+            target_feature_tier("aarch64", TargetKind::Aarch64ArmCortexA),
+            2
+        );
+        assert_eq!(
+            target_feature_tier("aarch64", TargetKind::Aarch64ArmNeoverseN),
+            2
+        );
+        assert_eq!(target_feature_tier("aarch64", TargetKind::Aarch64Apple), 2);
     }
 
     #[test]
