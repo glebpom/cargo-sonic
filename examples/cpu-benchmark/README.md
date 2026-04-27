@@ -1,6 +1,6 @@
-# sonic-variant-printer
+# sonic-cpu-benchmark
 
-Minimal `cargo-sonic` example. The target CPU variants are selected by the
+Minimal `cargo-sonic` CPU benchmark example. The target CPU variants are selected by the
 `justfile` build command with `--target-cpus`; they are not stored in
 `Cargo.toml`.
 
@@ -44,11 +44,11 @@ SONIC_EXAMPLE_LEN=524288 SONIC_EXAMPLE_ITERS=3000 just compare
 The generated executable is written to:
 
 ```text
-target/sonic/x86_64-unknown-linux-gnu/release/sonic-variant-printer
+target/sonic/x86_64-unknown-linux-gnu/release/sonic-cpu-benchmark
 ```
 
 If `CARGO_TARGET_DIR` is set, the example `justfile` uses:
 
 ```text
-$CARGO_TARGET_DIR/sonic/x86_64-unknown-linux-gnu/release/sonic-variant-printer
+$CARGO_TARGET_DIR/sonic/x86_64-unknown-linux-gnu/release/sonic-cpu-benchmark
 ```
