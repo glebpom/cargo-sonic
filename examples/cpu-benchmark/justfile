@@ -2,13 +2,13 @@ set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 
 sonic_manifest := "../../crates/cargo-sonic/Cargo.toml"
 target_dir := env_var_or_default("CARGO_TARGET_DIR", env_var_or_default("CARGO_TARGET", "target"))
-fat_binary := target_dir + "/sonic/x86_64-unknown-linux-gnu/release/sonic-variant-printer"
+fat_binary := target_dir + "/sonic/x86_64-unknown-linux-gnu/release/sonic-cpu-benchmark"
 
 default: build
 
 # Build the local cargo-sonic tool and then build this example as a fat executable.
 build:
-    cargo run --manifest-path {{sonic_manifest}} -- sonic --target-cpus=x86-64-v3,znver5,raptorlake build --release
+    cargo run --manifest-path {{sonic_manifest}} -- sonic --target-cpus=x86-64-v3,x86-64-v4,znver5,raptorlake build --release
 
 # Run the generated fat executable. The loader is silent; this output comes from the app.
 run: build

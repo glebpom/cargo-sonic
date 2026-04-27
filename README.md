@@ -11,6 +11,59 @@ writes it to a `memfd`, and executes it with `execveat(AT_EMPTY_PATH)`.
 The loader is intentionally silent. Applications can observe the selected
 variant through environment variables.
 
+## Motivation
+
+Modern software distribution relies on portability. To ensure a single Docker
+image or binary runs across a diverse fleet of servers, developers typically
+target a generic architecture baseline. While this ensures the application
+"just works" everywhere, it prevents the compiler from using the specific
+capabilities of modern hardware.
+
+### The Auto-Vectorization Gap
+
+Many high-performance libraries, such as cryptography or compression libraries,
+use manual runtime detection to switch between hand-written assembly
+implementations. Most application code does not have hand-written alternatives
+for every possible CPU.
+
+For general-purpose code, performance depends on the compiler. When LLVM is
+restricted to a generic target, it must be conservative. It cannot safely use
+modern instruction sets such as AVX-512, and it cannot apply
+microarchitecture-specific scheduling weights that optimize instruction ordering
+for a particular chip pipeline.
+
+### Performance Impact
+
+The difference between a generic build and one tuned for a specific
+microarchitecture can be substantial, particularly for compute-heavy tasks where
+the compiler can leverage auto-vectorization.
+
+In a benchmark of naive matrix operations, included in the examples folder,
+running on a Raptor Lake host, the performance delta is clear:
+
+| Selection Mode | Target CPU | Execution Time |
+| --- | --- | ---: |
+| Sonic (Optimized) | `raptorlake` | 154 ms |
+| Generic Fallback | `generic` | 2771 ms |
+
+### Optimized Portability
+
+`cargo-sonic` removes the need to choose between a single portable image and
+multiple hardware-specific builds. By packaging multiple optimized payloads into
+one fat executable, it lets the application negotiate with the silicon at
+runtime.
+
+- **Microarchitecture tuning:** enables the compiler to use efficient
+  instruction weights and vectorization strategies for the specific host.
+- **Automated fallback:** includes a generic payload to preserve compatibility
+  with legacy hardware or restricted environments.
+- **Infrastructure simplicity:** provides the performance of specialized builds
+  within a single portable deployment unit.
+
+By resolving this at the loader level, `cargo-sonic` lets Rust applications use
+more of the underlying hardware without manual dispatch code or complex CI/CD
+pipelines.
+
 ## Status
 
 This repository currently has a working Linux x86_64/AArch64 vertical slice:
@@ -60,7 +113,7 @@ crate manifest through Cargo's normal `--manifest-path` flag:
 ```bash
 cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- \
   sonic --target-cpus=x86-64-v3,znver5,raptorlake build \
-  --manifest-path examples/variant-printer/Cargo.toml
+  --manifest-path examples/cpu-benchmark/Cargo.toml
 ```
 
 The final executable is written under the target crate:
@@ -81,7 +134,7 @@ $CARGO_TARGET_DIR/sonic/<target-triple>/<profile>/<bin-name>
 For example:
 
 ```text
-examples/variant-printer/target/sonic/x86_64-unknown-linux-gnu/debug/sonic-variant-printer
+examples/cpu-benchmark/target/sonic/x86_64-unknown-linux-gnu/debug/sonic-cpu-benchmark
 ```
 
 ## Target CPUs
@@ -166,7 +219,7 @@ Selection is enabled by default. Set `CARGO_SONIC_ENABLE=0` or
 `CARGO_SONIC_ENABLE=false` to force the loader to select the `generic` payload:
 
 ```bash
-CARGO_SONIC_ENABLE=0 target/sonic/x86_64-unknown-linux-gnu/release/sonic-variant-printer
+CARGO_SONIC_ENABLE=0 target/sonic/x86_64-unknown-linux-gnu/release/sonic-cpu-benchmark
 ```
 
 Application code can read these like normal environment variables:
@@ -188,7 +241,7 @@ The loader is silent by default. Set `CARGO_SONIC_DEBUG` to make it print
 selection diagnostics to stderr before it executes the selected payload:
 
 ```bash
-CARGO_SONIC_DEBUG=1 target/sonic/x86_64-unknown-linux-gnu/release/sonic-variant-printer
+CARGO_SONIC_DEBUG=1 target/sonic/x86_64-unknown-linux-gnu/release/sonic-cpu-benchmark
 ```
 
 Debug output includes:
@@ -202,12 +255,12 @@ Debug output includes:
 
 ## Example
 
-See [examples/variant-printer](examples/variant-printer).
+See [examples/cpu-benchmark](examples/cpu-benchmark).
 
 It has a `justfile`:
 
 ```bash
-cd examples/variant-printer
+cd examples/cpu-benchmark
 just build
 just run
 just check-loader
@@ -309,8 +362,8 @@ This verifies the generated loader executable has no ELF interpreter and no
 dynamic libc dependency:
 
 ```bash
-readelf -l target/sonic/x86_64-unknown-linux-gnu/release/sonic-variant-printer
-readelf -d target/sonic/x86_64-unknown-linux-gnu/release/sonic-variant-printer
+readelf -l target/sonic/x86_64-unknown-linux-gnu/release/sonic-cpu-benchmark
+readelf -d target/sonic/x86_64-unknown-linux-gnu/release/sonic-cpu-benchmark
 ```
 
 Expected:
@@ -325,7 +378,7 @@ no NEEDED libc
 ```text
 crates/cargo-sonic          Cargo subcommand, build orchestration, and loader logic
 crates/xtask                automation and QEMU matrix runner
-examples/variant-printer    minimal runnable example
+examples/cpu-benchmark    minimal CPU benchmark example
 tests/cpu-fixtures          fixture-driven modern CPU selector suites
 tests/fixtures              integration fixtures
 tests/qemu                  QEMU system-mode matrix

@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "sonic-variant-printer"
+name = "sonic-cpu-benchmark"
 version = "0.1.0"
