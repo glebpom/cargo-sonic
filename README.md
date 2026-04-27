@@ -1,7 +1,7 @@
 # cargo-sonic
 
-`cargo-sonic` is an experimental Cargo subcommand that builds one Linux fat
-executable for a Rust binary.
+`cargo-sonic` is a Cargo subcommand that builds one Linux fat executable for a
+Rust binary.
 
 The output executable contains multiple ELF payloads built from the same binary
 with different `-C target-cpu=<cpu>` values. At runtime, a small generated
@@ -82,6 +82,11 @@ This repository currently has a working Linux x86_64/AArch64 vertical slice:
 - unit tests, generated-loader integration tests, and fixture-driven modern CPU
   selector tests
 - pinned QEMU 11.0.0 system-mode correctness suite via `just qemu`
+
+Contributions and bug reports are welcome, especially reports from real
+hardware. CPU feature exposure varies across bare metal, virtual machines, cloud
+instances, firmware, kernels, and hypervisors, so real host reports are useful
+for improving selection safety and coverage.
 
 ## Startup Cost
 

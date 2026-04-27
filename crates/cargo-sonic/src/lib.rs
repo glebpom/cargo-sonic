@@ -75,6 +75,16 @@ struct ProbeVariant {
     feature_tier: u8,
 }
 
+struct SkippedProbeVariant {
+    target_cpu: String,
+    reason: String,
+}
+
+struct FeatureSet {
+    known: Vec<String>,
+    unknown: Vec<String>,
+}
+
 pub fn build(options: BuildOptions) -> Result<BuildOutput> {
     let cargo_args = parse_cargo_args(&options.cargo_args);
     let manifest_path = options
@@ -134,11 +144,19 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
     let mut features_by_cpu = BTreeMap::new();
     for cpu in &included {
         let features = parse_target_features_from_rustc_cfg(&rustc_cfg(&target, Some(cpu))?);
-        let filtered = filter_runtime_features(&features);
-        if cpu != "generic" {
-            unsupported_runtime_features(&filtered)?;
+        let feature_set = classify_runtime_features(&features);
+        if cpu != "generic" && !feature_set.unknown.is_empty() {
+            warnings.push(format!(
+                "skipping target-cpu `{}` because rustc reported unknown runtime feature(s): {}",
+                cpu,
+                feature_set.unknown.join(", ")
+            ));
+            continue;
         }
-        features_by_cpu.insert(cpu.clone(), filtered);
+        features_by_cpu.insert(cpu.clone(), feature_set.known);
+    }
+    if !features_by_cpu.contains_key("generic") {
+        features_by_cpu.insert("generic".to_string(), Vec::new());
     }
     warnings.extend(analyze_warnings(&features_by_cpu, &target_arch));
     for warning in &warnings {
@@ -146,7 +164,10 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
     }
 
     let mut variants = Vec::new();
-    for cpu in &included {
+    for cpu in included
+        .iter()
+        .filter(|cpu| features_by_cpu.contains_key(cpu.as_str()))
+    {
         let feature_names = features_by_cpu.get(cpu).cloned().unwrap_or_default();
         let rank_features = feature_mask(&feature_names)?;
         let required_feature_names = safety_required_features(&feature_names);
@@ -223,12 +244,21 @@ pub fn probe(options: ProbeOptions) -> Result<()> {
 
     let mut metas = Vec::new();
     let mut display = Vec::new();
+    let mut skipped = Vec::new();
     for cpu in &included {
         let features = parse_target_features_from_rustc_cfg(&rustc_cfg(&target, Some(cpu))?);
-        let feature_names = filter_runtime_features(&features);
-        if cpu != "generic" {
-            unsupported_runtime_features(&feature_names)?;
+        let feature_set = classify_runtime_features(&features);
+        if cpu != "generic" && !feature_set.unknown.is_empty() {
+            skipped.push(SkippedProbeVariant {
+                target_cpu: cpu.clone(),
+                reason: format!(
+                    "unknown runtime feature(s): {}",
+                    feature_set.unknown.join(", ")
+                ),
+            });
+            continue;
         }
+        let feature_names = feature_set.known;
         let rank_features = feature_mask(&feature_names)?;
         let required_feature_names = safety_required_features(&feature_names);
         let required_features = if cpu == "generic" {
@@ -255,7 +285,7 @@ pub fn probe(options: ProbeOptions) -> Result<()> {
     }
 
     let selected = select_variant(host, &metas);
-    print_probe_report(&target, host, &display, selected.target_cpu);
+    print_probe_report(&target, host, &display, &skipped, selected.target_cpu);
     Ok(())
 }
 
@@ -359,17 +389,43 @@ fn print_variant_build_prelude(target_cpu: &str) {
     let _ = std::io::stderr().flush();
 }
 
-fn print_probe_report(target: &str, host: HostInfo, variants: &[ProbeVariant], selected: &str) {
-    println!("cargo-sonic probe");
-    println!("  target={target}");
-    println!("  host.arch={}", host_arch_name(host.arch));
-    println!("  host.features={}", format_words(host.features));
-    println!(
-        "  host.feature_names=[{}]",
-        feature_names(host.features).join(",")
+fn print_probe_report(
+    target: &str,
+    host: HostInfo,
+    variants: &[ProbeVariant],
+    skipped: &[SkippedProbeVariant],
+    selected: &str,
+) {
+    print!(
+        "{}",
+        format_probe_report(target, host, variants, skipped, selected)
     );
-    println!("  host.identity={}", format_identity(host.identity));
-    println!("  variants:");
+}
+
+fn format_probe_report(
+    target: &str,
+    host: HostInfo,
+    variants: &[ProbeVariant],
+    skipped: &[SkippedProbeVariant],
+    selected: &str,
+) -> String {
+    let mut out = String::new();
+    out.push_str("cargo-sonic probe\n");
+    out.push_str(&format!("  target={target}\n"));
+    out.push_str(&format!("  host.arch={}\n", host_arch_name(host.arch)));
+    out.push_str(&format!(
+        "  host.features={}\n",
+        format_words(host.features)
+    ));
+    out.push_str(&format!(
+        "  host.feature_names=[{}]\n",
+        feature_names(host.features).join(",")
+    ));
+    out.push_str(&format!(
+        "  host.identity={}\n",
+        format_identity(host.identity)
+    ));
+    out.push_str("  variants:\n");
     for variant in variants {
         let eligible = variant.target_cpu == "generic"
             || variant.required_features.is_subset_of(host.features);
@@ -377,22 +433,31 @@ fn print_probe_report(target: &str, host: HostInfo, variants: &[ProbeVariant], s
             variant.required_features.words()[0] & !host.features.words()[0],
             variant.required_features.words()[1] & !host.features.words()[1],
         ]);
-        print!(
+        out.push_str(&format!(
             "    {} eligible={} tier={} count={} required={}",
             variant.target_cpu,
             if eligible { "yes" } else { "no" },
             variant.feature_tier,
             variant.rank_features.count(),
             format_words(variant.required_features)
-        );
+        ));
         if !eligible {
-            print!(
+            out.push_str(&format!(
                 " missing={} missing_features=[{}]",
                 format_words(missing),
                 feature_names(missing).join(",")
-            );
+            ));
         }
-        println!(" flags=[{}]", variant.feature_names.join(","));
+        out.push_str(&format!(" flags=[{}]\n", variant.feature_names.join(",")));
+    }
+    if !skipped.is_empty() {
+        out.push_str("  skipped:\n");
+        for variant in skipped {
+            out.push_str(&format!(
+                "    {} reason={}\n",
+                variant.target_cpu, variant.reason
+            ));
+        }
     }
     let eligible = variants
         .iter()
@@ -401,8 +466,9 @@ fn print_probe_report(target: &str, host: HostInfo, variants: &[ProbeVariant], s
         })
         .map(|variant| variant.target_cpu.as_str())
         .collect::<Vec<_>>();
-    println!("  fits=[{}]", eligible.join(","));
-    println!("  selected={selected}");
+    out.push_str(&format!("  fits=[{}]\n", eligible.join(",")));
+    out.push_str(&format!("  selected={selected}\n"));
+    out
 }
 
 fn host_arch_name(arch: TargetArch) -> &'static str {
@@ -715,16 +781,31 @@ pub fn parse_target_features_from_rustc_cfg(cfg: &str) -> Vec<String> {
 }
 
 pub fn filter_runtime_features(features: &[String]) -> Vec<String> {
-    features
+    classify_runtime_features(features).known
+}
+
+fn classify_runtime_features(features: &[String]) -> FeatureSet {
+    let mut known = Vec::new();
+    let mut unknown = Vec::new();
+    for feature in features
         .iter()
-        .filter(|feature| {
-            !matches!(
-                feature.as_str(),
-                "crt-static" | "ermsb" | "lahfsahf" | "prfchw" | "x87"
-            )
-        })
+        .filter(|feature| !is_ignored_rustc_feature(feature))
         .cloned()
-        .collect()
+    {
+        if feature_by_name(&feature).is_some() {
+            known.push(feature);
+        } else {
+            unknown.push(feature);
+        }
+    }
+    FeatureSet { known, unknown }
+}
+
+fn is_ignored_rustc_feature(feature: &str) -> bool {
+    matches!(
+        feature,
+        "crt-static" | "ermsb" | "lahfsahf" | "prfchw" | "x87"
+    )
 }
 
 fn rustc_target_cpus(target: &str) -> Result<BTreeSet<String>> {
@@ -777,35 +858,24 @@ pub fn filter_target_cpus(
     known_union: &BTreeSet<String>,
 ) -> Result<Vec<String>> {
     let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
     for cpu in configured {
-        if cpu == "generic" {
-            out.push(cpu.clone());
+        let accepted = if cpu == "generic" {
+            true
         } else if cpu == "native" {
             bail!("target-cpu \"native\" is rejected");
         } else if current_valid.contains(cpu) {
-            out.push(cpu.clone());
+            true
         } else if known_union.contains(cpu) {
-            continue;
+            false
         } else {
             bail!("unknown target-cpu spelling `{cpu}`");
+        };
+        if accepted && seen.insert(cpu.clone()) {
+            out.push(cpu.clone());
         }
     }
     Ok(out)
-}
-
-fn unsupported_runtime_features(features: &[String]) -> Result<()> {
-    let unsupported: Vec<_> = features
-        .iter()
-        .filter(|feature| feature_by_name(feature).is_none())
-        .cloned()
-        .collect();
-    if !unsupported.is_empty() {
-        bail!(
-            "unsupported runtime feature mapping(s): {}",
-            unsupported.join(", ")
-        );
-    }
-    Ok(())
 }
 
 fn feature_mask(features: &[String]) -> Result<FeatureMask> {
@@ -929,9 +999,16 @@ fn encoded_rustflags(cpu: &str) -> OsString {
 }
 
 fn sanitize_cpu(cpu: &str) -> String {
-    cpu.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
+    let mut out = String::new();
+    for b in cpu.bytes() {
+        if b.is_ascii_alphanumeric() {
+            out.push(b as char);
+        } else {
+            out.push('_');
+            out.push_str(&format!("{b:02x}"));
+        }
+    }
+    out
 }
 
 fn resolve_bin_name(
@@ -2647,7 +2724,6 @@ mod tests {
             "avx".into(),
             "avx2".into(),
         ]);
-        unsupported_runtime_features(&features).unwrap();
         assert!(!features.iter().any(|feature| feature == "x87"));
         assert!(!features.iter().any(|feature| feature == "ermsb"));
         assert!(!features.iter().any(|feature| feature == "lahfsahf"));
@@ -2841,8 +2917,59 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_runtime_feature_mapping_is_build_error() {
-        assert!(unsupported_runtime_features(&["not-real".into()]).is_err());
+    fn duplicate_target_cpus_are_deduplicated() {
+        let current = BTreeSet::from(["generic".into(), "arrowlake-s".into()]);
+        let union = current.clone();
+        let got = filter_target_cpus(
+            &["generic".into(), "arrowlake-s".into(), "arrowlake-s".into()],
+            &current,
+            &union,
+        )
+        .unwrap();
+        assert_eq!(got, vec!["generic", "arrowlake-s"]);
+    }
+
+    #[test]
+    fn target_cpu_payload_names_do_not_collapse_aliases() {
+        assert_ne!(sanitize_cpu("arrowlake-s"), sanitize_cpu("arrowlake_s"));
+        assert_eq!(sanitize_cpu("arrowlake-s"), "arrowlake_2ds");
+        assert_eq!(sanitize_cpu("arrowlake_s"), "arrowlake_5fs");
+    }
+
+    #[test]
+    fn unknown_runtime_features_are_reported_for_variant_skipping() {
+        let features = classify_runtime_features(&["avx2".into(), "not-real".into()]);
+        assert_eq!(features.known, vec!["avx2"]);
+        assert_eq!(features.unknown, vec!["not-real"]);
+    }
+
+    #[test]
+    fn probe_report_shows_skipped_unknown_feature_variants() {
+        let report = format_probe_report(
+            "x86_64-unknown-linux-gnu",
+            HostInfo {
+                arch: TargetArch::X86_64,
+                features: FeatureMask::EMPTY,
+                identity: CpuIdentity::Unknown,
+                heterogeneous: false,
+            },
+            &[ProbeVariant {
+                target_cpu: "generic".to_string(),
+                required_features: FeatureMask::EMPTY,
+                rank_features: FeatureMask::EMPTY,
+                feature_names: Vec::new(),
+                feature_tier: 0,
+            }],
+            &[SkippedProbeVariant {
+                target_cpu: "futurelake".to_string(),
+                reason: "unknown runtime feature(s): avx10".to_string(),
+            }],
+            "generic",
+        );
+
+        assert!(report.contains("  skipped:\n"));
+        assert!(report.contains("futurelake reason=unknown runtime feature(s): avx10"));
+        assert!(report.contains("selected=generic"));
     }
 
     #[test]
