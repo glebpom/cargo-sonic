@@ -717,7 +717,12 @@ pub fn parse_target_features_from_rustc_cfg(cfg: &str) -> Vec<String> {
 pub fn filter_runtime_features(features: &[String]) -> Vec<String> {
     features
         .iter()
-        .filter(|feature| !matches!(feature.as_str(), "crt-static" | "lahfsahf" | "x87"))
+        .filter(|feature| {
+            !matches!(
+                feature.as_str(),
+                "crt-static" | "ermsb" | "lahfsahf" | "prfchw" | "x87"
+            )
+        })
         .cloned()
         .collect()
 }
@@ -2615,9 +2620,11 @@ mod tests {
         assert_eq!(
             filter_runtime_features(&[
                 "crt-static".into(),
+                "ermsb".into(),
                 "lahfsahf".into(),
+                "prfchw".into(),
                 "x87".into(),
-                "avx2".into()
+                "avx2".into(),
             ]),
             vec!["avx2"]
         );
@@ -2627,7 +2634,9 @@ mod tests {
     fn skylake_style_features_with_baseline_non_runtime_features_are_supported() {
         let features = filter_runtime_features(&[
             "x87".into(),
+            "ermsb".into(),
             "lahfsahf".into(),
+            "prfchw".into(),
             "fxsr".into(),
             "sse".into(),
             "sse2".into(),
@@ -2640,7 +2649,9 @@ mod tests {
         ]);
         unsupported_runtime_features(&features).unwrap();
         assert!(!features.iter().any(|feature| feature == "x87"));
+        assert!(!features.iter().any(|feature| feature == "ermsb"));
         assert!(!features.iter().any(|feature| feature == "lahfsahf"));
+        assert!(!features.iter().any(|feature| feature == "prfchw"));
     }
 
     #[test]
