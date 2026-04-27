@@ -19,6 +19,9 @@ struct Sonic {
     #[arg(long, value_delimiter = ',')]
     target_cpus: Vec<String>,
 
+    #[arg(long)]
+    auditable: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -46,17 +49,20 @@ fn main() -> Result<()> {
     match cli.command {
         CargoSonicCommand::Sonic(Sonic {
             target_cpus,
+            auditable,
             command: Command::Build(build),
         }) => cargo_sonic::build(BuildOptions {
             cargo_args: build.cargo_args,
             manifest_path: None,
             target_cpus,
+            auditable,
         })
         .map(|output| {
             println!("{}", output.final_binary);
         }),
         CargoSonicCommand::Sonic(Sonic {
             target_cpus,
+            auditable: _,
             command: Command::Probe(probe),
         }) => cargo_sonic::probe(ProbeOptions {
             cargo_args: probe.cargo_args,

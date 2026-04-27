@@ -2,6 +2,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::{Artifact, Message, MetadataCommand, Package};
 use clap::{Arg, ArgAction, Command as ClapCommand};
+use miniz_oxide::deflate::compress_to_vec_zlib;
+use object::write::{Object, StandardSegment, Symbol, SymbolSection};
+use object::{
+    Architecture, BinaryFormat, Endianness, FileFlags, SectionFlags, SectionKind, SymbolFlags,
+    SymbolKind, SymbolScope, elf,
+};
+use serde::Serialize;
 pub mod arch_aarch64;
 pub mod arch_x86_64;
 pub mod feature_mask;
@@ -12,6 +19,7 @@ use crate::select::{
     CpuIdentity, HostInfo, TargetArch, TargetKind, VariantMeta, X86Vendor, select_variant,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
@@ -22,6 +30,7 @@ pub struct BuildOptions {
     pub cargo_args: Vec<String>,
     pub manifest_path: Option<Utf8PathBuf>,
     pub target_cpus: Vec<String>,
+    pub auditable: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -81,6 +90,14 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
         .exec()
         .context("failed to read cargo metadata")?;
     let package = select_package(&metadata, cargo_args.package.as_deref())?;
+    let auditable_section = if options.auditable {
+        Some(collect_auditable_section(
+            manifest_path.as_deref(),
+            cargo_args.package.as_deref(),
+        )?)
+    } else {
+        None
+    };
     let configured_cpus = normalize_target_cpus(effective_target_cpus(options.target_cpus)?)?;
 
     let target = match cargo_args.target.clone() {
@@ -161,7 +178,12 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
 
     let bin_name = resolve_bin_name(package, cargo_args.bin.as_deref(), &variants)?;
     let loader_dir = out_root.join("loader");
-    generate_loader_crate(&loader_dir, &target, &variants)?;
+    generate_loader_crate(
+        &loader_dir,
+        &target,
+        &variants,
+        auditable_section.as_deref(),
+    )?;
     let loader_artifact = build_loader(&loader_dir, &target, profile)?;
     let final_binary = out_root.join(&bin_name);
     fs::create_dir_all(out_root.as_path())?;
@@ -934,10 +956,236 @@ fn resolve_bin_name(
     bail!("multiple binary artifacts are possible; pass --bin");
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
+enum AuditDepKind {
+    Development,
+    Build,
+    Runtime,
+}
+
+#[derive(Serialize)]
+struct AuditVersionInfo {
+    format: u32,
+    packages: Vec<AuditPackage>,
+}
+
+#[derive(Serialize)]
+struct AuditPackage {
+    name: String,
+    version: String,
+    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    dependencies: Vec<usize>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    root: bool,
+}
+
+fn collect_auditable_section(
+    manifest_path: Option<&Utf8Path>,
+    package: Option<&str>,
+) -> Result<Vec<u8>> {
+    let mut metadata_cmd = MetadataCommand::new();
+    if let Some(path) = manifest_path {
+        metadata_cmd.manifest_path(path);
+    }
+    let metadata = metadata_cmd
+        .exec()
+        .context("failed to read cargo metadata for auditable section")?;
+    let package = select_package(&metadata, package)?;
+    let info = auditable_from_metadata(&metadata, package)?;
+    let json = serde_json::to_vec(&info)?;
+    Ok(compress_to_vec_zlib(&json, 7))
+}
+
+fn auditable_from_metadata(
+    metadata: &cargo_metadata::Metadata,
+    root_package: &Package,
+) -> Result<AuditVersionInfo> {
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .context("cargo metadata did not include dependency resolution")?;
+    let root_id = root_package.id.repr.as_str();
+    let proc_macros = proc_macro_packages(metadata);
+    let nodes: HashMap<&str, &cargo_metadata::Node> = resolve
+        .nodes
+        .iter()
+        .map(|node| (node.id.repr.as_str(), node))
+        .collect();
+    let root = nodes.get(root_id).with_context(|| {
+        format!(
+            "selected package `{}` is missing from dependency graph",
+            root_package.name
+        )
+    })?;
+
+    let mut id_to_dep_kind = HashMap::new();
+    id_to_dep_kind.insert(root_id, AuditDepKind::Runtime);
+    let mut current = vec![*root];
+    let mut next = Vec::new();
+    while !current.is_empty() {
+        for parent in current.drain(..) {
+            let parent_kind = id_to_dep_kind[parent.id.repr.as_str()];
+            for child in &parent.deps {
+                let child_id = child.pkg.repr.as_str();
+                let mut dep_kind = strongest_audit_dep_kind(&child.dep_kinds);
+                dep_kind = dep_kind.min(parent_kind);
+                if proc_macros.contains(child_id) {
+                    dep_kind = dep_kind.min(AuditDepKind::Build);
+                }
+                if id_to_dep_kind
+                    .get(child_id)
+                    .is_none_or(|previous| dep_kind > *previous)
+                {
+                    id_to_dep_kind.insert(child_id, dep_kind);
+                    if let Some(node) = nodes.get(child_id) {
+                        next.push(*node);
+                    }
+                }
+            }
+        }
+        std::mem::swap(&mut current, &mut next);
+    }
+
+    let mut packages = metadata
+        .packages
+        .iter()
+        .filter(|package| {
+            id_to_dep_kind
+                .get(package.id.repr.as_str())
+                .is_some_and(|kind| *kind != AuditDepKind::Development)
+        })
+        .collect::<Vec<_>>();
+    packages.sort_unstable_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.version.cmp(&b.version))
+            .then_with(|| a.id.repr.cmp(&b.id.repr))
+    });
+
+    let id_to_index = packages
+        .iter()
+        .enumerate()
+        .map(|(index, package)| (package.id.repr.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut audit_packages = packages
+        .into_iter()
+        .map(|package| {
+            let dep_kind = id_to_dep_kind[package.id.repr.as_str()];
+            AuditPackage {
+                name: package.name.to_string(),
+                version: package.version.to_string(),
+                source: package
+                    .source
+                    .as_ref()
+                    .map_or_else(|| "local".to_string(), audit_source),
+                kind: (dep_kind == AuditDepKind::Build).then_some("build"),
+                dependencies: Vec::new(),
+                root: package.id == root_package.id,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for node in &resolve.nodes {
+        let Some(&package_index) = id_to_index.get(node.id.repr.as_str()) else {
+            continue;
+        };
+        for dep in &node.deps {
+            if strongest_audit_dep_kind(&dep.dep_kinds) == AuditDepKind::Development {
+                continue;
+            }
+            if let Some(&dep_index) = id_to_index.get(dep.pkg.repr.as_str()) {
+                audit_packages[package_index].dependencies.push(dep_index);
+            }
+        }
+        audit_packages[package_index].dependencies.sort_unstable();
+        audit_packages[package_index].dependencies.dedup();
+    }
+
+    Ok(AuditVersionInfo {
+        format: 1,
+        packages: audit_packages,
+    })
+}
+
+fn strongest_audit_dep_kind(deps: &[cargo_metadata::DepKindInfo]) -> AuditDepKind {
+    deps.iter()
+        .map(|dep| match dep.kind {
+            cargo_metadata::DependencyKind::Normal => AuditDepKind::Runtime,
+            cargo_metadata::DependencyKind::Build => AuditDepKind::Build,
+            cargo_metadata::DependencyKind::Development => AuditDepKind::Development,
+            _ => AuditDepKind::Runtime,
+        })
+        .max()
+        .unwrap_or(AuditDepKind::Runtime)
+}
+
+fn proc_macro_packages(metadata: &cargo_metadata::Metadata) -> HashSet<&str> {
+    metadata
+        .packages
+        .iter()
+        .filter_map(|package| {
+            if package.targets.len() == 1
+                && package.targets[0].kind.len() == 1
+                && package.targets[0].kind[0] == cargo_metadata::TargetKind::ProcMacro
+            {
+                Some(package.id.repr.as_str())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn audit_source(source: &cargo_metadata::Source) -> String {
+    match source.repr.as_str() {
+        "registry+https://github.com/rust-lang/crates.io-index" => "crates.io".to_string(),
+        other => other.split('+').next().unwrap_or("registry").to_string(),
+    }
+}
+
+fn auditable_object(target: &str, contents: &[u8]) -> Result<Vec<u8>> {
+    let architecture = if target.starts_with("x86_64-") {
+        Architecture::X86_64
+    } else if target.starts_with("aarch64-") {
+        Architecture::Aarch64
+    } else {
+        bail!("auditable section is only supported for x86_64 and aarch64 targets");
+    };
+    let mut file = Object::new(BinaryFormat::Elf, architecture, Endianness::Little);
+    file.flags = FileFlags::Elf {
+        os_abi: elf::ELFOSABI_NONE,
+        abi_version: 0,
+        e_flags: 0,
+    };
+    let section = file.add_section(
+        file.segment_name(StandardSegment::Data).to_vec(),
+        b".dep-v0".to_vec(),
+        SectionKind::ReadOnlyData,
+    );
+    file.section_mut(section).flags = SectionFlags::Elf { sh_flags: 0 };
+    let offset = file.append_section_data(section, contents, 1);
+    file.add_symbol(Symbol {
+        name: b"__cargo_sonic_auditable_dep_v0".to_vec(),
+        value: offset,
+        size: contents.len() as u64,
+        kind: SymbolKind::Data,
+        scope: SymbolScope::Dynamic,
+        weak: false,
+        section: SymbolSection::Section(section),
+        flags: SymbolFlags::None,
+    });
+    file.write()
+        .context("failed to build auditable metadata object")
+}
+
 fn generate_loader_crate(
     loader_dir: &Utf8Path,
     target: &str,
     variants: &[VariantBuild],
+    auditable_section: Option<&[u8]>,
 ) -> Result<()> {
     fs::create_dir_all(loader_dir.join("src"))?;
     fs::write(
@@ -976,6 +1224,12 @@ panic = "abort"
         generated_manifest(variants),
     )?;
     fs::write(loader_dir.join("src/main.rs"), generated_main(target))?;
+    if let Some(section) = auditable_section {
+        fs::write(
+            loader_dir.join("auditable.o"),
+            auditable_object(target, section)?,
+        )?;
+    }
     Ok(())
 }
 
@@ -988,7 +1242,12 @@ fn build_loader(loader_dir: &Utf8Path, target: &str, profile: &str) -> Result<Ut
     if profile == "release" {
         cmd.arg("--release");
     }
-    cmd.env("RUSTFLAGS", loader_rustflags(target));
+    let mut rustflags = loader_rustflags(target).to_string();
+    if loader_dir.join("auditable.o").exists() {
+        rustflags
+            .push_str(" -C link-arg=auditable.o -C link-arg=-Wl,-u,__cargo_sonic_auditable_dep_v0");
+    }
+    cmd.env("RUSTFLAGS", rustflags);
     let status = cmd
         .status()
         .context("failed to spawn cargo for generated loader")?;
@@ -2628,6 +2887,7 @@ mod tests {
             cargo_args: Vec::new(),
             manifest_path: Some(manifest),
             target_cpus: vec!["x86-64".into()],
+            auditable: true,
         })
         .unwrap();
         let run = Command::new(&output.final_binary)
@@ -2656,6 +2916,15 @@ mod tests {
                 .output()
                 .unwrap();
             assert!(!String::from_utf8(dyns.stdout).unwrap().contains("NEEDED"));
+            let sections = Command::new("readelf")
+                .args(["-S", output.final_binary.as_str()])
+                .output()
+                .unwrap();
+            assert!(
+                String::from_utf8(sections.stdout)
+                    .unwrap()
+                    .contains(".dep-v0")
+            );
         }
     }
 
