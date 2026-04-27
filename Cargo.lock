@@ -87,8 +87,10 @@ name = "cargo-sonic"
 version = "0.1.0-beta.1"
 dependencies = [
  "anyhow",
+ "camino",
+ "cargo_metadata",
  "clap",
- "sonic-build",
+ "tempfile",
 ]
 
 [[package]]
@@ -399,22 +401,6 @@ checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
 ]
-
-[[package]]
-name = "sonic-build"
-version = "0.1.0-beta.1"
-dependencies = [
- "anyhow",
- "camino",
- "cargo_metadata",
- "clap",
- "sonic-loader",
- "tempfile",
-]
-
-[[package]]
-name = "sonic-loader"
-version = "0.1.0-beta.1"
 
 [[package]]
 name = "strsim"

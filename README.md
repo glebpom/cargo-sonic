@@ -29,10 +29,6 @@ This repository currently has a working Linux x86_64/AArch64 vertical slice:
   selector tests
 - pinned QEMU 11.0.0 system-mode correctness suite via `just qemu`
 
-Known incomplete areas:
-
-- Build-time warning analysis is still partial.
-
 ## Startup Cost
 
 `cargo-sonic` optimizes code generation for the selected CPU, not process
@@ -242,7 +238,7 @@ cargo test
 Run only the modern CPU fixture suites:
 
 ```bash
-cargo test -p sonic-loader fixture_modern
+cargo test -p cargo-sonic fixture_modern
 ```
 
 These tests parse `tests/cpu-fixtures/x86_64-modern.tsv` and
@@ -313,9 +309,7 @@ no NEEDED libc
 ## Workspace Layout
 
 ```text
-crates/cargo-sonic          Cargo subcommand entrypoint
-crates/sonic-build          build orchestration and loader generation
-crates/sonic-loader         testable no_std loader logic
+crates/cargo-sonic          Cargo subcommand, build orchestration, and loader logic
 crates/xtask                automation and QEMU matrix runner
 examples/variant-printer    minimal runnable example
 tests/cpu-fixtures          fixture-driven modern CPU selector suites

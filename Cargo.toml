@@ -2,8 +2,6 @@
 resolver = "2"
 members = [
   "crates/cargo-sonic",
-  "crates/sonic-build",
-  "crates/sonic-loader",
   "crates/xtask",
 ]
 

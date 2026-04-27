@@ -3,8 +3,11 @@ name = "cargo-sonic"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+publish = true
 
 [dependencies]
 anyhow = "1"
+camino = "1"
+cargo_metadata = "0.19"
 clap = { version = "4", features = ["derive"] }
-sonic-build = { path = "../sonic-build" }
+tempfile = "3"
