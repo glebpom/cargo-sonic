@@ -94,8 +94,8 @@ struct Score {
     exact: u8,
     package: u8,
     unknown_neutral: u8,
-    tier: u8,
     count: u16,
+    tier: u8,
     weak: u8,
     generic_tie: u8,
 }
@@ -145,15 +145,15 @@ fn score(host: HostInfo, variant: &VariantMeta) -> Score {
         } else {
             0
         },
-        tier: if core_specific_penalty {
-            0
-        } else {
-            variant.feature_tier
-        },
         count: if core_specific_penalty {
             0
         } else {
             variant.rank_feature_count
+        },
+        tier: if core_specific_penalty {
+            0
+        } else {
+            variant.feature_tier
         },
         weak: if core_specific_penalty {
             0
@@ -1155,6 +1155,53 @@ mod tests {
             )
             .target_cpu,
             "avx2"
+        );
+    }
+
+    #[test]
+    fn richer_neutral_x86_baseline_beats_older_vendor_specific_cpu() {
+        let variants = [
+            v(
+                "x86-64-v4",
+                &[
+                    Feature::Avx2,
+                    Feature::Avx512F,
+                    Feature::Avx512Bw,
+                    Feature::Avx512Dq,
+                    Feature::Avx512Vl,
+                ],
+                1,
+                TargetKind::X86NeutralLevel { level: 4 },
+            ),
+            v(
+                "znver2",
+                &[Feature::Avx2],
+                2,
+                TargetKind::X86AmdZen { generation: 2 },
+            ),
+        ];
+        let identity = CpuIdentity::X86 {
+            vendor: X86Vendor::Amd,
+            family: 26,
+            model: 1,
+            stepping: 0,
+        };
+        assert_eq!(
+            select_variant(
+                host(
+                    &[
+                        Feature::Avx2,
+                        Feature::Avx512F,
+                        Feature::Avx512Bw,
+                        Feature::Avx512Dq,
+                        Feature::Avx512Vl,
+                    ],
+                    identity
+                ),
+                &variants
+            )
+            .target_cpu,
+            "x86-64-v4"
         );
     }
 
