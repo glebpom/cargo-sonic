@@ -1,4 +1,4 @@
-use crate::feature_mask::FeatureMask;
+use crate::feature_mask::{Feature, FeatureMask};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TargetArch {
@@ -91,9 +91,11 @@ pub struct VariantMeta {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct Score {
+    baseline: u8,
     exact: u8,
     package: u8,
     unknown_neutral: u8,
+    feature_score: u16,
     count: u16,
     tier: u8,
     weak: u8,
@@ -132,6 +134,11 @@ fn score(host: HostInfo, variant: &VariantMeta) -> Score {
     let exact = exact_affinity(host.identity, variant.target_kind, variant.target_cpu);
     let core_specific_penalty = host.heterogeneous && variant.target_kind.is_core_specific();
     Score {
+        baseline: if core_specific_penalty {
+            0
+        } else {
+            baseline_level(host.arch, variant.target_kind, variant.rank_features)
+        },
         exact: if core_specific_penalty { 0 } else { exact },
         package: if host.heterogeneous && is_package_level(variant.target_kind) {
             1
@@ -144,6 +151,11 @@ fn score(host: HostInfo, variant: &VariantMeta) -> Score {
             1
         } else {
             0
+        },
+        feature_score: if core_specific_penalty {
+            0
+        } else {
+            weighted_feature_score(host.arch, variant.rank_features)
         },
         count: if core_specific_penalty {
             0
@@ -166,6 +178,146 @@ fn score(host: HostInfo, variant: &VariantMeta) -> Score {
             0
         },
     }
+}
+
+fn baseline_level(arch: TargetArch, target_kind: TargetKind, features: FeatureMask) -> u8 {
+    match arch {
+        TargetArch::X86_64 => {
+            if target_kind.is_generic() {
+                0
+            } else if x86_64_v4_features(features) {
+                4
+            } else if x86_64_v3_features(features) {
+                3
+            } else if x86_64_v2_features(features) {
+                2
+            } else if x86_64_v1_features(features) {
+                1
+            } else {
+                0
+            }
+        }
+        TargetArch::Aarch64 => 0,
+    }
+}
+
+fn x86_64_v1_features(features: FeatureMask) -> bool {
+    features.contains(Feature::Sse) && features.contains(Feature::Sse2)
+}
+
+fn x86_64_v2_features(features: FeatureMask) -> bool {
+    x86_64_v1_features(features)
+        && features.contains(Feature::Cmpxchg16b)
+        && features.contains(Feature::Fxsr)
+        && features.contains(Feature::Popcnt)
+        && features.contains(Feature::Sse3)
+        && features.contains(Feature::Sse4_1)
+        && features.contains(Feature::Sse4_2)
+        && features.contains(Feature::Ssse3)
+}
+
+fn x86_64_v3_features(features: FeatureMask) -> bool {
+    x86_64_v2_features(features)
+        && features.contains(Feature::Avx)
+        && features.contains(Feature::Avx2)
+        && features.contains(Feature::Bmi1)
+        && features.contains(Feature::Bmi2)
+        && features.contains(Feature::F16c)
+        && features.contains(Feature::Fma)
+        && features.contains(Feature::Lzcnt)
+        && features.contains(Feature::Movbe)
+        && features.contains(Feature::Xsave)
+}
+
+fn x86_64_v4_features(features: FeatureMask) -> bool {
+    x86_64_v3_features(features)
+        && features.contains(Feature::Avx512Bw)
+        && features.contains(Feature::Avx512Cd)
+        && features.contains(Feature::Avx512Dq)
+        && features.contains(Feature::Avx512F)
+        && features.contains(Feature::Avx512Vl)
+}
+
+fn weighted_feature_score(arch: TargetArch, features: FeatureMask) -> u16 {
+    match arch {
+        TargetArch::X86_64 => x86_feature_score(features),
+        TargetArch::Aarch64 => aarch64_feature_score(features),
+    }
+}
+
+fn x86_feature_score(features: FeatureMask) -> u16 {
+    let weighted = [
+        (Feature::Avx512Fp16, 80),
+        (Feature::Avx512Bf16, 80),
+        (Feature::Avx512Vnni, 60),
+        (Feature::Avx512F, 120),
+        (Feature::Avx512Bw, 40),
+        (Feature::Avx512Dq, 40),
+        (Feature::Avx512Vl, 40),
+        (Feature::Avx512Ifma, 30),
+        (Feature::Avx512Vbmi, 30),
+        (Feature::Avx512Vbmi2, 30),
+        (Feature::Avx512Bitalg, 20),
+        (Feature::Avx512Vpopcntdq, 20),
+        (Feature::Avx512Cd, 10),
+        (Feature::Avx512Vp2intersect, 10),
+        (Feature::AvxVnniInt16, 35),
+        (Feature::AvxVnniInt8, 35),
+        (Feature::AvxVnni, 30),
+        (Feature::AvxIfma, 30),
+        (Feature::AvxNeConvert, 25),
+        (Feature::Avx2, 80),
+        (Feature::Fma, 35),
+        (Feature::Avx, 30),
+        (Feature::Bmi2, 20),
+        (Feature::Bmi1, 15),
+        (Feature::Vaes, 25),
+        (Feature::Vpclmulqdq, 25),
+        (Feature::Gfni, 15),
+        (Feature::Pclmulqdq, 12),
+        (Feature::Sha, 12),
+        (Feature::Aes, 10),
+        (Feature::Sse4_2, 8),
+        (Feature::Sse4_1, 8),
+        (Feature::Ssse3, 6),
+        (Feature::Sse3, 4),
+        (Feature::Sse2, 2),
+        (Feature::Sse, 1),
+    ];
+    feature_score(features, &weighted)
+}
+
+fn aarch64_feature_score(features: FeatureMask) -> u16 {
+    let weighted = [
+        (Feature::Sve2, 140),
+        (Feature::Sve, 100),
+        (Feature::Bf16, 60),
+        (Feature::I8mm, 60),
+        (Feature::Fhm, 35),
+        (Feature::Dotprod, 30),
+        (Feature::Fp16, 30),
+        (Feature::Rdm, 25),
+        (Feature::Lse, 25),
+        (Feature::Fcma, 20),
+        (Feature::Dpb2, 20),
+        (Feature::Dpb, 15),
+        (Feature::Sha512, 15),
+        (Feature::Sha3, 15),
+        (Feature::Sm4, 12),
+        (Feature::Sm3, 12),
+        (Feature::Sha2, 10),
+        (Feature::Aes, 10),
+        (Feature::Crc, 8),
+        (Feature::Asimd, 4),
+    ];
+    feature_score(features, &weighted)
+}
+
+fn feature_score(features: FeatureMask, weighted: &[(Feature, u16)]) -> u16 {
+    weighted
+        .iter()
+        .filter_map(|(feature, weight)| features.contains(*feature).then_some(*weight))
+        .sum()
 }
 
 fn is_package_level(kind: TargetKind) -> bool {
@@ -740,6 +892,58 @@ mod tests {
         }
     }
 
+    fn x86_64_v3_features() -> Vec<Feature> {
+        vec![
+            Feature::Avx,
+            Feature::Avx2,
+            Feature::Bmi1,
+            Feature::Bmi2,
+            Feature::Cmpxchg16b,
+            Feature::F16c,
+            Feature::Fma,
+            Feature::Fxsr,
+            Feature::Lzcnt,
+            Feature::Movbe,
+            Feature::Popcnt,
+            Feature::Sse,
+            Feature::Sse2,
+            Feature::Sse3,
+            Feature::Sse4_1,
+            Feature::Sse4_2,
+            Feature::Ssse3,
+            Feature::Xsave,
+        ]
+    }
+
+    fn x86_64_v4_features() -> Vec<Feature> {
+        let mut features = x86_64_v3_features();
+        features.extend([
+            Feature::Avx512Bw,
+            Feature::Avx512Cd,
+            Feature::Avx512Dq,
+            Feature::Avx512F,
+            Feature::Avx512Vl,
+        ]);
+        features
+    }
+
+    fn znver2_features() -> Vec<Feature> {
+        let mut features = x86_64_v3_features();
+        features.extend([
+            Feature::Adx,
+            Feature::Aes,
+            Feature::Pclmulqdq,
+            Feature::Rdrand,
+            Feature::Rdseed,
+            Feature::Sha,
+            Feature::Sse4a,
+            Feature::Xsavec,
+            Feature::Xsaveopt,
+            Feature::Xsaves,
+        ]);
+        features
+    }
+
     fn leak(value: &str) -> &'static str {
         Box::leak(value.to_string().into_boxed_str())
     }
@@ -1163,19 +1367,13 @@ mod tests {
         let variants = [
             v(
                 "x86-64-v4",
-                &[
-                    Feature::Avx2,
-                    Feature::Avx512F,
-                    Feature::Avx512Bw,
-                    Feature::Avx512Dq,
-                    Feature::Avx512Vl,
-                ],
+                &x86_64_v4_features(),
                 1,
                 TargetKind::X86NeutralLevel { level: 4 },
             ),
             v(
                 "znver2",
-                &[Feature::Avx2],
+                &znver2_features(),
                 2,
                 TargetKind::X86AmdZen { generation: 2 },
             ),
@@ -1187,21 +1385,88 @@ mod tests {
             stepping: 0,
         };
         assert_eq!(
-            select_variant(
-                host(
-                    &[
-                        Feature::Avx2,
-                        Feature::Avx512F,
-                        Feature::Avx512Bw,
-                        Feature::Avx512Dq,
-                        Feature::Avx512Vl,
-                    ],
-                    identity
-                ),
-                &variants
-            )
-            .target_cpu,
+            select_variant(host(&x86_64_v4_features(), identity), &variants).target_cpu,
             "x86-64-v4"
+        );
+    }
+
+    #[test]
+    fn same_x86_baseline_prefers_exact_concrete_cpu() {
+        let variants = [
+            v(
+                "x86-64-v4",
+                &x86_64_v4_features(),
+                1,
+                TargetKind::X86NeutralLevel { level: 4 },
+            ),
+            v(
+                "znver5",
+                &x86_64_v4_features(),
+                2,
+                TargetKind::X86AmdZen { generation: 5 },
+            ),
+        ];
+        let identity = CpuIdentity::X86 {
+            vendor: X86Vendor::Amd,
+            family: 26,
+            model: 0x24,
+            stepping: 0,
+        };
+        assert_eq!(
+            select_variant(host(&x86_64_v4_features(), identity), &variants).target_cpu,
+            "znver5"
+        );
+    }
+
+    #[test]
+    fn weighted_features_beat_raw_feature_count() {
+        let v4 = mask(&x86_64_v4_features());
+        let znver2 = mask(&znver2_features());
+
+        assert!(znver2.count() > v4.count());
+        assert!(
+            weighted_feature_score(TargetArch::X86_64, v4)
+                > weighted_feature_score(TargetArch::X86_64, znver2)
+        );
+    }
+
+    #[test]
+    fn x86_baseline_level_aligns_concrete_and_neutral_targets() {
+        let generic = mask(&[Feature::Sse, Feature::Sse2]);
+        let v3 = mask(&x86_64_v3_features());
+        let v4 = mask(&x86_64_v4_features());
+
+        assert_eq!(
+            baseline_level(TargetArch::X86_64, TargetKind::Generic, generic),
+            0
+        );
+        assert_eq!(
+            baseline_level(
+                TargetArch::X86_64,
+                TargetKind::X86IntelCore,
+                FeatureMask::EMPTY
+            ),
+            0
+        );
+        assert_eq!(
+            baseline_level(TargetArch::X86_64, TargetKind::X86IntelCore, generic),
+            1
+        );
+        assert_eq!(
+            baseline_level(
+                TargetArch::X86_64,
+                TargetKind::X86AmdZen { generation: 2 },
+                v3
+            ),
+            3
+        );
+        assert_eq!(
+            baseline_level(
+                TargetArch::X86_64,
+                TargetKind::X86NeutralLevel { level: 4 },
+                v4
+            ),
+            4
         );
     }
 
