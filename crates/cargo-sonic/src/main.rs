@@ -19,6 +19,9 @@ struct Sonic {
     #[arg(long, value_delimiter = ',')]
     target_cpus: Vec<String>,
 
+    #[arg(short = 'p', long, default_value_t = 1)]
+    parallelism: usize,
+
     #[arg(long)]
     auditable: bool,
 
@@ -49,12 +52,14 @@ fn main() -> Result<()> {
     match cli.command {
         CargoSonicCommand::Sonic(Sonic {
             target_cpus,
+            parallelism,
             auditable,
             command: Command::Build(build),
         }) => cargo_sonic::build(BuildOptions {
             cargo_args: build.cargo_args,
             manifest_path: None,
             target_cpus,
+            parallelism,
             auditable,
         })
         .map(|output| {
@@ -62,6 +67,7 @@ fn main() -> Result<()> {
         }),
         CargoSonicCommand::Sonic(Sonic {
             target_cpus,
+            parallelism: _,
             auditable: _,
             command: Command::Probe(probe),
         }) => cargo_sonic::probe(ProbeOptions {
