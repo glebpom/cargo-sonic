@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
 use cargo_sonic::{BuildOptions, LoaderStrategy, PayloadCompression, ProbeOptions};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, error::ErrorKind};
+use clap_complete::{Shell, generate};
+use std::io;
 
 #[derive(Parser)]
 #[command(name = "cargo-sonic", bin_name = "cargo-sonic")]
@@ -34,8 +36,11 @@ struct Sonic {
     #[arg(long)]
     auditable: bool,
 
+    #[arg(long, value_enum)]
+    completion: Option<Shell>,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -66,7 +71,8 @@ fn main() -> Result<()> {
             compression_level,
             loader,
             auditable,
-            command: Command::Build(build),
+            completion: None,
+            command: Some(Command::Build(build)),
         }) => cargo_sonic::build(BuildOptions {
             cargo_args: build.cargo_args,
             manifest_path: None,
@@ -87,11 +93,30 @@ fn main() -> Result<()> {
             compression_level: _,
             loader: _,
             auditable: _,
-            command: Command::Probe(probe),
+            completion: None,
+            command: Some(Command::Probe(probe)),
         }) => cargo_sonic::probe(ProbeOptions {
             cargo_args: probe.cargo_args,
             target_cpus,
         }),
+        CargoSonicCommand::Sonic(Sonic {
+            completion: Some(shell),
+            ..
+        }) => {
+            let mut command = Cli::command();
+            generate(shell, &mut command, "cargo-sonic", &mut io::stdout());
+            Ok(())
+        }
+        CargoSonicCommand::Sonic(Sonic {
+            completion: None,
+            command: None,
+            ..
+        }) => Err(Cli::command()
+            .error(
+                ErrorKind::MissingSubcommand,
+                "missing subcommand `build` or `probe`",
+            )
+            .into()),
     }
     .map_err(|err| {
         if err.downcast_ref::<clap::Error>().is_some() {

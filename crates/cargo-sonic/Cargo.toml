@@ -15,6 +15,7 @@ anyhow = "1"
 camino = "1"
 cargo_metadata = "0.23.1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 miniz_oxide = "0.9.1"
 object = { version = "0.39.1", features = ["write"] }
 serde = { version = "1.0.228", features = ["derive"] }

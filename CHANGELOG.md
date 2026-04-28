@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add `cargo sonic --completion bash|fish|zsh` to generate shell completions.
 - Run the system-mode QEMU correctness suite against both `embedded` and `bundle` loader strategies.
 - Reuse each architecture's QEMU target-cpu probe results across loader strategies and include skipped CPU reasons when no payload target-cpus are buildable.
 - Add an early QEMU host Rust target check that reports the exact `rustup target add ...` command when a cross target is missing.

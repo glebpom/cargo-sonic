@@ -146,6 +146,14 @@ cargo sonic --target-cpus=x86-64-v4,znver5 build \
   --manifest-path examples/cpu-benchmark/Cargo.toml
 ```
 
+Generate shell completions with `--completion`:
+
+```bash
+cargo sonic --completion bash
+cargo sonic --completion fish
+cargo sonic --completion zsh
+```
+
 ## Target CPUs
 
 Choose variants at build time with `--target-cpus`:
