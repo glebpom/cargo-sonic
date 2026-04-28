@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 const QEMU_ASSET_SUBDIR: &str = "sonic-qemu-system";
+const QEMU_LOADER_STRATEGIES: &[&str] = &["embedded", "bundle"];
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -63,9 +64,16 @@ fn qemu_system() -> Result<()> {
 
     let mut prepared = Vec::new();
     for arch in &manifest.arch {
-        let fat_binary = build_qemu_test_app(&root, &asset_dir, arch)?;
-        let initrd = build_test_initramfs(&asset_dir, arch, &fat_binary)?;
-        prepared.push(PreparedQemuArch { arch, initrd });
+        let variants = rustc_payload_target_cpus(&asset_dir, &arch.target)?;
+        for loader in QEMU_LOADER_STRATEGIES {
+            let app = build_qemu_test_app(&root, &asset_dir, arch, loader, &variants)?;
+            let initrd = build_test_initramfs(&asset_dir, arch, &app)?;
+            prepared.push(PreparedQemuArch {
+                arch,
+                loader,
+                initrd,
+            });
+        }
     }
 
     let mut case_jobs = Vec::new();
@@ -73,6 +81,7 @@ fn qemu_system() -> Result<()> {
         for case in filtered_cases(prepared_arch.arch, case_filter.as_deref()) {
             case_jobs.push(QemuCaseJob {
                 arch: prepared_arch.arch,
+                loader: prepared_arch.loader,
                 case,
                 initrd: &prepared_arch.initrd,
             });
@@ -85,10 +94,11 @@ fn qemu_system() -> Result<()> {
         match result.outcome {
             Ok(()) => {
                 passed += 1;
-                println!("ok: {} {}", result.arch, result.cpu);
+                println!("ok: {} {} {}", result.arch, result.loader, result.cpu);
             }
             Err(err) => {
-                let report = format_qemu_failure_report(&result.arch, &result.cpu, &err);
+                let report =
+                    format_qemu_failure_report(&result.arch, &result.loader, &result.cpu, &err);
                 println!("fail: {report}");
                 failed_reports.push(report);
             }
@@ -165,17 +175,20 @@ struct SystemException {
 
 struct PreparedQemuArch<'a> {
     arch: &'a SystemArch,
+    loader: &'a str,
     initrd: PathBuf,
 }
 
 struct QemuCaseJob<'a> {
     arch: &'a SystemArch,
+    loader: &'a str,
     case: &'a SystemCase,
     initrd: &'a Path,
 }
 
 struct QemuCaseResult {
     arch: String,
+    loader: String,
     cpu: String,
     outcome: std::result::Result<(), Box<QemuCaseFailure>>,
 }
@@ -193,7 +206,17 @@ struct GuestComparison {
     result: String,
 }
 
-fn format_qemu_failure_report(arch: &str, cpu: &str, err: &QemuCaseFailure) -> String {
+struct QemuTestApp {
+    loader: String,
+    binary: PathBuf,
+}
+
+fn format_qemu_failure_report(
+    arch: &str,
+    loader: &str,
+    cpu: &str,
+    err: &QemuCaseFailure,
+) -> String {
     let (native, selected, result) = err
         .comparison
         .as_ref()
@@ -211,7 +234,7 @@ fn format_qemu_failure_report(arch: &str, cpu: &str, err: &QemuCaseFailure) -> S
         .map(|path| format!(" log={}", path.display()))
         .unwrap_or_default();
     format!(
-        "{arch} {cpu}: native={native} selected={selected} result={result} status={} message={}{}",
+        "{arch} {loader} {cpu}: native={native} selected={selected} result={result} status={} message={}{}",
         err.status, err.message, log
     )
 }
@@ -249,11 +272,13 @@ fn run_qemu_cases_parallel(
                         break;
                     }
                     let job = &jobs_to_run[index];
-                    let outcome = run_qemu_case(asset_dir, job.arch, job.case, job.initrd);
+                    let outcome =
+                        run_qemu_case(asset_dir, job.arch, job.loader, job.case, job.initrd);
                     results.lock().expect("qemu result mutex poisoned").push((
                         index,
                         QemuCaseResult {
                             arch: job.arch.name.clone(),
+                            loader: job.loader.to_string(),
                             cpu: job.case.cpu.clone(),
                             outcome,
                         },
@@ -556,47 +581,59 @@ fn main() {{}}
 RS
 rustc /tmp/native.rs --emit=llvm-ir -C target-cpu=native -o /tmp/native.ll
 native="$(sed -n 's/.*"target-cpu"="\([^"]*\)".*/\1/p' /tmp/native.ll | head -n1)"
-CARGO_SONIC_DEBUG=1 SONIC_EXAMPLE_ITERS=1 SONIC_EXAMPLE_LEN=64 /sonic-qemu-app > /tmp/app.out 2> /tmp/app.err
-selected="$(sed -n 's/^selected target-cpu: //p' /tmp/app.out | head -n1)"
-native_line="$(grep -F "    $native eligible=" /tmp/app.err | head -n1 || true)"
-selected_line="$(grep -F "    $selected eligible=" /tmp/app.err | head -n1 || true)"
-native_eligible="$(echo "$native_line" | sed -n 's/.* eligible=\([^ ]*\).*/\1/p')"
-selected_eligible="$(echo "$selected_line" | sed -n 's/.* eligible=\([^ ]*\).*/\1/p')"
-expectation=exact
-reason=
-if [ -z "$native_line" ]; then
-  result=fail
-  reason=native-variant-missing
-elif [ "$selected_eligible" != yes ]; then
-  result=fail
-  reason=selected-variant-ineligible
-elif [ "$native_eligible" = yes ] && [ "$selected" = "$native" ]; then
-  result=ok
-  expectation=exact
-elif [ "$native_eligible" = yes ]; then
-  result=fail
-  reason=native-eligible-but-not-selected
-else
-  result=ok
-  expectation=best-effort-native-ineligible
-fi
 echo "CARGO_SONIC_QEMU_BEGIN"
 echo "arch={arch_name}"
 echo "native=$native"
-echo "native_eligible=$native_eligible"
-echo "selected=$selected"
-echo "selected_eligible=$selected_eligible"
-echo "expectation=$expectation"
-echo "reason=$reason"
-if [ "$result" = fail ]; then
+overall=ok
+for loader in embedded bundle; do
+  app="/sonic-qemu-app-$loader"
+  if [ ! -x "$app" ]; then
+    continue
+  fi
+  CARGO_SONIC_DEBUG=1 SONIC_EXAMPLE_ITERS=1 SONIC_EXAMPLE_LEN=64 "$app" > "/tmp/app-$loader.out" 2> "/tmp/app-$loader.err"
+  selected="$(sed -n 's/^selected target-cpu: //p' "/tmp/app-$loader.out" | head -n1)"
+  native_line="$(grep -F "    $native eligible=" "/tmp/app-$loader.err" | head -n1 || true)"
+  selected_line="$(grep -F "    $selected eligible=" "/tmp/app-$loader.err" | head -n1 || true)"
+  native_eligible="$(echo "$native_line" | sed -n 's/.* eligible=\([^ ]*\).*/\1/p')"
+  selected_eligible="$(echo "$selected_line" | sed -n 's/.* eligible=\([^ ]*\).*/\1/p')"
+  expectation=exact
+  reason=
+  if [ -z "$native_line" ]; then
+    result=fail
+    reason=native-variant-missing
+  elif [ "$selected_eligible" != yes ]; then
+    result=fail
+    reason=selected-variant-ineligible
+  elif [ "$native_eligible" = yes ] && [ "$selected" = "$native" ]; then
+    result=ok
+    expectation=exact
+  elif [ "$native_eligible" = yes ]; then
+    result=fail
+    reason=native-eligible-but-not-selected
+  else
+    result=ok
+    expectation=best-effort-native-ineligible
+  fi
+  if [ "$result" = fail ]; then
+    overall=fail
+  fi
+  echo "loader=$loader"
+  echo "native_eligible=$native_eligible"
+  echo "selected=$selected"
+  echo "selected_eligible=$selected_eligible"
+  echo "expectation=$expectation"
+  echo "reason=$reason"
+  cat "/tmp/app-$loader.out"
+  cat "/tmp/app-$loader.err"
+  echo "loader_result=$result"
+done
+if [ "$overall" = fail ]; then
   echo "guest /proc/cpuinfo:"
   cat /proc/cpuinfo || true
   echo "guest sysfs midr:"
   cat /sys/devices/system/cpu/cpu0/regs/identification/midr_el1 || true
 fi
-cat /tmp/app.out
-cat /tmp/app.err
-echo "result=$result"
+echo "result=$overall"
 echo "CARGO_SONIC_QEMU_END"
 echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
 echo o > /proc/sysrq-trigger 2>/dev/null || true
@@ -610,9 +647,17 @@ done
     make_executable(path)
 }
 
-fn build_qemu_test_app(root: &Path, asset_dir: &Path, arch: &SystemArch) -> Result<PathBuf> {
-    let variants = rustc_payload_target_cpus(asset_dir, &arch.target)?;
-    let project = asset_dir.join("work").join(format!("app-{}", arch.name));
+fn build_qemu_test_app(
+    root: &Path,
+    asset_dir: &Path,
+    arch: &SystemArch,
+    loader: &str,
+    variants: &[String],
+) -> Result<QemuTestApp> {
+    let package_name = format!("sonic-qemu-app-{loader}");
+    let project = asset_dir
+        .join("work")
+        .join(format!("app-{}-{loader}", arch.name));
     if project.exists() {
         fs::remove_dir_all(&project)
             .with_context(|| format!("failed to remove {}", project.display()))?;
@@ -620,14 +665,16 @@ fn build_qemu_test_app(root: &Path, asset_dir: &Path, arch: &SystemArch) -> Resu
     fs::create_dir_all(project.join("src"))?;
     fs::write(
         project.join("Cargo.toml"),
-        r#"[package]
-name = "sonic-qemu-app"
+        format!(
+            r#"[package]
+name = "{package_name}"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
 [workspace]
-"#,
+"#
+        ),
     )?;
     fs::write(
         project.join("src/main.rs"),
@@ -667,6 +714,8 @@ publish = false
             "sonic",
             "--target-cpus",
             &target_cpus,
+            "--loader",
+            loader,
             "build",
             "--release",
             "--target",
@@ -678,7 +727,7 @@ publish = false
         .with_context(|| "failed to run cargo-sonic for qemu test app")?;
     if !output.status.success() {
         bail!(
-            "cargo-sonic qemu test app build failed for {}\nstdout:\n{}\nstderr:\n{}",
+            "cargo-sonic qemu test app build failed for {} {loader}\nstdout:\n{}\nstderr:\n{}",
             arch.name,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -698,7 +747,10 @@ publish = false
             path.display()
         );
     }
-    Ok(path)
+    Ok(QemuTestApp {
+        loader: loader.to_string(),
+        binary: path,
+    })
 }
 
 fn rustc_payload_target_cpus(asset_dir: &Path, target: &str) -> Result<Vec<String>> {
@@ -716,6 +768,7 @@ fn rustc_payload_target_cpus(asset_dir: &Path, target: &str) -> Result<Vec<Strin
         "#![no_std]\n#[no_mangle]\npub extern \"C\" fn cargo_sonic_probe() {}\n",
     )
     .with_context(|| format!("failed to write {}", probe_source.display()))?;
+    ensure_rust_target_installed(target, &probe_source, &probe_dir)?;
 
     let mut accepted = Vec::new();
     let mut skipped = Vec::new();
@@ -748,9 +801,6 @@ fn rustc_payload_target_cpus(asset_dir: &Path, target: &str) -> Result<Vec<Strin
         }
     }
 
-    if accepted.is_empty() {
-        bail!("rustc reported no payload-buildable target-cpus for {target}");
-    }
     if !skipped.is_empty() {
         println!(
             "rustc target-cpu probe for {target}: {} accepted, {} skipped",
@@ -761,7 +811,52 @@ fn rustc_payload_target_cpus(asset_dir: &Path, target: &str) -> Result<Vec<Strin
             println!("  skip {cpu}: {reason}");
         }
     }
+    if accepted.is_empty() {
+        let reasons = skipped
+            .iter()
+            .take(10)
+            .map(|(cpu, reason)| format!("  - {cpu}: {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        bail!(
+            "rustc reported no payload-buildable target-cpus for {target}{}",
+            if reasons.is_empty() {
+                String::new()
+            } else {
+                format!("\n{reasons}")
+            }
+        );
+    }
     Ok(accepted)
+}
+
+fn ensure_rust_target_installed(target: &str, probe_source: &Path, probe_dir: &Path) -> Result<()> {
+    let object = probe_dir.join("target-installed.o");
+    let output = Command::new("rustc")
+        .arg("--crate-type=lib")
+        .arg("--emit=obj")
+        .arg("--target")
+        .arg(target)
+        .arg("-C")
+        .arg("panic=abort")
+        .arg(probe_source)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .with_context(|| format!("failed to check whether Rust target `{target}` is installed"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("can't find crate for `core`") {
+        bail!(
+            "Rust target `{target}` is not installed for the host toolchain; run `rustup target add {target}`"
+        );
+    }
+    bail!(
+        "failed to compile host probe for Rust target `{target}`:\n{}",
+        stderr
+    );
 }
 
 fn rustc_target_cpus(target: &str) -> Result<Vec<String>> {
@@ -795,7 +890,7 @@ fn rustc_target_cpus(target: &str) -> Result<Vec<String>> {
     Ok(cpus)
 }
 
-fn build_test_initramfs(asset_dir: &Path, arch: &SystemArch, fat_binary: &Path) -> Result<PathBuf> {
+fn build_test_initramfs(asset_dir: &Path, arch: &SystemArch, app: &QemuTestApp) -> Result<PathBuf> {
     ensure_tool("cpio")?;
     ensure_tool("gzip")?;
 
@@ -803,18 +898,33 @@ fn build_test_initramfs(asset_dir: &Path, arch: &SystemArch, fat_binary: &Path) 
     let initrd = asset_dir
         .join("run")
         .join(&arch.name)
-        .join("initramfs.cpio.gz");
+        .join(format!("initramfs-{}.cpio.gz", app.loader));
     if let Some(parent) = initrd.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::copy(fat_binary, rootfs.join("sonic-qemu-app")).with_context(|| {
+    for loader in QEMU_LOADER_STRATEGIES {
+        let guest_name = qemu_guest_app_name(loader);
+        let _ = fs::remove_file(rootfs.join(&guest_name));
+        let bundle = rootfs.join(format!("{guest_name}.bundle"));
+        if bundle.exists() {
+            fs::remove_dir_all(&bundle)
+                .with_context(|| format!("failed to remove old bundle {}", bundle.display()))?;
+        }
+    }
+    let guest_name = qemu_guest_app_name(&app.loader);
+    let guest_path = rootfs.join(&guest_name);
+    fs::copy(&app.binary, &guest_path).with_context(|| {
         format!(
             "failed to copy {} into {}",
-            fat_binary.display(),
+            app.binary.display(),
             rootfs.display()
         )
     })?;
-    make_executable(&rootfs.join("sonic-qemu-app"))?;
+    make_executable(&guest_path)?;
+    let bundle = bundle_dir_for(&app.binary);
+    if bundle.exists() {
+        copy_dir_all(&bundle, &rootfs.join(format!("{guest_name}.bundle")))?;
+    }
 
     let mut sh = Command::new("sh");
     sh.current_dir(&rootfs).arg("-c").arg(format!(
@@ -825,9 +935,40 @@ fn build_test_initramfs(asset_dir: &Path, arch: &SystemArch, fat_binary: &Path) 
     Ok(initrd)
 }
 
+fn qemu_guest_app_name(loader: &str) -> String {
+    format!("sonic-qemu-app-{loader}")
+}
+
+fn bundle_dir_for(binary: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.bundle", binary.display()))
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    if dst.exists() {
+        fs::remove_dir_all(dst).with_context(|| format!("failed to remove {}", dst.display()))?;
+    }
+    fs::create_dir_all(dst).with_context(|| format!("failed to create {}", dst.display()))?;
+    for entry in fs::read_dir(src).with_context(|| format!("failed to read {}", src.display()))? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)
+                .with_context(|| format!("failed to copy {}", entry.path().display()))?;
+            if ty.is_file() {
+                make_executable(&target)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_qemu_case(
     asset_dir: &Path,
     arch: &SystemArch,
+    loader: &str,
     case: &SystemCase,
     initrd: &Path,
 ) -> std::result::Result<(), Box<QemuCaseFailure>> {
@@ -873,8 +1014,8 @@ fn run_qemu_case(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    if !combined.contains("result=ok") {
-        let log_path = match write_qemu_case_log(asset_dir, arch, case, &combined) {
+    if !combined.lines().any(|line| line == "result=ok") {
+        let log_path = match write_qemu_case_log(asset_dir, arch, loader, case, &combined) {
             Ok(path) => Some(path),
             Err(err) => {
                 eprintln!(
@@ -897,10 +1038,15 @@ fn run_qemu_case(
 fn write_qemu_case_log(
     asset_dir: &Path,
     arch: &SystemArch,
+    loader: &str,
     case: &SystemCase,
     output: &str,
 ) -> Result<PathBuf> {
-    let dir = asset_dir.join("run").join("logs").join(&arch.name);
+    let dir = asset_dir
+        .join("run")
+        .join("logs")
+        .join(&arch.name)
+        .join(loader);
     fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create qemu log directory {}", dir.display()))?;
     let path = dir.join(format!("{}.log", sanitize_path_component(&case.cpu)));

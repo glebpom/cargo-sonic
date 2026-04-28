@@ -28,6 +28,9 @@ struct Sonic {
     #[arg(long, default_value_t = 22)]
     compression_level: i32,
 
+    #[arg(long, default_value = "embedded")]
+    loader: String,
+
     #[arg(long)]
     auditable: bool,
 
@@ -61,6 +64,7 @@ fn main() -> Result<()> {
             parallelism,
             compress,
             compression_level,
+            loader,
             auditable,
             command: Command::Build(build),
         }) => cargo_sonic::build(BuildOptions {
@@ -70,6 +74,7 @@ fn main() -> Result<()> {
             parallelism,
             compress,
             compression_level,
+            loader,
             auditable,
         })
         .map(|output| {
@@ -80,6 +85,7 @@ fn main() -> Result<()> {
             parallelism: _,
             compress: _,
             compression_level: _,
+            loader: _,
             auditable: _,
             command: Command::Probe(probe),
         }) => cargo_sonic::probe(ProbeOptions {

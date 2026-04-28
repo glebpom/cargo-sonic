@@ -168,6 +168,24 @@ The compression level is controlled separately:
 cargo sonic --target-cpus=x86-64-v3,znver5 --compress=zstd --compression-level=10 build --release
 ```
 
+The default loader strategy is `--loader=embedded`, which produces one
+self-contained fat executable. For container images and other layouts where a
+directory can travel with the launcher, `--loader=bundle` builds a small CPU
+detection launcher at the usual output path and places the concrete payload
+binaries in an adjacent `<bin-name>.bundle/` directory:
+
+```bash
+cargo sonic --target-cpus=x86-64-v3,znver5 --loader=bundle build --release
+```
+
+With uncompressed payloads, the bundle loader avoids copying or decompressing
+the selected payload at startup; it directly `exec`s the matching binary from
+the bundle directory. This is faster to start, works well in Docker images, and
+should be comparable to a single generic build for startup overhead. It is not a
+single-file binary distribution format. Compression can still be combined with
+bundle mode, but it gives up the fast-start benefit because the selected payload
+must be decompressed before execution.
+
 With `--parallelism=1`, payload build output is passed through without
 cargo-sonic block headers. Output from parallel payload builds is buffered
 briefly and printed in blocks headed by `cargo-sonic[<target-cpu>]` so
@@ -344,16 +362,17 @@ identity cases that QEMU TCG cannot model as strict guest oracles.
 Run the QEMU system-mode suite:
 
 ```bash
+rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-musl
 just qemu-prepare
 just qemu
 ```
 
 The QEMU correctness suite is system-mode only. It must boot a controlled Linux
 guest for each CPU model listed in `tests/qemu/system.toml`, run rustc inside
-that guest with `-C target-cpu=native`, run the cargo-sonic fat executable inside
-the same guest, and compare the loader-selected target against the rustc-derived
-expectation. Host `qemu-user`, host rustc, and checked-in selected-target goldens
-are intentionally not used as correctness oracles.
+that guest with `-C target-cpu=native`, run both cargo-sonic loader strategies
+inside the same guest, and compare each loader-selected target against the
+rustc-derived expectation. Host `qemu-user`, host rustc, and checked-in
+selected-target goldens are intentionally not used as correctness oracles.
 
 QEMU cases run in parallel. The default worker count is the number of available
 CPU cores; override it with `SONIC_QEMU_JOBS=<n>` when needed:

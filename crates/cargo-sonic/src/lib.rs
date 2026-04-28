@@ -41,6 +41,7 @@ pub struct BuildOptions {
     pub parallelism: usize,
     pub compress: Option<String>,
     pub compression_level: i32,
+    pub loader: String,
     pub auditable: bool,
 }
 
@@ -86,6 +87,7 @@ struct VariantBuild {
     artifact: Utf8PathBuf,
     payload_compression: PayloadCompression,
     uncompressed_len: u64,
+    bundle_path: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -123,11 +125,25 @@ enum PayloadCompression {
     Zstd,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum LoaderStrategy {
+    Embedded,
+    Bundle,
+}
+
 fn parse_payload_compression(value: Option<&str>) -> Result<PayloadCompression> {
     match value {
         None | Some("none") => Ok(PayloadCompression::None),
         Some("zstd") => Ok(PayloadCompression::Zstd),
         Some(other) => bail!("unsupported --compress value `{other}`; expected `zstd`"),
+    }
+}
+
+fn parse_loader_strategy(value: &str) -> Result<LoaderStrategy> {
+    match value {
+        "embedded" => Ok(LoaderStrategy::Embedded),
+        "bundle" => Ok(LoaderStrategy::Bundle),
+        other => bail!("unsupported --loader value `{other}`; expected `embedded` or `bundle`"),
     }
 }
 
@@ -154,6 +170,7 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
         bail!("--parallelism must be at least 1");
     }
     let payload_compression = parse_payload_compression(options.compress.as_deref())?;
+    let loader_strategy = parse_loader_strategy(&options.loader)?;
     let cargo_args = parse_cargo_args(&options.cargo_args);
     let manifest_path = options
         .manifest_path
@@ -275,6 +292,7 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
         &loader_dir,
         &target,
         &variants,
+        loader_strategy,
         auditable_section.as_deref(),
     )?;
     let loader_artifact = build_loader(&loader_dir, &target, profile)?;
@@ -283,6 +301,9 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
     fs::copy(&loader_artifact, &final_binary)
         .with_context(|| format!("failed to copy final fat binary to {final_binary}"))?;
     make_executable(&final_binary)?;
+    if loader_strategy == LoaderStrategy::Bundle {
+        prepare_bundle_directory(&final_binary, &variants)?;
+    }
     Ok(BuildOutput {
         final_binary,
         warnings,
@@ -1039,8 +1060,10 @@ fn build_payload_variants(
                     break;
                 };
                 print_variant_build_prelude(&job.target_cpu);
-                let result =
-                    build_payload_variant(&ctx, &job.target_cpu).map(|payload| VariantBuild {
+                let result = build_payload_variant(&ctx, &job.target_cpu).map(|payload| {
+                    let bundle_path =
+                        leaked_str(&format!("{}.elf\0", sanitize_cpu(&job.target_cpu)));
+                    VariantBuild {
                         target_cpu: job.target_cpu,
                         required_features: job.required_features,
                         rank_features: job.rank_features,
@@ -1050,7 +1073,9 @@ fn build_payload_variants(
                         artifact: payload.path,
                         payload_compression: payload.compression,
                         uncompressed_len: payload.uncompressed_len,
-                    });
+                        bundle_path,
+                    }
+                });
                 if tx.send((index, result)).is_err() {
                     break;
                 }
@@ -1367,6 +1392,31 @@ fn resolve_bin_name(
     bail!("multiple binary artifacts are possible; pass --bin");
 }
 
+fn prepare_bundle_directory(final_binary: &Utf8Path, variants: &[VariantBuild]) -> Result<()> {
+    let bundle_dir = bundle_dir_for(final_binary);
+    if bundle_dir.exists() {
+        fs::remove_dir_all(&bundle_dir)
+            .with_context(|| format!("failed to remove old bundle directory {bundle_dir}"))?;
+    }
+    fs::create_dir_all(&bundle_dir)
+        .with_context(|| format!("failed to create bundle directory {bundle_dir}"))?;
+    for variant in variants {
+        let destination = bundle_dir.join(variant.bundle_path.trim_end_matches('\0'));
+        fs::copy(&variant.artifact, &destination).with_context(|| {
+            format!(
+                "failed to copy payload {} to bundle path {destination}",
+                variant.artifact
+            )
+        })?;
+        make_executable(&destination)?;
+    }
+    Ok(())
+}
+
+fn bundle_dir_for(final_binary: &Utf8Path) -> Utf8PathBuf {
+    Utf8PathBuf::from(format!("{final_binary}.bundle"))
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
 enum AuditDepKind {
     Development,
@@ -1596,6 +1646,7 @@ fn generate_loader_crate(
     loader_dir: &Utf8Path,
     target: &str,
     variants: &[VariantBuild],
+    loader_strategy: LoaderStrategy,
     auditable_section: Option<&[u8]>,
 ) -> Result<()> {
     fs::create_dir_all(loader_dir.join("src"))?;
@@ -1645,11 +1696,11 @@ panic = "abort"
     fs::write(loader_dir.join("src/stack.rs"), generated_stack())?;
     fs::write(
         loader_dir.join("src/generated_manifest.rs"),
-        generated_manifest(variants),
+        generated_manifest(variants, loader_strategy),
     )?;
     fs::write(
         loader_dir.join("src/main.rs"),
-        generated_main(target, uses_zstd),
+        generated_main(target, uses_zstd, loader_strategy),
     )?;
     if let Some(section) = auditable_section {
         fs::write(
@@ -1700,26 +1751,28 @@ fn loader_rustflags(target: &str) -> &'static str {
     }
 }
 
-fn generated_manifest(variants: &[VariantBuild]) -> String {
+fn generated_manifest(variants: &[VariantBuild], loader_strategy: LoaderStrategy) -> String {
     let mut out = String::new();
     out.push_str("use crate::feature_mask::FeatureMask;\nuse crate::select::TargetKind;\n\n");
     out.push_str("pub static ENV_ENABLED: &[u8] = b\"CARGO_SONIC_ENABLED=1\\0\";\n\n");
-    out.push_str(
-        "#[repr(align(131072))]\npub struct AlignedPayload<const N: usize>(pub [u8; N]);\n\n",
-    );
-    for v in variants {
-        let payload_len = fs::metadata(&v.artifact)
-            .map(|metadata| metadata.len())
-            .unwrap_or_default();
-        out.push_str(&format!(
-            "static PAYLOAD_{}: AlignedPayload<{}> = AlignedPayload(*include_bytes!(\"../payloads/{}.elf\"));\n",
-            sanitize_cpu(&v.target_cpu).to_ascii_uppercase(),
-            payload_len,
-            sanitize_cpu(&v.target_cpu)
-        ));
+    if loader_strategy == LoaderStrategy::Embedded {
+        out.push_str(
+            "#[repr(align(131072))]\npub struct AlignedPayload<const N: usize>(pub [u8; N]);\n\n",
+        );
+        for v in variants {
+            let payload_len = fs::metadata(&v.artifact)
+                .map(|metadata| metadata.len())
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "static PAYLOAD_{}: AlignedPayload<{}> = AlignedPayload(*include_bytes!(\"../payloads/{}.elf\"));\n",
+                sanitize_cpu(&v.target_cpu).to_ascii_uppercase(),
+                payload_len,
+                sanitize_cpu(&v.target_cpu)
+            ));
+        }
     }
     out.push('\n');
-    out.push_str("pub struct Variant {\n    pub target_cpu: &'static str,\n    pub required_features: FeatureMask,\n    pub rank_features: FeatureMask,\n    pub rank_feature_count: u16,\n    pub feature_tier: u8,\n    pub target_kind: TargetKind,\n    pub env_selected_target_cpu: &'static [u8],\n    pub env_selected_flags: &'static [u8],\n    pub payload: &'static [u8],\n    pub payload_compression: PayloadCompression,\n    pub uncompressed_len: usize,\n}\n\n");
+    out.push_str("pub struct Variant {\n    pub target_cpu: &'static str,\n    pub required_features: FeatureMask,\n    pub rank_features: FeatureMask,\n    pub rank_feature_count: u16,\n    pub feature_tier: u8,\n    pub target_kind: TargetKind,\n    pub env_selected_target_cpu: &'static [u8],\n    pub env_selected_flags: &'static [u8],\n    pub payload: &'static [u8],\n    pub payload_path: &'static [u8],\n    pub payload_compression: PayloadCompression,\n    pub uncompressed_len: usize,\n}\n\n");
     out.push_str("#[derive(Clone, Copy, Eq, PartialEq)]\npub enum PayloadCompression {\n    None,\n    Zstd,\n}\n\n");
     out.push_str("pub static VARIANTS: &[Variant] = &[\n");
     for v in variants {
@@ -1753,10 +1806,16 @@ fn generated_manifest(variants: &[VariantBuild]) -> String {
             "        env_selected_flags: b\"CARGO_SONIC_SELECTED_FLAGS={}\\0\",\n",
             escape_bytes(&flags)
         ));
-        out.push_str(&format!(
-            "        payload: &PAYLOAD_{}.0,\n",
-            sanitize_cpu(&v.target_cpu).to_ascii_uppercase()
-        ));
+        let payload_expr = if loader_strategy == LoaderStrategy::Embedded {
+            format!(
+                "&PAYLOAD_{}.0",
+                sanitize_cpu(&v.target_cpu).to_ascii_uppercase()
+            )
+        } else {
+            "&[]".to_string()
+        };
+        out.push_str(&format!("        payload: {payload_expr},\n"));
+        out.push_str(&format!("        payload_path: b{:?},\n", v.bundle_path));
         out.push_str(&format!(
             "        payload_compression: {},\n",
             payload_compression_expr(v.payload_compression)
@@ -1802,11 +1861,12 @@ fn target_kind_expr(kind: TargetKind) -> String {
     }
 }
 
-fn generated_main(_target: &str, uses_zstd: bool) -> String {
+fn generated_main(_target: &str, uses_zstd: bool, loader_strategy: LoaderStrategy) -> String {
     let zstd_support = if uses_zstd {
         r#"
 extern crate alloc;
 use core::alloc::{GlobalAlloc, Layout};
+use alloc::vec::Vec;
 
 struct MmapAllocator;
 
@@ -1841,13 +1901,48 @@ unsafe fn write_zstd_payload(fd: isize, selected: &Variant) -> isize {
         linux_sys::write_all(fd, output, selected.uncompressed_len)
     }
 }
+
+unsafe fn write_zstd_payload_from_fd(fd: isize, payload_fd: isize, selected: &Variant) -> isize {
+    unsafe {
+        let mut compressed = Vec::new();
+        let mut buf = [0u8; 16384];
+        loop {
+            let n = linux_sys::read(payload_fd, buf.as_mut_ptr(), buf.len());
+            if n < 0 {
+                return n;
+            }
+            if n == 0 {
+                break;
+            }
+            compressed.extend_from_slice(&buf[..n as usize]);
+        }
+        let output = linux_sys::mmap(selected.uncompressed_len) as *mut u8;
+        if (output as isize) < 0 {
+            return -1;
+        }
+        let output_slice = core::slice::from_raw_parts_mut(output, selected.uncompressed_len);
+        let mut decoder = ruzstd::decoding::FrameDecoder::new();
+        if decoder.decode_all(&compressed, output_slice).is_err() {
+            return -1;
+        }
+        linux_sys::write_all(fd, output, selected.uncompressed_len)
+    }
+}
 "#
     } else {
         r#"
 unsafe fn write_zstd_payload(_fd: isize, _selected: &Variant) -> isize {
     -1
 }
+
+unsafe fn write_zstd_payload_from_fd(_fd: isize, _payload_fd: isize, _selected: &Variant) -> isize {
+    -1
+}
 "#
+    };
+    let exec_payload = match loader_strategy {
+        LoaderStrategy::Embedded => "exec_embedded_payload",
+        LoaderStrategy::Bundle => "exec_bundle_payload",
     };
     r#"#![no_std]
 #![no_main]
@@ -1985,7 +2080,7 @@ unsafe extern "C" fn loader_entry(stack: *const usize) -> ! {
         debug_selection(host, &metas[..count], selected_meta.target_cpu, sonic_enabled);
     }
     let selected = find_variant(selected_meta.target_cpu);
-    unsafe { exec_payload(selected, &initial) }
+    unsafe { __CARGO_SONIC_EXEC_PAYLOAD__(selected, &initial) }
 }
 
 fn find_variant(name: &str) -> &'static Variant {
@@ -2188,6 +2283,10 @@ fn read_u64(buf: &[u8], offset: usize) -> u64 {
 }
 
 unsafe fn exec_payload(selected: &Variant, initial: &stack::InitialStack) -> ! {
+    unsafe { exec_embedded_payload(selected, initial) }
+}
+
+unsafe fn exec_embedded_payload(selected: &Variant, initial: &stack::InitialStack) -> ! {
     unsafe {
         let _ = exec_reflink_tmpfile(selected, initial);
         let fd = linux_sys::memfd_create_best_effort(b"cargo-sonic-payload\0".as_ptr());
@@ -2207,6 +2306,70 @@ unsafe fn exec_payload(selected: &Variant, initial: &stack::InitialStack) -> ! {
         }
         linux_sys::execveat(fd, b"\0".as_ptr(), initial.argv, envp, linux_sys::AT_EMPTY_PATH);
         linux_sys::exit(114)
+    }
+}
+
+unsafe fn exec_bundle_payload(selected: &Variant, initial: &stack::InitialStack) -> ! {
+    unsafe {
+        let mut path = [0u8; 4096];
+        let exe_len = linux_sys::readlinkat(
+            linux_sys::AT_FDCWD,
+            b"/proc/self/exe\0".as_ptr(),
+            path.as_mut_ptr(),
+            path.len() - 1,
+        );
+        if exe_len <= 0 {
+            linux_sys::exit(115);
+        }
+        let exe_len = exe_len as usize;
+        let suffix = b".bundle/";
+        let required = exe_len + suffix.len() + selected.payload_path.len();
+        if required > path.len() {
+            linux_sys::exit(116);
+        }
+        let mut out = exe_len;
+        let mut i = 0;
+        while i < suffix.len() {
+            path[out] = suffix[i];
+            out += 1;
+            i += 1;
+        }
+        i = 0;
+        while i < selected.payload_path.len() {
+            path[out] = selected.payload_path[i];
+            out += 1;
+            i += 1;
+        }
+        let fd = linux_sys::openat(linux_sys::AT_FDCWD, path.as_ptr(), linux_sys::O_RDONLY, 0);
+        if fd < 0 {
+            linux_sys::exit(117);
+        }
+        if selected.payload_compression != PayloadCompression::None {
+            let memfd = linux_sys::memfd_create_best_effort(b"cargo-sonic-payload\0".as_ptr());
+            if memfd < 0 {
+                let _ = linux_sys::close(fd);
+                linux_sys::exit(120);
+            }
+            if write_zstd_payload_from_fd(memfd, fd, selected) < 0 {
+                let _ = linux_sys::close(fd);
+                linux_sys::exit(121);
+            }
+            let _ = linux_sys::close(fd);
+            let envp = stack::build_envp(initial, generated_manifest::ENV_ENABLED, selected.env_selected_target_cpu, selected.env_selected_flags);
+            if envp.is_null() {
+                let _ = linux_sys::close(memfd);
+                linux_sys::exit(122);
+            }
+            linux_sys::execveat(memfd, b"\0".as_ptr(), initial.argv, envp, linux_sys::AT_EMPTY_PATH);
+            linux_sys::exit(123);
+        }
+        let envp = stack::build_envp(initial, generated_manifest::ENV_ENABLED, selected.env_selected_target_cpu, selected.env_selected_flags);
+        if envp.is_null() {
+            let _ = linux_sys::close(fd);
+            linux_sys::exit(118);
+        }
+        linux_sys::execveat(fd, b"\0".as_ptr(), initial.argv, envp, linux_sys::AT_EMPTY_PATH);
+        linux_sys::exit(119)
     }
 }
 
@@ -2637,6 +2800,7 @@ unsafe fn detect_x86_identity() -> CpuIdentity {
     }
 }
 "#
+    .replace("__CARGO_SONIC_EXEC_PAYLOAD__", exec_payload)
     .replace("/*__CARGO_SONIC_ZSTD_SUPPORT__*/", zstd_support)
 }
 
@@ -2669,6 +2833,8 @@ const SYS_OPENAT: usize = 257;
 const SYS_MEMFD_CREATE: usize = 319;
 #[cfg(target_arch = "x86_64")]
 const SYS_EXECVEAT: usize = 322;
+#[cfg(target_arch = "x86_64")]
+const SYS_READLINKAT: usize = 267;
 const PROT_READ: usize = 1;
 const PROT_WRITE: usize = 2;
 const MAP_PRIVATE: usize = 2;
@@ -2699,6 +2865,8 @@ const SYS_OPENAT: usize = 56;
 const SYS_MEMFD_CREATE: usize = 279;
 #[cfg(target_arch = "aarch64")]
 const SYS_EXECVEAT: usize = 281;
+#[cfg(target_arch = "aarch64")]
+const SYS_READLINKAT: usize = 78;
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn syscall6(n: usize, a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize) -> isize {
@@ -2747,6 +2915,10 @@ pub unsafe fn write_all(fd: isize, mut ptr: *const u8, mut len: usize) -> isize 
 
 pub unsafe fn read(fd: isize, ptr: *mut u8, len: usize) -> isize {
     unsafe { syscall6(SYS_READ, fd as usize, ptr as usize, len, 0, 0, 0) }
+}
+
+pub unsafe fn readlinkat(dirfd: isize, path: *const u8, buf: *mut u8, len: usize) -> isize {
+    unsafe { syscall6(SYS_READLINKAT, dirfd as usize, path as usize, buf as usize, len, 0, 0) }
 }
 
 pub unsafe fn pread(fd: isize, ptr: *mut u8, len: usize, offset: usize) -> isize {
@@ -3207,6 +3379,19 @@ mod tests {
     }
 
     #[test]
+    fn loader_strategy_accepts_only_known_modes() {
+        assert_eq!(
+            parse_loader_strategy("embedded").unwrap(),
+            LoaderStrategy::Embedded
+        );
+        assert_eq!(
+            parse_loader_strategy("bundle").unwrap(),
+            LoaderStrategy::Bundle
+        );
+        assert!(parse_loader_strategy("single").is_err());
+    }
+
+    #[test]
     fn cargo_args_tolerate_repeated_cargo_selectors() {
         let args = strings(&[
             "--manifest-path",
@@ -3248,7 +3433,11 @@ mod tests {
 
     #[test]
     fn generated_aarch64_loader_does_not_read_midr_el1_before_fallbacks() {
-        let source = generated_main("aarch64-unknown-linux-musl", false);
+        let source = generated_main(
+            "aarch64-unknown-linux-musl",
+            false,
+            LoaderStrategy::Embedded,
+        );
         assert!(source.contains("read_small_file_hex"));
         assert!(!source.contains("let midr = unsafe { read_midr_el1() };"));
     }
@@ -3525,6 +3714,7 @@ mod tests {
             parallelism: 1,
             compress: None,
             compression_level: 22,
+            loader: "embedded".into(),
             auditable: true,
         })
         .unwrap();
