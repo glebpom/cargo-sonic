@@ -161,6 +161,13 @@ Payload builds run sequentially by default. Pass `-p`/`--parallelism` before the
 cargo sonic --target-cpus=x86-64-v3,znver5 -p 2 build --release
 ```
 
+Pass `--compress=zstd` to store payloads compressed inside the final fat binary.
+The compression level is controlled separately:
+
+```bash
+cargo sonic --target-cpus=x86-64-v3,znver5 --compress=zstd --compression-level=10 build --release
+```
+
 With `--parallelism=1`, payload build output is passed through without
 cargo-sonic block headers. Output from parallel payload builds is buffered
 briefly and printed in blocks headed by `cargo-sonic[<target-cpu>]` so
