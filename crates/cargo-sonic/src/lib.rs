@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
+use std::io::Cursor;
 use std::io::{IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
@@ -38,6 +39,8 @@ pub struct BuildOptions {
     pub manifest_path: Option<Utf8PathBuf>,
     pub target_cpus: Vec<String>,
     pub parallelism: usize,
+    pub compress: Option<String>,
+    pub compression_level: i32,
     pub auditable: bool,
 }
 
@@ -81,6 +84,8 @@ struct VariantBuild {
     feature_tier: u8,
     target_kind: TargetKind,
     artifact: Utf8PathBuf,
+    payload_compression: PayloadCompression,
+    uncompressed_len: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +106,29 @@ struct PayloadBuildContext {
     target: String,
     out_root: Utf8PathBuf,
     tag_output: bool,
+    payload_compression: PayloadCompression,
+    compression_level: i32,
+}
+
+#[derive(Debug, Clone)]
+struct PayloadArtifact {
+    path: Utf8PathBuf,
+    compression: PayloadCompression,
+    uncompressed_len: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PayloadCompression {
+    None,
+    Zstd,
+}
+
+fn parse_payload_compression(value: Option<&str>) -> Result<PayloadCompression> {
+    match value {
+        None | Some("none") => Ok(PayloadCompression::None),
+        Some("zstd") => Ok(PayloadCompression::Zstd),
+        Some(other) => bail!("unsupported --compress value `{other}`; expected `zstd`"),
+    }
 }
 
 struct ProbeVariant {
@@ -125,6 +153,7 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
     if options.parallelism == 0 {
         bail!("--parallelism must be at least 1");
     }
+    let payload_compression = parse_payload_compression(options.compress.as_deref())?;
     let cargo_args = parse_cargo_args(&options.cargo_args);
     let manifest_path = options
         .manifest_path
@@ -233,6 +262,8 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
             target: target.clone(),
             out_root: out_root.clone(),
             tag_output: options.parallelism > 1,
+            payload_compression,
+            compression_level: options.compression_level,
         },
         options.parallelism,
         variant_jobs,
@@ -1009,14 +1040,16 @@ fn build_payload_variants(
                 };
                 print_variant_build_prelude(&job.target_cpu);
                 let result =
-                    build_payload_variant(&ctx, &job.target_cpu).map(|artifact| VariantBuild {
+                    build_payload_variant(&ctx, &job.target_cpu).map(|payload| VariantBuild {
                         target_cpu: job.target_cpu,
                         required_features: job.required_features,
                         rank_features: job.rank_features,
                         feature_names: job.feature_names,
                         feature_tier: job.feature_tier,
                         target_kind: job.target_kind,
-                        artifact,
+                        artifact: payload.path,
+                        payload_compression: payload.compression,
+                        uncompressed_len: payload.uncompressed_len,
                     });
                 if tx.send((index, result)).is_err() {
                     break;
@@ -1049,7 +1082,7 @@ fn build_payload_variants(
         .collect()
 }
 
-fn build_payload_variant(ctx: &PayloadBuildContext, cpu: &str) -> Result<Utf8PathBuf> {
+fn build_payload_variant(ctx: &PayloadBuildContext, cpu: &str) -> Result<PayloadArtifact> {
     let target_dir = ctx.out_root.join("variants").join(sanitize_cpu(cpu));
     fs::create_dir_all(&target_dir)?;
     let mut cmd = Command::new("cargo");
@@ -1143,8 +1176,27 @@ fn build_payload_variant(ctx: &PayloadBuildContext, cpu: &str) -> Result<Utf8Pat
     let payload_dir = ctx.out_root.join("loader").join("payloads");
     fs::create_dir_all(&payload_dir)?;
     let payload = payload_dir.join(format!("{}.elf", sanitize_cpu(cpu)));
-    fs::copy(&executables[0], &payload)?;
-    Ok(payload)
+    let uncompressed_len = fs::metadata(&executables[0])?.len();
+    match ctx.payload_compression {
+        PayloadCompression::None => {
+            fs::copy(&executables[0], &payload)?;
+        }
+        PayloadCompression::Zstd => {
+            let input = fs::read(&executables[0])
+                .with_context(|| format!("failed to read payload artifact {}", executables[0]))?;
+            let compressed = zstd::stream::encode_all(Cursor::new(input), ctx.compression_level)
+                .with_context(|| {
+                    format!("failed to zstd-compress payload for target-cpu `{cpu}`")
+                })?;
+            fs::write(&payload, compressed)
+                .with_context(|| format!("failed to write compressed payload {payload}"))?;
+        }
+    }
+    Ok(PayloadArtifact {
+        path: payload,
+        compression: ctx.payload_compression,
+        uncompressed_len,
+    })
 }
 
 fn resolved_cargo_color(color: Option<ColorMode>) -> &'static str {
@@ -1547,9 +1599,21 @@ fn generate_loader_crate(
     auditable_section: Option<&[u8]>,
 ) -> Result<()> {
     fs::create_dir_all(loader_dir.join("src"))?;
+    let uses_zstd = variants
+        .iter()
+        .any(|variant| variant.payload_compression == PayloadCompression::Zstd);
+    let dependencies = if uses_zstd {
+        r#"
+[dependencies]
+ruzstd = { version = "0.8.2", default-features = false }
+"#
+    } else {
+        ""
+    };
     fs::write(
         loader_dir.join("Cargo.toml"),
-        r#"[package]
+        format!(
+            r#"[package]
 name = "sonic-generated-loader"
 version = "0.0.0"
 edition = "2024"
@@ -1561,7 +1625,8 @@ panic = "abort"
 panic = "abort"
 
 [workspace]
-"#,
+{dependencies}"#
+        ),
     )?;
     fs::write(
         loader_dir.join("src/feature_mask.rs"),
@@ -1582,7 +1647,10 @@ panic = "abort"
         loader_dir.join("src/generated_manifest.rs"),
         generated_manifest(variants),
     )?;
-    fs::write(loader_dir.join("src/main.rs"), generated_main(target))?;
+    fs::write(
+        loader_dir.join("src/main.rs"),
+        generated_main(target, uses_zstd),
+    )?;
     if let Some(section) = auditable_section {
         fs::write(
             loader_dir.join("auditable.o"),
@@ -1651,7 +1719,8 @@ fn generated_manifest(variants: &[VariantBuild]) -> String {
         ));
     }
     out.push('\n');
-    out.push_str("pub struct Variant {\n    pub target_cpu: &'static str,\n    pub required_features: FeatureMask,\n    pub rank_features: FeatureMask,\n    pub rank_feature_count: u16,\n    pub feature_tier: u8,\n    pub target_kind: TargetKind,\n    pub env_selected_target_cpu: &'static [u8],\n    pub env_selected_flags: &'static [u8],\n    pub payload: &'static [u8],\n}\n\n");
+    out.push_str("pub struct Variant {\n    pub target_cpu: &'static str,\n    pub required_features: FeatureMask,\n    pub rank_features: FeatureMask,\n    pub rank_feature_count: u16,\n    pub feature_tier: u8,\n    pub target_kind: TargetKind,\n    pub env_selected_target_cpu: &'static [u8],\n    pub env_selected_flags: &'static [u8],\n    pub payload: &'static [u8],\n    pub payload_compression: PayloadCompression,\n    pub uncompressed_len: usize,\n}\n\n");
+    out.push_str("#[derive(Clone, Copy, Eq, PartialEq)]\npub enum PayloadCompression {\n    None,\n    Zstd,\n}\n\n");
     out.push_str("pub static VARIANTS: &[Variant] = &[\n");
     for v in variants {
         let req = v.required_features.words();
@@ -1688,10 +1757,25 @@ fn generated_manifest(variants: &[VariantBuild]) -> String {
             "        payload: &PAYLOAD_{}.0,\n",
             sanitize_cpu(&v.target_cpu).to_ascii_uppercase()
         ));
+        out.push_str(&format!(
+            "        payload_compression: {},\n",
+            payload_compression_expr(v.payload_compression)
+        ));
+        out.push_str(&format!(
+            "        uncompressed_len: {},\n",
+            v.uncompressed_len
+        ));
         out.push_str("    },\n");
     }
     out.push_str("];\n");
     out
+}
+
+fn payload_compression_expr(compression: PayloadCompression) -> &'static str {
+    match compression {
+        PayloadCompression::None => "PayloadCompression::None",
+        PayloadCompression::Zstd => "PayloadCompression::Zstd",
+    }
 }
 
 fn target_kind_expr(kind: TargetKind) -> String {
@@ -1718,7 +1802,53 @@ fn target_kind_expr(kind: TargetKind) -> String {
     }
 }
 
-fn generated_main(_target: &str) -> &'static str {
+fn generated_main(_target: &str, uses_zstd: bool) -> String {
+    let zstd_support = if uses_zstd {
+        r#"
+extern crate alloc;
+use core::alloc::{GlobalAlloc, Layout};
+
+struct MmapAllocator;
+
+unsafe impl GlobalAlloc for MmapAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let len = layout.size().max(1);
+        let ptr = unsafe { linux_sys::mmap(len) } as *mut u8;
+        if (ptr as isize) < 0 {
+            core::ptr::null_mut()
+        } else {
+            ptr
+        }
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+
+#[global_allocator]
+static ALLOCATOR: MmapAllocator = MmapAllocator;
+
+unsafe fn write_zstd_payload(fd: isize, selected: &Variant) -> isize {
+    unsafe {
+        let output = linux_sys::mmap(selected.uncompressed_len) as *mut u8;
+        if (output as isize) < 0 {
+            return -1;
+        }
+        let output_slice = core::slice::from_raw_parts_mut(output, selected.uncompressed_len);
+        let mut decoder = ruzstd::decoding::FrameDecoder::new();
+        if decoder.decode_all(selected.payload, output_slice).is_err() {
+            return -1;
+        }
+        linux_sys::write_all(fd, output, selected.uncompressed_len)
+    }
+}
+"#
+    } else {
+        r#"
+unsafe fn write_zstd_payload(_fd: isize, _selected: &Variant) -> isize {
+    -1
+}
+"#
+    };
     r#"#![no_std]
 #![no_main]
 #![allow(dead_code)]
@@ -1743,6 +1873,9 @@ mod arch_aarch64;
 
 use generated_manifest::{Variant, VARIANTS};
 use select::{CpuIdentity, HostInfo, TargetArch, VariantMeta};
+use generated_manifest::PayloadCompression;
+
+/*__CARGO_SONIC_ZSTD_SUPPORT__*/
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -1901,6 +2034,9 @@ struct FileCloneRange {
 
 unsafe fn exec_reflink_tmpfile(selected: &Variant, initial: &stack::InitialStack) -> isize {
     unsafe {
+        if selected.payload_compression != generated_manifest::PayloadCompression::None {
+            return -1;
+        }
         let exe = linux_sys::openat(linux_sys::AT_FDCWD, b"/proc/self/exe\0".as_ptr(), 0, 0);
         if exe < 0 {
             return exe;
@@ -2058,7 +2194,11 @@ unsafe fn exec_payload(selected: &Variant, initial: &stack::InitialStack) -> ! {
         if fd < 0 {
             linux_sys::exit(111);
         }
-        if linux_sys::write_all(fd, selected.payload.as_ptr(), selected.payload.len()) < 0 {
+        let written = match selected.payload_compression {
+            PayloadCompression::None => linux_sys::write_all(fd, selected.payload.as_ptr(), selected.payload.len()),
+            PayloadCompression::Zstd => write_zstd_payload(fd, selected),
+        };
+        if written < 0 {
             linux_sys::exit(112);
         }
         let envp = stack::build_envp(initial, generated_manifest::ENV_ENABLED, selected.env_selected_target_cpu, selected.env_selected_flags);
@@ -2497,6 +2637,7 @@ unsafe fn detect_x86_identity() -> CpuIdentity {
     }
 }
 "#
+    .replace("/*__CARGO_SONIC_ZSTD_SUPPORT__*/", zstd_support)
 }
 
 fn generated_linux_sys() -> &'static str {
@@ -3049,6 +3190,23 @@ mod tests {
     }
 
     #[test]
+    fn payload_compression_accepts_only_known_modes() {
+        assert_eq!(
+            parse_payload_compression(None).unwrap(),
+            PayloadCompression::None
+        );
+        assert_eq!(
+            parse_payload_compression(Some("none")).unwrap(),
+            PayloadCompression::None
+        );
+        assert_eq!(
+            parse_payload_compression(Some("zstd")).unwrap(),
+            PayloadCompression::Zstd
+        );
+        assert!(parse_payload_compression(Some("gzip")).is_err());
+    }
+
+    #[test]
     fn cargo_args_tolerate_repeated_cargo_selectors() {
         let args = strings(&[
             "--manifest-path",
@@ -3090,7 +3248,7 @@ mod tests {
 
     #[test]
     fn generated_aarch64_loader_does_not_read_midr_el1_before_fallbacks() {
-        let source = generated_main("aarch64-unknown-linux-musl");
+        let source = generated_main("aarch64-unknown-linux-musl", false);
         assert!(source.contains("read_small_file_hex"));
         assert!(!source.contains("let midr = unsafe { read_midr_el1() };"));
     }
@@ -3365,6 +3523,8 @@ mod tests {
             manifest_path: Some(manifest),
             target_cpus: vec!["x86-64".into()],
             parallelism: 1,
+            compress: None,
+            compression_level: 3,
             auditable: true,
         })
         .unwrap();

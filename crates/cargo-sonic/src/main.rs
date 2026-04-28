@@ -23,6 +23,12 @@ struct Sonic {
     parallelism: usize,
 
     #[arg(long)]
+    compress: Option<String>,
+
+    #[arg(long, default_value_t = 3)]
+    compression_level: i32,
+
+    #[arg(long)]
     auditable: bool,
 
     #[command(subcommand)]
@@ -53,6 +59,8 @@ fn main() -> Result<()> {
         CargoSonicCommand::Sonic(Sonic {
             target_cpus,
             parallelism,
+            compress,
+            compression_level,
             auditable,
             command: Command::Build(build),
         }) => cargo_sonic::build(BuildOptions {
@@ -60,6 +68,8 @@ fn main() -> Result<()> {
             manifest_path: None,
             target_cpus,
             parallelism,
+            compress,
+            compression_level,
             auditable,
         })
         .map(|output| {
@@ -68,6 +78,8 @@ fn main() -> Result<()> {
         CargoSonicCommand::Sonic(Sonic {
             target_cpus,
             parallelism: _,
+            compress: _,
+            compression_level: _,
             auditable: _,
             command: Command::Probe(probe),
         }) => cargo_sonic::probe(ProbeOptions {
