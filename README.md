@@ -104,22 +104,18 @@ Benchmark before using `cargo-sonic` for startup-sensitive commands. It is a
 better fit for servers, daemons, and other long-running applications where the
 one-time startup cost is amortized.
 
-## Run Locally
+## Install
 
-From a target crate directory:
+Install the Cargo subcommand:
 
 ```bash
-cargo run --manifest-path /path/to/cargo-sonic/crates/cargo-sonic/Cargo.toml -- \
-  sonic --target-cpus=x86-64-v3,znver5 build
+cargo install cargo-sonic
 ```
 
-From this repository root, build the included example by passing the target
-crate manifest through Cargo's normal `--manifest-path` flag:
+Then run it from the crate you want to build:
 
 ```bash
-cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- \
-  sonic --target-cpus=x86-64-v3,znver5,raptorlake build \
-  --manifest-path examples/cpu-benchmark/Cargo.toml
+cargo sonic --target-cpus=x86-64-v4,znver5 build --release
 ```
 
 The final executable is written under the target crate:
@@ -141,6 +137,13 @@ For example:
 
 ```text
 examples/cpu-benchmark/target/sonic/x86_64-unknown-linux-gnu/debug/sonic-cpu-benchmark
+```
+
+To build a different manifest, pass Cargo's normal `--manifest-path` flag:
+
+```bash
+cargo sonic --target-cpus=x86-64-v4,znver5 build \
+  --manifest-path examples/cpu-benchmark/Cargo.toml
 ```
 
 ## Target CPUs
@@ -167,19 +170,15 @@ Rules:
 The target triple comes from normal Cargo arguments:
 
 ```bash
-cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- \
-  sonic --target-cpus=x86-64-v3,znver5 build --release
-cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- \
-  sonic --target-cpus=x86-64-v3,znver5 build --target x86_64-unknown-linux-gnu
+cargo sonic --target-cpus=x86-64-v3,znver5 build --release
+cargo sonic --target-cpus=x86-64-v3,znver5 build --target x86_64-unknown-linux-gnu
 ```
 
 Binary/package selection also uses normal Cargo arguments:
 
 ```bash
-cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- \
-  sonic --target-cpus=x86-64-v3,znver5 build --bin server
-cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- \
-  sonic --target-cpus=x86-64-v3,znver5 build --package my-crate --bin worker
+cargo sonic --target-cpus=x86-64-v3,znver5 build --bin server
+cargo sonic --target-cpus=x86-64-v3,znver5 build --package my-crate --bin worker
 ```
 
 ## Auditable Binaries
@@ -201,8 +200,7 @@ dependency list for the selected package.
 Use `cargo sonic probe` to inspect the current host without building payloads:
 
 ```bash
-cargo run --manifest-path crates/cargo-sonic/Cargo.toml -- \
-  sonic --target-cpus=x86-64-v3,znver5,raptorlake probe
+cargo sonic --target-cpus=x86-64-v3,znver5,raptorlake probe
 ```
 
 The probe uses the same `--target-cpus` list, asks rustc for each target-cpu's

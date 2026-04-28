@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-sonic"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "camino",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "serde",
