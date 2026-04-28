@@ -154,6 +154,21 @@ Choose variants at build time with `--target-cpus`:
 cargo sonic --target-cpus=znver5,x86-64-v4,icelake-server build --release
 ```
 
+Payload builds run sequentially by default. Pass `-p`/`--parallelism` before the
+`build` subcommand to compile multiple target-cpu payloads at once:
+
+```bash
+cargo sonic --target-cpus=x86-64-v3,znver5 -p 2 build --release
+```
+
+With `--parallelism=1`, payload build output is passed through without
+cargo-sonic block headers. Output from parallel payload builds is buffered
+briefly and printed in blocks headed by `cargo-sonic[<target-cpu>]` so
+interleaved cargo output remains attributable. Cargo's normal
+`--color auto|always|never` argument is supported; with `auto`, cargo-sonic
+preserves colors when its output is attached to a terminal even though child
+Cargo output is buffered through pipes.
+
 `generic` is implicit. It is always built and is always eligible at runtime, so
 do not list it in `--target-cpus`. Pass at least one non-generic CPU; with only
 one generic payload there is no reason to use `cargo-sonic`.

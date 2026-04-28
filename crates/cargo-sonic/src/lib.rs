@@ -18,18 +18,26 @@ use crate::feature_mask::{FeatureMask, feature_by_name};
 use crate::select::{
     CpuIdentity, HostInfo, TargetArch, TargetKind, VariantMeta, X86Vendor, select_variant,
 };
+use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
+use std::io::{IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+const OUTPUT_FLUSH_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct BuildOptions {
     pub cargo_args: Vec<String>,
     pub manifest_path: Option<Utf8PathBuf>,
     pub target_cpus: Vec<String>,
+    pub parallelism: usize,
     pub auditable: bool,
 }
 
@@ -53,7 +61,15 @@ struct CargoArgs {
     bin: Option<String>,
     package: Option<String>,
     manifest_path: Option<Utf8PathBuf>,
+    color: Option<ColorMode>,
     forwarded: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ColorMode {
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +81,26 @@ struct VariantBuild {
     feature_tier: u8,
     target_kind: TargetKind,
     artifact: Utf8PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct VariantBuildJob {
+    target_cpu: String,
+    required_features: FeatureMask,
+    rank_features: FeatureMask,
+    feature_names: Vec<String>,
+    feature_tier: u8,
+    target_kind: TargetKind,
+}
+
+#[derive(Debug, Clone)]
+struct PayloadBuildContext {
+    package: Package,
+    cargo_args: CargoArgs,
+    manifest_path: Option<Utf8PathBuf>,
+    target: String,
+    out_root: Utf8PathBuf,
+    tag_output: bool,
 }
 
 struct ProbeVariant {
@@ -86,6 +122,9 @@ struct FeatureSet {
 }
 
 pub fn build(options: BuildOptions) -> Result<BuildOutput> {
+    if options.parallelism == 0 {
+        bail!("--parallelism must be at least 1");
+    }
     let cargo_args = parse_cargo_args(&options.cargo_args);
     let manifest_path = options
         .manifest_path
@@ -163,7 +202,7 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
         eprintln!("warning: {warning}");
     }
 
-    let mut variants = Vec::new();
+    let mut variant_jobs = Vec::new();
     for cpu in included
         .iter()
         .filter(|cpu| features_by_cpu.contains_key(cpu.as_str()))
@@ -176,27 +215,28 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
         } else {
             feature_mask(&required_feature_names)?
         };
-        print_variant_build_prelude(cpu);
-        let artifact = build_payload_variant(
-            package,
-            &cargo_args,
-            manifest_path.as_deref(),
-            &target,
-            profile,
-            cpu,
-            &out_root,
-        )?;
         let target_kind = classify_target_cpu(cpu, &target_arch);
-        variants.push(VariantBuild {
+        variant_jobs.push(VariantBuildJob {
             target_cpu: cpu.clone(),
             required_features,
             rank_features,
             feature_names,
             feature_tier: target_feature_tier(&target_arch, target_kind),
             target_kind,
-            artifact,
         });
     }
+    let variants = build_payload_variants(
+        PayloadBuildContext {
+            package: package.clone(),
+            cargo_args: cargo_args.clone(),
+            manifest_path: manifest_path.clone(),
+            target: target.clone(),
+            out_root: out_root.clone(),
+            tag_output: options.parallelism > 1,
+        },
+        options.parallelism,
+        variant_jobs,
+    )?;
 
     let bin_name = resolve_bin_name(package, cargo_args.bin.as_deref(), &variants)?;
     let loader_dir = out_root.join("loader");
@@ -303,7 +343,16 @@ fn parse_cargo_args(args: &[String]) -> CargoArgs {
         bin: last_match_value(&matches, "bin"),
         package: last_match_value(&matches, "package"),
         manifest_path: last_match_value(&matches, "manifest-path").map(Utf8PathBuf::from),
+        color: last_match_value(&matches, "color").map(|value| parse_color_mode(&value)),
         forwarded: forwarded_cargo_args(args),
+    }
+}
+
+fn parse_color_mode(value: &str) -> ColorMode {
+    match value {
+        "always" => ColorMode::Always,
+        "never" => ColorMode::Never,
+        _ => ColorMode::Auto,
     }
 }
 
@@ -321,7 +370,7 @@ fn known_cargo_args(args: &[String]) -> Vec<String> {
         match args[i].as_str() {
             "--release" | "-r" => known.push(args[i].clone()),
             "--profile" | "--target" | "--target-dir" | "--bin" | "--package" | "-p"
-            | "--manifest-path" => {
+            | "--manifest-path" | "--color" => {
                 known.push(args[i].clone());
                 if let Some(value) = args.get(i + 1) {
                     known.push(value.clone());
@@ -334,7 +383,8 @@ fn known_cargo_args(args: &[String]) -> Vec<String> {
                     || value.starts_with("--target-dir=")
                     || value.starts_with("--bin=")
                     || value.starts_with("--package=")
-                    || value.starts_with("--manifest-path=") =>
+                    || value.starts_with("--manifest-path=")
+                    || value.starts_with("--color=") =>
             {
                 known.push(args[i].clone());
             }
@@ -361,6 +411,7 @@ fn cargo_args_command() -> ClapCommand {
         .arg(repeated_arg("bin").long("bin"))
         .arg(repeated_arg("package").long("package").short('p'))
         .arg(repeated_arg("manifest-path").long("manifest-path"))
+        .arg(repeated_arg("color").long("color"))
 }
 
 fn repeated_arg(name: &'static str) -> Arg {
@@ -372,8 +423,10 @@ fn forwarded_cargo_args(args: &[String]) -> Vec<String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--manifest-path" | "--target-dir" => i += 1,
-            v if v.starts_with("--manifest-path=") || v.starts_with("--target-dir=") => {}
+            "--manifest-path" | "--target-dir" | "--color" => i += 1,
+            v if v.starts_with("--manifest-path=")
+                || v.starts_with("--target-dir=")
+                || v.starts_with("--color=") => {}
             _ => forwarded.push(args[i].clone()),
         }
         i += 1;
@@ -924,55 +977,160 @@ fn is_safety_required_feature(feature: &str) -> bool {
     )
 }
 
-fn build_payload_variant(
-    package: &Package,
-    cargo_args: &CargoArgs,
-    manifest_path: Option<&Utf8Path>,
-    target: &str,
-    _profile: &str,
-    cpu: &str,
-    out_root: &Utf8Path,
-) -> Result<Utf8PathBuf> {
-    let target_dir = out_root.join("variants").join(sanitize_cpu(cpu));
+fn build_payload_variants(
+    ctx: PayloadBuildContext,
+    parallelism: usize,
+    jobs: Vec<VariantBuildJob>,
+) -> Result<Vec<VariantBuild>> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let job_count = jobs.len();
+    let worker_count = parallelism.min(job_count);
+    let ctx = Arc::new(ctx);
+    let queue = Arc::new(Mutex::new(
+        jobs.into_iter().enumerate().collect::<VecDeque<_>>(),
+    ));
+    let (tx, rx) = mpsc::channel();
+
+    for _ in 0..worker_count {
+        let ctx = Arc::clone(&ctx);
+        let queue = Arc::clone(&queue);
+        let tx = tx.clone();
+        thread::spawn(move || {
+            loop {
+                let next = queue
+                    .lock()
+                    .expect("variant build queue poisoned")
+                    .pop_front();
+                let Some((index, job)) = next else {
+                    break;
+                };
+                print_variant_build_prelude(&job.target_cpu);
+                let result =
+                    build_payload_variant(&ctx, &job.target_cpu).map(|artifact| VariantBuild {
+                        target_cpu: job.target_cpu,
+                        required_features: job.required_features,
+                        rank_features: job.rank_features,
+                        feature_names: job.feature_names,
+                        feature_tier: job.feature_tier,
+                        target_kind: job.target_kind,
+                        artifact,
+                    });
+                if tx.send((index, result)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx);
+
+    let mut variants = Vec::new();
+    variants.resize_with(job_count, || None);
+    let mut first_error = None;
+    for (index, result) in rx {
+        match result {
+            Ok(variant) => variants[index] = Some(variant),
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+
+    variants
+        .into_iter()
+        .map(|variant| variant.context("variant build worker exited without reporting a result"))
+        .collect()
+}
+
+fn build_payload_variant(ctx: &PayloadBuildContext, cpu: &str) -> Result<Utf8PathBuf> {
+    let target_dir = ctx.out_root.join("variants").join(sanitize_cpu(cpu));
     fs::create_dir_all(&target_dir)?;
     let mut cmd = Command::new("cargo");
     cmd.arg("build");
-    cmd.args(&cargo_args.forwarded);
-    if let Some(manifest_path) = manifest_path {
+    cmd.args(&ctx.cargo_args.forwarded);
+    if let Some(manifest_path) = &ctx.manifest_path {
         cmd.args(["--manifest-path", manifest_path.as_str()]);
     }
-    if cargo_args.target.is_none() {
-        cmd.args(["--target", target]);
+    if ctx.cargo_args.target.is_none() {
+        cmd.args(["--target", &ctx.target]);
     }
+    cmd.args(["--color", resolved_cargo_color(ctx.cargo_args.color)]);
     cmd.args(["--message-format", "json-render-diagnostics"]);
     cmd.args(["--target-dir", target_dir.as_str()]);
     cmd.env("CARGO_ENCODED_RUSTFLAGS", encoded_rustflags(cpu));
     cmd.stdout(Stdio::piped());
+    if ctx.tag_output {
+        cmd.stderr(Stdio::piped());
+    } else {
+        cmd.stderr(Stdio::inherit());
+    }
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn cargo for target-cpu `{cpu}`"))?;
     let stdout = child.stdout.take().context("failed to read cargo stdout")?;
+    let stderr_thread = if ctx.tag_output {
+        let stderr = child.stderr.take().context("failed to read cargo stderr")?;
+        let cpu_for_stderr = cpu.to_string();
+        Some(thread::spawn(move || {
+            forward_tagged_output(cpu_for_stderr, stderr)
+        }))
+    } else {
+        None
+    };
     let reader = std::io::BufReader::new(stdout);
     let mut executables = Vec::new();
+    let mut stdout_pending = Vec::new();
+    let mut stdout_last_flush = Instant::now();
     for message in Message::parse_stream(reader) {
-        if let Message::CompilerArtifact(Artifact {
-            executable: Some(exe),
-            target: artifact_target,
-            package_id,
-            ..
-        }) = message?
-            && package_id == package.id
-            && artifact_target
-                .kind
-                .iter()
-                .any(|k| matches!(k, cargo_metadata::TargetKind::Bin))
+        match message? {
+            Message::CompilerArtifact(Artifact {
+                executable: Some(exe),
+                target: artifact_target,
+                package_id,
+                ..
+            }) if package_id == ctx.package.id
+                && artifact_target
+                    .kind
+                    .iter()
+                    .any(|k| matches!(k, cargo_metadata::TargetKind::Bin)) =>
+            {
+                let exe = Utf8PathBuf::from_path_buf(exe.into_std_path_buf())
+                    .map_err(|_| anyhow!("artifact path is not valid UTF-8"))?;
+                executables.push(exe);
+            }
+            Message::CompilerMessage(message) => {
+                if let Some(rendered) = message.message.rendered {
+                    write_payload_stdout(ctx.tag_output, &mut stdout_pending, rendered.as_bytes())?;
+                }
+            }
+            Message::TextLine(line) => {
+                write_payload_stdout(ctx.tag_output, &mut stdout_pending, line.as_bytes())?;
+                write_payload_stdout(ctx.tag_output, &mut stdout_pending, b"\n")?;
+            }
+            _ => {}
+        }
+        if ctx.tag_output
+            && (stdout_pending.len() >= OUTPUT_FLUSH_BYTES
+                || stdout_last_flush.elapsed() >= OUTPUT_FLUSH_INTERVAL)
         {
-            let exe = Utf8PathBuf::from_path_buf(exe.into_std_path_buf())
-                .map_err(|_| anyhow!("artifact path is not valid UTF-8"))?;
-            executables.push(exe);
+            flush_tagged_stdout(cpu, &mut stdout_pending)?;
+            stdout_last_flush = Instant::now();
         }
     }
+    flush_payload_stdout(cpu, ctx.tag_output, &mut stdout_pending)?;
     let status = child.wait()?;
+    if let Some(stderr_thread) = stderr_thread {
+        stderr_thread
+            .join()
+            .map_err(|_| anyhow!("stderr forwarding thread panicked for target-cpu `{cpu}`"))??;
+    }
     if !status.success() {
         bail!("cargo build failed for target-cpu `{cpu}`");
     }
@@ -982,11 +1140,25 @@ fn build_payload_variant(
             executables.len()
         );
     }
-    let payload_dir = out_root.join("loader").join("payloads");
+    let payload_dir = ctx.out_root.join("loader").join("payloads");
     fs::create_dir_all(&payload_dir)?;
     let payload = payload_dir.join(format!("{}.elf", sanitize_cpu(cpu)));
     fs::copy(&executables[0], &payload)?;
     Ok(payload)
+}
+
+fn resolved_cargo_color(color: Option<ColorMode>) -> &'static str {
+    match color.unwrap_or(ColorMode::Auto) {
+        ColorMode::Always => "always",
+        ColorMode::Never => "never",
+        ColorMode::Auto => {
+            if std::io::stdout().is_terminal() || std::io::stderr().is_terminal() {
+                "always"
+            } else {
+                "never"
+            }
+        }
+    }
 }
 
 fn encoded_rustflags(cpu: &str) -> OsString {
@@ -997,6 +1169,110 @@ fn encoded_rustflags(cpu: &str) -> OsString {
     }
     flags.push(format!("-Ctarget-cpu={cpu}"));
     flags
+}
+
+fn forward_tagged_output(target_cpu: String, mut input: impl Read + Send + 'static) -> Result<()> {
+    let (tx, rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut buf = [0_u8; 4096];
+        loop {
+            match input.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(Ok(buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(anyhow!(err)));
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut pending = Vec::new();
+    let mut last_flush = Instant::now();
+    loop {
+        let timeout = OUTPUT_FLUSH_INTERVAL
+            .checked_sub(last_flush.elapsed())
+            .unwrap_or(Duration::ZERO);
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(chunk)) => pending.extend_from_slice(&chunk),
+            Ok(Err(err)) => return Err(err),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                flush_tagged_stderr(&target_cpu, &mut pending)?;
+                last_flush = Instant::now();
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if pending.len() >= OUTPUT_FLUSH_BYTES || last_flush.elapsed() >= OUTPUT_FLUSH_INTERVAL {
+            flush_tagged_stderr(&target_cpu, &mut pending)?;
+            last_flush = Instant::now();
+        }
+    }
+    flush_tagged_stderr(&target_cpu, &mut pending)?;
+    reader
+        .join()
+        .map_err(|_| anyhow!("output reader thread panicked for target-cpu `{target_cpu}`"))?;
+    Ok(())
+}
+
+fn write_payload_stdout(tag_output: bool, pending: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    if tag_output {
+        pending.extend_from_slice(bytes);
+    } else {
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        stdout.write_all(bytes)?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
+fn flush_payload_stdout(target_cpu: &str, tag_output: bool, pending: &mut Vec<u8>) -> Result<()> {
+    if tag_output {
+        flush_tagged_stdout(target_cpu, pending)
+    } else {
+        pending.clear();
+        Ok(())
+    }
+}
+
+fn flush_tagged_stdout(target_cpu: &str, pending: &mut Vec<u8>) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    write_tagged_output(&mut stdout, target_cpu, pending)?;
+    pending.clear();
+    Ok(())
+}
+
+fn flush_tagged_stderr(target_cpu: &str, pending: &mut Vec<u8>) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let stderr = std::io::stderr();
+    let mut stderr = stderr.lock();
+    write_tagged_output(&mut stderr, target_cpu, pending)?;
+    pending.clear();
+    Ok(())
+}
+
+fn write_tagged_output(output: &mut impl Write, target_cpu: &str, pending: &[u8]) -> Result<()> {
+    writeln!(output, "cargo-sonic[{target_cpu}]")?;
+    for chunk in pending.split_inclusive(|byte| *byte == b'\n') {
+        output.write_all(b"  ")?;
+        output.write_all(chunk)?;
+        if !chunk.ends_with(b"\n") {
+            writeln!(output)?;
+        }
+    }
+    output.flush()?;
+    Ok(())
 }
 
 fn sanitize_cpu(cpu: &str) -> String {
@@ -2758,6 +3034,21 @@ mod tests {
     }
 
     #[test]
+    fn cargo_args_consumes_color_without_forwarding_duplicate() {
+        let args = strings(&["--color", "always", "--release"]);
+        let got = parse_cargo_args(&args);
+        assert_eq!(got.color, Some(ColorMode::Always));
+        assert_eq!(got.forwarded, strings(&["--release"]));
+        assert_eq!(resolved_cargo_color(got.color), "always");
+
+        let args = strings(&["--color=never", "--release"]);
+        let got = parse_cargo_args(&args);
+        assert_eq!(got.color, Some(ColorMode::Never));
+        assert_eq!(got.forwarded, strings(&["--release"]));
+        assert_eq!(resolved_cargo_color(got.color), "never");
+    }
+
+    #[test]
     fn cargo_args_tolerate_repeated_cargo_selectors() {
         let args = strings(&[
             "--manifest-path",
@@ -3073,6 +3364,7 @@ mod tests {
             cargo_args: Vec::new(),
             manifest_path: Some(manifest),
             target_cpus: vec!["x86-64".into()],
+            parallelism: 1,
             auditable: true,
         })
         .unwrap();
