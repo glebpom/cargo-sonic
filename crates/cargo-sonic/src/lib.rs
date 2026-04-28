@@ -3524,7 +3524,7 @@ mod tests {
             target_cpus: vec!["x86-64".into()],
             parallelism: 1,
             compress: None,
-            compression_level: 3,
+            compression_level: 22,
             auditable: true,
         })
         .unwrap();

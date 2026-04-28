@@ -25,7 +25,7 @@ struct Sonic {
     #[arg(long)]
     compress: Option<String>,
 
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 22)]
     compression_level: i32,
 
     #[arg(long)]
