@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::{Artifact, Message, MetadataCommand, Package};
-use clap::{Arg, ArgAction, Command as ClapCommand};
+use clap::{Arg, ArgAction, Command as ClapCommand, ValueEnum};
 use miniz_oxide::deflate::compress_to_vec_zlib;
 use object::write::{Object, StandardSegment, Symbol, SymbolSection};
 use object::{
@@ -39,9 +39,9 @@ pub struct BuildOptions {
     pub manifest_path: Option<Utf8PathBuf>,
     pub target_cpus: Vec<String>,
     pub parallelism: usize,
-    pub compress: Option<String>,
+    pub compress: PayloadCompression,
     pub compression_level: i32,
-    pub loader: String,
+    pub loader: LoaderStrategy,
     pub auditable: bool,
 }
 
@@ -119,32 +119,16 @@ struct PayloadArtifact {
     uncompressed_len: u64,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum PayloadCompression {
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum PayloadCompression {
     None,
     Zstd,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum LoaderStrategy {
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum LoaderStrategy {
     Embedded,
     Bundle,
-}
-
-fn parse_payload_compression(value: Option<&str>) -> Result<PayloadCompression> {
-    match value {
-        None | Some("none") => Ok(PayloadCompression::None),
-        Some("zstd") => Ok(PayloadCompression::Zstd),
-        Some(other) => bail!("unsupported --compress value `{other}`; expected `zstd`"),
-    }
-}
-
-fn parse_loader_strategy(value: &str) -> Result<LoaderStrategy> {
-    match value {
-        "embedded" => Ok(LoaderStrategy::Embedded),
-        "bundle" => Ok(LoaderStrategy::Bundle),
-        other => bail!("unsupported --loader value `{other}`; expected `embedded` or `bundle`"),
-    }
 }
 
 struct ProbeVariant {
@@ -169,8 +153,8 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
     if options.parallelism == 0 {
         bail!("--parallelism must be at least 1");
     }
-    let payload_compression = parse_payload_compression(options.compress.as_deref())?;
-    let loader_strategy = parse_loader_strategy(&options.loader)?;
+    let payload_compression = options.compress;
+    let loader_strategy = options.loader;
     let cargo_args = parse_cargo_args(&options.cargo_args);
     let manifest_path = options
         .manifest_path
@@ -1061,8 +1045,11 @@ fn build_payload_variants(
                 };
                 print_variant_build_prelude(&job.target_cpu);
                 let result = build_payload_variant(&ctx, &job.target_cpu).map(|payload| {
-                    let bundle_path =
-                        leaked_str(&format!("{}.elf\0", sanitize_cpu(&job.target_cpu)));
+                    let bundle_path = leaked_str(&format!(
+                        "{}{}\0",
+                        sanitize_cpu(&job.target_cpu),
+                        payload_extension(payload.compression)
+                    ));
                     VariantBuild {
                         target_cpu: job.target_cpu,
                         required_features: job.required_features,
@@ -1200,7 +1187,11 @@ fn build_payload_variant(ctx: &PayloadBuildContext, cpu: &str) -> Result<Payload
     }
     let payload_dir = ctx.out_root.join("loader").join("payloads");
     fs::create_dir_all(&payload_dir)?;
-    let payload = payload_dir.join(format!("{}.elf", sanitize_cpu(cpu)));
+    let payload = payload_dir.join(format!(
+        "{}{}",
+        sanitize_cpu(cpu),
+        payload_extension(ctx.payload_compression)
+    ));
     let uncompressed_len = fs::metadata(&executables[0])?.len();
     match ctx.payload_compression {
         PayloadCompression::None => {
@@ -1764,10 +1755,11 @@ fn generated_manifest(variants: &[VariantBuild], loader_strategy: LoaderStrategy
                 .map(|metadata| metadata.len())
                 .unwrap_or_default();
             out.push_str(&format!(
-                "static PAYLOAD_{}: AlignedPayload<{}> = AlignedPayload(*include_bytes!(\"../payloads/{}.elf\"));\n",
+                "static PAYLOAD_{}: AlignedPayload<{}> = AlignedPayload(*include_bytes!(\"../payloads/{}{}\"));\n",
                 sanitize_cpu(&v.target_cpu).to_ascii_uppercase(),
                 payload_len,
-                sanitize_cpu(&v.target_cpu)
+                sanitize_cpu(&v.target_cpu),
+                payload_extension(v.payload_compression)
             ));
         }
     }
@@ -1834,6 +1826,13 @@ fn payload_compression_expr(compression: PayloadCompression) -> &'static str {
     match compression {
         PayloadCompression::None => "PayloadCompression::None",
         PayloadCompression::Zstd => "PayloadCompression::Zstd",
+    }
+}
+
+fn payload_extension(compression: PayloadCompression) -> &'static str {
+    match compression {
+        PayloadCompression::None => ".elf",
+        PayloadCompression::Zstd => ".elf.zstd",
     }
 }
 
@@ -3362,36 +3361,6 @@ mod tests {
     }
 
     #[test]
-    fn payload_compression_accepts_only_known_modes() {
-        assert_eq!(
-            parse_payload_compression(None).unwrap(),
-            PayloadCompression::None
-        );
-        assert_eq!(
-            parse_payload_compression(Some("none")).unwrap(),
-            PayloadCompression::None
-        );
-        assert_eq!(
-            parse_payload_compression(Some("zstd")).unwrap(),
-            PayloadCompression::Zstd
-        );
-        assert!(parse_payload_compression(Some("gzip")).is_err());
-    }
-
-    #[test]
-    fn loader_strategy_accepts_only_known_modes() {
-        assert_eq!(
-            parse_loader_strategy("embedded").unwrap(),
-            LoaderStrategy::Embedded
-        );
-        assert_eq!(
-            parse_loader_strategy("bundle").unwrap(),
-            LoaderStrategy::Bundle
-        );
-        assert!(parse_loader_strategy("single").is_err());
-    }
-
-    #[test]
     fn cargo_args_tolerate_repeated_cargo_selectors() {
         let args = strings(&[
             "--manifest-path",
@@ -3712,9 +3681,9 @@ mod tests {
             manifest_path: Some(manifest),
             target_cpus: vec!["x86-64".into()],
             parallelism: 1,
-            compress: None,
+            compress: PayloadCompression::None,
             compression_level: 22,
-            loader: "embedded".into(),
+            loader: LoaderStrategy::Embedded,
             auditable: true,
         })
         .unwrap();

@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use cargo_sonic::{BuildOptions, ProbeOptions};
+use cargo_sonic::{BuildOptions, LoaderStrategy, PayloadCompression, ProbeOptions};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -22,14 +22,14 @@ struct Sonic {
     #[arg(short = 'p', long, default_value_t = 1)]
     parallelism: usize,
 
-    #[arg(long)]
-    compress: Option<String>,
+    #[arg(long, value_enum, default_value = "none")]
+    compress: PayloadCompression,
 
     #[arg(long, default_value_t = 22)]
     compression_level: i32,
 
-    #[arg(long, default_value = "embedded")]
-    loader: String,
+    #[arg(long, value_enum, default_value = "embedded")]
+    loader: LoaderStrategy,
 
     #[arg(long)]
     auditable: bool,
