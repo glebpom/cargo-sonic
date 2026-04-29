@@ -706,7 +706,7 @@ fn detect_current_aarch64_host() -> Result<HostInfo> {
     Ok(HostInfo {
         arch: TargetArch::Aarch64,
         features: crate::arch_aarch64::detect_aarch64_features_from_hwcap(hwcap, hwcap2, hwcap3),
-        identity: CpuIdentity::Unknown,
+        identity: detect_current_aarch64_identity(),
         heterogeneous: false,
     })
 }
@@ -746,6 +746,125 @@ fn usize_from_ne_bytes(bytes: &[u8]) -> usize {
         out |= (*byte as usize) << (i * 8);
     }
     out
+}
+
+#[cfg(target_arch = "aarch64")]
+fn detect_current_aarch64_identity() -> CpuIdentity {
+    if let Ok(bytes) = fs::read("/sys/devices/system/cpu/cpu0/regs/identification/midr_el1")
+        && let Some(midr) = parse_aarch64_midr_hex(&bytes)
+    {
+        return aarch64_identity_from_midr(midr);
+    }
+
+    if let Ok(bytes) = fs::read("/proc/cpuinfo") {
+        let identity = parse_aarch64_cpuinfo_identity(&bytes);
+        if identity != CpuIdentity::Unknown {
+            return identity;
+        }
+    }
+
+    CpuIdentity::Unknown
+}
+
+#[cfg(any(target_arch = "aarch64", test))]
+fn aarch64_identity_from_midr(midr: u32) -> CpuIdentity {
+    CpuIdentity::Aarch64 {
+        implementer: ((midr >> 24) & 0xff) as u16,
+        part: ((midr >> 4) & 0xfff) as u16,
+        variant: ((midr >> 20) & 0xf) as u8,
+        revision: (midr & 0xf) as u8,
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", test))]
+fn parse_aarch64_midr_hex(buf: &[u8]) -> Option<u32> {
+    let mut out = 0u32;
+    let mut seen = false;
+    for b in buf.iter().copied() {
+        let digit = if b.is_ascii_digit() {
+            b - b'0'
+        } else if (b'a'..=b'f').contains(&b) {
+            b - b'a' + 10
+        } else if (b'A'..=b'F').contains(&b) {
+            b - b'A' + 10
+        } else if matches!(b, b'x' | b'X' | b' ' | b'\t' | b'\n') {
+            continue;
+        } else {
+            break;
+        };
+        out = (out << 4) | digit as u32;
+        seen = true;
+    }
+    seen.then_some(out)
+}
+
+#[cfg(any(target_arch = "aarch64", test))]
+fn parse_aarch64_cpuinfo_identity(buf: &[u8]) -> CpuIdentity {
+    let implementer = aarch64_cpuinfo_hex_value(buf, b"CPU implementer");
+    let part = aarch64_cpuinfo_hex_value(buf, b"CPU part");
+    let variant = aarch64_cpuinfo_hex_value(buf, b"CPU variant");
+    let revision = aarch64_cpuinfo_decimal_value(buf, b"CPU revision");
+    if let (Some(implementer), Some(part)) = (implementer, part) {
+        CpuIdentity::Aarch64 {
+            implementer,
+            part,
+            variant: variant.unwrap_or(0) as u8,
+            revision: revision.unwrap_or(0) as u8,
+        }
+    } else {
+        CpuIdentity::Unknown
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", test))]
+fn aarch64_cpuinfo_hex_value(buf: &[u8], key: &[u8]) -> Option<u16> {
+    let value = aarch64_cpuinfo_value(buf, key)?;
+    let mut out = 0u16;
+    let mut seen = false;
+    for b in value.iter().copied() {
+        let digit = if b.is_ascii_digit() {
+            b - b'0'
+        } else if (b'a'..=b'f').contains(&b) {
+            b - b'a' + 10
+        } else if (b'A'..=b'F').contains(&b) {
+            b - b'A' + 10
+        } else if matches!(b, b'x' | b'X' | b' ' | b'\t') {
+            continue;
+        } else {
+            break;
+        };
+        out = (out << 4) | digit as u16;
+        seen = true;
+    }
+    seen.then_some(out)
+}
+
+#[cfg(any(target_arch = "aarch64", test))]
+fn aarch64_cpuinfo_decimal_value(buf: &[u8], key: &[u8]) -> Option<u16> {
+    let value = aarch64_cpuinfo_value(buf, key)?;
+    let mut out = 0u16;
+    let mut seen = false;
+    for b in value.iter().copied() {
+        if b.is_ascii_digit() {
+            out = out.saturating_mul(10).saturating_add((b - b'0') as u16);
+            seen = true;
+        } else if seen {
+            break;
+        }
+    }
+    seen.then_some(out)
+}
+
+#[cfg(any(target_arch = "aarch64", test))]
+fn aarch64_cpuinfo_value<'a>(buf: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    for line in buf.split(|b| *b == b'\n') {
+        if line.starts_with(key)
+            && let Some(colon) = line.iter().position(|b| *b == b':')
+        {
+            return Some(&line[colon + 1..]);
+        }
+    }
+    None
 }
 
 fn select_package<'a>(
@@ -3239,6 +3358,38 @@ fn make_executable(_path: &Utf8Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_aarch64_midr_identity() {
+        assert_eq!(
+            parse_aarch64_midr_hex(b"0x00000000410fd4f1\n").map(aarch64_identity_from_midr),
+            Some(CpuIdentity::Aarch64 {
+                implementer: 0x41,
+                part: 0xd4f,
+                variant: 0,
+                revision: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_aarch64_cpuinfo_identity() {
+        let cpuinfo = b"processor\t: 0\n\
+            CPU implementer\t: 0x41\n\
+            CPU architecture: 8\n\
+            CPU variant\t: 0x0\n\
+            CPU part\t: 0xd4f\n\
+            CPU revision\t: 1\n";
+        assert_eq!(
+            parse_aarch64_cpuinfo_identity(cpuinfo),
+            CpuIdentity::Aarch64 {
+                implementer: 0x41,
+                part: 0xd4f,
+                variant: 0,
+                revision: 1,
+            }
+        );
+    }
 
     #[test]
     fn parse_target_features_from_rustc_cfg_test() {

@@ -100,6 +100,7 @@ struct Score {
     tier: u8,
     weak: u8,
     generic_tie: u8,
+    lineage: u16,
 }
 
 pub fn select_variant(host: HostInfo, variants: &[VariantMeta]) -> &VariantMeta {
@@ -176,6 +177,11 @@ fn score(host: HostInfo, variant: &VariantMeta) -> Score {
             1
         } else {
             0
+        },
+        lineage: if core_specific_penalty {
+            0
+        } else {
+            target_lineage(variant.target_kind, variant.target_cpu)
         },
     }
 }
@@ -846,6 +852,37 @@ fn weak_affinity(identity: CpuIdentity, kind: TargetKind) -> u8 {
     }
 }
 
+fn target_lineage(kind: TargetKind, target_cpu: &str) -> u16 {
+    match kind {
+        TargetKind::X86AmdZen { generation } => generation as u16,
+        TargetKind::Aarch64ArmNeoverseE => numbered_suffix(target_cpu, "neoverse-e"),
+        TargetKind::Aarch64ArmNeoverseN => numbered_suffix(target_cpu, "neoverse-n"),
+        TargetKind::Aarch64ArmNeoverseV => {
+            if target_cpu == "neoverse-512tvb" {
+                1
+            } else {
+                numbered_suffix(target_cpu, "neoverse-v")
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn numbered_suffix(value: &str, prefix: &str) -> u16 {
+    let Some(suffix) = value.strip_prefix(prefix) else {
+        return 0;
+    };
+    let digits = suffix
+        .as_bytes()
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return 0;
+    }
+    suffix[..digits].parse().unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1298,6 +1335,51 @@ mod tests {
             select_variant(host(&[], CpuIdentity::Unknown), &variants).target_cpu,
             "generic"
         );
+    }
+
+    #[test]
+    fn same_feature_neoverse_collision_prefers_newer_generation_when_identity_unknown() {
+        let features = [
+            Feature::Asimd,
+            Feature::Bf16,
+            Feature::Bti,
+            Feature::Crc,
+            Feature::Dit,
+            Feature::Dotprod,
+            Feature::Dpb,
+            Feature::Dpb2,
+            Feature::Fcma,
+            Feature::Fhm,
+            Feature::Flagm,
+            Feature::Fp16,
+            Feature::Frintts,
+            Feature::I8mm,
+            Feature::Jsconv,
+            Feature::Lse,
+            Feature::Paca,
+            Feature::Pacg,
+            Feature::Rand,
+            Feature::Rcpc,
+            Feature::Rcpc2,
+            Feature::Rdm,
+            Feature::Sb,
+            Feature::Sha2,
+            Feature::Sha3,
+            Feature::Sha512,
+            Feature::Sve,
+            Feature::Sve2,
+        ];
+        let variants = [
+            v("neoverse-v3", &features, 2, TargetKind::Aarch64ArmNeoverseV),
+            v("neoverse-v2", &features, 2, TargetKind::Aarch64ArmNeoverseV),
+        ];
+        let host = HostInfo {
+            arch: TargetArch::Aarch64,
+            features: mask(&features),
+            identity: CpuIdentity::Unknown,
+            heterogeneous: false,
+        };
+        assert_eq!(select_variant(host, &variants).target_cpu, "neoverse-v3");
     }
 
     #[test]
