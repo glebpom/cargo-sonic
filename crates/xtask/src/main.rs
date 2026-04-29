@@ -507,6 +507,7 @@ fn prepare_runtime_rootfs(asset_dir: &Path, manifest: &SystemManifest) -> Result
     for arch in &manifest.arch {
         let rootfs = rootfs_root.join(&arch.name);
         if rootfs.join(".cargo-sonic-prepared").exists() {
+            prune_runtime_rootfs(&rootfs)?;
             write_guest_init(&rootfs.join("init"), arch)?;
             println!("runtime rootfs {} already prepared", arch.name);
             continue;
@@ -573,9 +574,26 @@ fn prepare_runtime_rootfs(asset_dir: &Path, manifest: &SystemManifest) -> Result
             "install rust toolchain into guest rootfs",
         )?;
 
+        prune_runtime_rootfs(&rootfs)?;
         write_guest_init(&rootfs.join("init"), arch)?;
         fs::write(rootfs.join("etc/resolv.conf"), b"nameserver 1.1.1.1\n")?;
         fs::write(rootfs.join(".cargo-sonic-prepared"), b"prepared\n")?;
+    }
+    Ok(())
+}
+
+fn prune_runtime_rootfs(rootfs: &Path) -> Result<()> {
+    for rel in [
+        "opt/rust/share/doc",
+        "opt/rust/share/man",
+        "opt/rust/share/zsh",
+        "opt/rust/etc",
+    ] {
+        let path = rootfs.join(rel);
+        if path.exists() {
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
     }
     Ok(())
 }
