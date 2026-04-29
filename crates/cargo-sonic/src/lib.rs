@@ -1862,7 +1862,7 @@ fn loader_rustflags(target: &str) -> &'static str {
     if target.starts_with("x86_64-") && target.contains("-musl") {
         "-C panic=abort -C code-model=large -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-static"
     } else if target.starts_with("x86_64-") {
-        "-C panic=abort -C code-model=large -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-nostartfiles -C link-arg=-static"
+        "-C panic=abort -C code-model=large -C target-feature=+crt-static -C relocation-model=static -C link-arg=-nostartfiles -C link-arg=-static"
     } else if target.contains("-musl") {
         "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-static"
     } else {
@@ -3558,6 +3558,8 @@ mod tests {
     fn x86_64_loader_rustflags_use_large_code_model() {
         let flags = loader_rustflags("x86_64-unknown-linux-gnu");
         assert!(flags.contains("-C code-model=large"));
+        assert!(!flags.contains("-C link-self-contained=no"));
+        assert!(flags.contains("-C link-arg=-nostartfiles"));
     }
 
     #[test]
