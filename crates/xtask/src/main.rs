@@ -64,7 +64,11 @@ fn qemu_system() -> Result<()> {
 
     let mut prepared = Vec::new();
     for arch in &manifest.arch {
-        let variants = rustc_payload_target_cpus(&asset_dir, &arch.target)?;
+        let cases = filtered_cases(arch, case_filter.as_deref());
+        if cases.is_empty() {
+            continue;
+        }
+        let variants = rustc_payload_target_cpus(&asset_dir, arch, &cases)?;
         for loader in QEMU_LOADER_STRATEGIES {
             let app = build_qemu_test_app(&root, &asset_dir, arch, loader, &variants)?;
             let initrd = build_test_initramfs(&asset_dir, arch, &app)?;
@@ -86,6 +90,15 @@ fn qemu_system() -> Result<()> {
                 initrd: &prepared_arch.initrd,
             });
         }
+    }
+    if case_jobs.is_empty() {
+        bail!(
+            "no qemu cases matched{}",
+            case_filter
+                .as_deref()
+                .map(|filter| format!(" SONIC_QEMU_CASE={filter:?}"))
+                .unwrap_or_default()
+        );
     }
 
     let mut passed = 0usize;
@@ -753,8 +766,14 @@ publish = false
     })
 }
 
-fn rustc_payload_target_cpus(asset_dir: &Path, target: &str) -> Result<Vec<String>> {
-    let cpus = rustc_target_cpus(target)?;
+fn rustc_payload_target_cpus(
+    asset_dir: &Path,
+    arch: &SystemArch,
+    cases: &[&SystemCase],
+) -> Result<Vec<String>> {
+    let target = &arch.target;
+    let valid = rustc_target_cpus(target)?;
+    let requested = qemu_payload_candidates(arch, cases);
     let probe_dir = asset_dir
         .join("run")
         .join("target-cpu-probes")
@@ -772,7 +791,11 @@ fn rustc_payload_target_cpus(asset_dir: &Path, target: &str) -> Result<Vec<Strin
 
     let mut accepted = Vec::new();
     let mut skipped = Vec::new();
-    for cpu in cpus {
+    for cpu in requested {
+        if !valid.contains(&cpu) {
+            skipped.push((cpu, "rustc does not list this target-cpu".to_string()));
+            continue;
+        }
         let object = probe_dir.join(format!("{}.o", sanitize_path_component(&cpu)));
         let output = Command::new("rustc")
             .arg("--crate-type=lib")
@@ -830,6 +853,42 @@ fn rustc_payload_target_cpus(asset_dir: &Path, target: &str) -> Result<Vec<Strin
     Ok(accepted)
 }
 
+fn qemu_payload_candidates(arch: &SystemArch, cases: &[&SystemCase]) -> Vec<String> {
+    let mut cpus = Vec::new();
+    for case in cases {
+        match arch.name.as_str() {
+            "x86_64" => cpus.extend(x86_qemu_case_target_cpus(&case.cpu)),
+            "aarch64" => cpus.push(case.cpu.clone()),
+            _ => {}
+        }
+    }
+    cpus.sort();
+    cpus.dedup();
+    cpus
+}
+
+fn x86_qemu_case_target_cpus(cpu: &str) -> Vec<String> {
+    match cpu {
+        "qemu64" => strings(&["k8-sse3"]),
+        "kvm64" => strings(&["nocona"]),
+        "phenom" => strings(&["amdfam10", "phenom"]),
+        "Opteron_G2" => strings(&["k8-sse3"]),
+        "Opteron_G3" => strings(&["amdfam10"]),
+        "Penryn" => strings(&["penryn"]),
+        "Nehalem" => strings(&["nehalem"]),
+        "Westmere" => strings(&["westmere"]),
+        "SandyBridge" => strings(&["sandybridge"]),
+        "IvyBridge" => strings(&["ivybridge"]),
+        "Haswell-v4" => strings(&["haswell"]),
+        "Broadwell-v4" => strings(&["broadwell"]),
+        other => vec![other.to_string()],
+    }
+}
+
+fn strings(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
+}
+
 fn ensure_rust_target_installed(target: &str, probe_source: &Path, probe_dir: &Path) -> Result<()> {
     let object = probe_dir.join("target-installed.o");
     let output = Command::new("rustc")
@@ -860,6 +919,11 @@ fn ensure_rust_target_installed(target: &str, probe_source: &Path, probe_dir: &P
 }
 
 fn rustc_target_cpus(target: &str) -> Result<Vec<String>> {
+    let implicit_baseline = if target.starts_with("x86_64-") {
+        "x86-64"
+    } else {
+        "generic"
+    };
     let output = Command::new("rustc")
         .args(["--print", "target-cpus", "--target", target])
         .output()
@@ -875,7 +939,7 @@ fn rustc_target_cpus(target: &str) -> Result<Vec<String>> {
         .lines()
         .filter_map(|line| {
             let cpu = line.split_whitespace().next()?;
-            if line.starts_with("    ") && cpu != "native" && cpu != "generic" {
+            if line.starts_with("    ") && cpu != "native" && cpu != implicit_baseline {
                 Some(cpu.to_string())
             } else {
                 None
@@ -978,7 +1042,7 @@ fn run_qemu_case(
         "-nographic".to_string(),
         "-no-reboot".to_string(),
         "-m".to_string(),
-        "4096".to_string(),
+        "6144".to_string(),
         "-kernel".to_string(),
         kernel.display().to_string(),
         "-initrd".to_string(),
@@ -1235,7 +1299,7 @@ fn write_qemu_readme(asset_dir: &Path, manifest: &SystemManifest) -> Result<()> 
         text.push_str(&format!("- qemu binary: `{}`\n", arch.qemu_binary));
         text.push_str(&format!("- kernel: `{}`\n", arch.kernel));
         text.push_str(&format!("- initrd: `{}`\n", arch.initrd));
-        text.push_str("- variants: all rustc target-cpus that compile for this target except `native` and implicit `generic`\n");
+        text.push_str("- variants: rustc target-cpus needed by configured qemu cases, excluding `native` and the implicit cargo-sonic baseline\n");
         text.push_str(&format!("- cpu cases: `{}`\n", arch.case.len()));
         text.push_str(&format!(
             "- cpus: `{}`\n\n",

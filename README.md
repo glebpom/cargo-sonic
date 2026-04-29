@@ -375,6 +375,9 @@ that guest with `-C target-cpu=native`, run both cargo-sonic loader strategies
 inside the same guest, and compare each loader-selected target against the
 rustc-derived expectation. Host `qemu-user`, host rustc, and checked-in
 selected-target goldens are intentionally not used as correctness oracles.
+The generated test binaries include only the rustc target-cpus needed by the
+configured QEMU cases; cargo-sonic adds the architecture baseline payload
+implicitly.
 
 QEMU cases run in parallel. The default worker count is the number of available
 CPU cores; override it with `SONIC_QEMU_JOBS=<n>` when needed:
