@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix generated x86_64 GNU loaders so they no longer force the system linker path in CI.
+
 # 0.1.5
 
 - Add `--loader=bundle` to build a CPU detection launcher plus an adjacent payload bundle directory for faster startup in container-style deployments.
