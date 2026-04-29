@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add `cargo sonic score` to rank rustc-supported target CPUs compatible with the current host without requiring `--target-cpus`.
+
 # 0.1.5
 
 - Add `--loader=bundle` to build a CPU detection launcher plus an adjacent payload bundle directory for faster startup in container-style deployments.

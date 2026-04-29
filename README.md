@@ -216,6 +216,15 @@ cargo sonic --target-cpus=x86-64-v3,znver5 build --release
 cargo sonic --target-cpus=x86-64-v3,znver5 build --target x86_64-unknown-linux-gnu
 ```
 
+To inspect what the current machine can run, use `score`. It does not require
+`--target-cpus`; it scores the current host against rustc-supported target CPUs
+for the selected target and prints compatible CPUs in runtime selection order:
+
+```bash
+cargo sonic score
+cargo sonic score --target x86_64-unknown-linux-gnu
+```
+
 Binary/package selection also uses normal Cargo arguments:
 
 ```bash

@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use cargo_sonic::{BuildOptions, LoaderStrategy, PayloadCompression, ProbeOptions};
+use cargo_sonic::{BuildOptions, LoaderStrategy, PayloadCompression, ProbeOptions, ScoreOptions};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -42,6 +42,7 @@ struct Sonic {
 enum Command {
     Build(Build),
     Probe(Probe),
+    Score(Score),
 }
 
 #[derive(Parser)]
@@ -52,6 +53,12 @@ struct Build {
 
 #[derive(Parser)]
 struct Probe {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    cargo_args: Vec<String>,
+}
+
+#[derive(Parser)]
+struct Score {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     cargo_args: Vec<String>,
 }
@@ -91,6 +98,17 @@ fn main() -> Result<()> {
         }) => cargo_sonic::probe(ProbeOptions {
             cargo_args: probe.cargo_args,
             target_cpus,
+        }),
+        CargoSonicCommand::Sonic(Sonic {
+            target_cpus: _,
+            parallelism: _,
+            compress: _,
+            compression_level: _,
+            loader: _,
+            auditable: _,
+            command: Command::Score(score),
+        }) => cargo_sonic::score(ScoreOptions {
+            cargo_args: score.cargo_args,
         }),
     }
     .map_err(|err| {
