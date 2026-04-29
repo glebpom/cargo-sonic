@@ -177,7 +177,7 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
     } else {
         None
     };
-    let configured_cpus = normalize_target_cpus(effective_target_cpus(options.target_cpus)?)?;
+    let requested_cpus = effective_target_cpus(options.target_cpus)?;
 
     let target = match cargo_args.target.clone() {
         Some(target) => target,
@@ -194,6 +194,8 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
             "cargo-sonic currently supports x86_64 and aarch64 only; `{target}` has target_arch={target_arch:?}"
         );
     }
+    let configured_cpus = normalize_target_cpus(requested_cpus, &target_arch)?;
+    let baseline_cpu = baseline_target_cpu(&target_arch);
 
     let current_valid = rustc_target_cpus(&target)?;
     let union_valid = known_supported_cpu_union()?;
@@ -214,7 +216,7 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
     for cpu in &included {
         let features = parse_target_features_from_rustc_cfg(&rustc_cfg(&target, Some(cpu))?);
         let feature_set = classify_runtime_features(&features);
-        if cpu != "generic" && !feature_set.unknown.is_empty() {
+        if cpu != baseline_cpu && !feature_set.unknown.is_empty() {
             warnings.push(format!(
                 "skipping target-cpu `{}` because rustc reported unknown runtime feature(s): {}",
                 cpu,
@@ -224,8 +226,8 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
         }
         features_by_cpu.insert(cpu.clone(), feature_set.known);
     }
-    if !features_by_cpu.contains_key("generic") {
-        features_by_cpu.insert("generic".to_string(), Vec::new());
+    if !features_by_cpu.contains_key(baseline_cpu) {
+        features_by_cpu.insert(baseline_cpu.to_string(), Vec::new());
     }
     warnings.extend(analyze_warnings(&features_by_cpu, &target_arch));
     for warning in &warnings {
@@ -240,12 +242,12 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
         let feature_names = features_by_cpu.get(cpu).cloned().unwrap_or_default();
         let rank_features = feature_mask(&feature_names)?;
         let required_feature_names = safety_required_features(&feature_names);
-        let required_features = if cpu == "generic" {
+        let required_features = if cpu == baseline_cpu {
             FeatureMask::EMPTY
         } else {
             feature_mask(&required_feature_names)?
         };
-        let target_kind = classify_target_cpu(cpu, &target_arch);
+        let target_kind = classify_target_cpu(cpu, &target_arch, baseline_cpu);
         variant_jobs.push(VariantBuildJob {
             target_cpu: cpu.clone(),
             required_features,
@@ -296,7 +298,7 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
 
 pub fn probe(options: ProbeOptions) -> Result<()> {
     let cargo_args = parse_cargo_args(&options.cargo_args);
-    let configured_cpus = normalize_target_cpus(effective_target_cpus(options.target_cpus)?)?;
+    let requested_cpus = effective_target_cpus(options.target_cpus)?;
 
     let target = match cargo_args.target.clone() {
         Some(target) => target,
@@ -313,6 +315,8 @@ pub fn probe(options: ProbeOptions) -> Result<()> {
             "cargo-sonic currently supports x86_64 and aarch64 only; `{target}` has target_arch={target_arch:?}"
         );
     }
+    let configured_cpus = normalize_target_cpus(requested_cpus, &target_arch)?;
+    let baseline_cpu = baseline_target_cpu(&target_arch);
 
     let host = detect_current_host(&target_arch)?;
     let current_valid = rustc_target_cpus(&target)?;
@@ -325,7 +329,7 @@ pub fn probe(options: ProbeOptions) -> Result<()> {
     for cpu in &included {
         let features = parse_target_features_from_rustc_cfg(&rustc_cfg(&target, Some(cpu))?);
         let feature_set = classify_runtime_features(&features);
-        if cpu != "generic" && !feature_set.unknown.is_empty() {
+        if cpu != baseline_cpu && !feature_set.unknown.is_empty() {
             skipped.push(SkippedProbeVariant {
                 target_cpu: cpu.clone(),
                 reason: format!(
@@ -338,12 +342,12 @@ pub fn probe(options: ProbeOptions) -> Result<()> {
         let feature_names = feature_set.known;
         let rank_features = feature_mask(&feature_names)?;
         let required_feature_names = safety_required_features(&feature_names);
-        let required_features = if cpu == "generic" {
+        let required_features = if cpu == baseline_cpu {
             FeatureMask::EMPTY
         } else {
             feature_mask(&required_feature_names)?
         };
-        let target_kind = classify_target_cpu(cpu, &target_arch);
+        let target_kind = classify_target_cpu(cpu, &target_arch, baseline_cpu);
         metas.push(VariantMeta {
             target_cpu: leaked_str(cpu),
             required_features,
@@ -517,8 +521,7 @@ fn format_probe_report(
     ));
     out.push_str("  variants:\n");
     for variant in variants {
-        let eligible = variant.target_cpu == "generic"
-            || variant.required_features.is_subset_of(host.features);
+        let eligible = variant.required_features.is_subset_of(host.features);
         let missing = FeatureMask::from_words([
             variant.required_features.words()[0] & !host.features.words()[0],
             variant.required_features.words()[1] & !host.features.words()[1],
@@ -551,9 +554,7 @@ fn format_probe_report(
     }
     let eligible = variants
         .iter()
-        .filter(|variant| {
-            variant.target_cpu == "generic" || variant.required_features.is_subset_of(host.features)
-        })
+        .filter(|variant| variant.required_features.is_subset_of(host.features))
         .map(|variant| variant.target_cpu.as_str())
         .collect::<Vec<_>>();
     out.push_str(&format!("  fits=[{}]\n", eligible.join(",")));
@@ -899,14 +900,22 @@ fn effective_target_cpus(target_cpus: Vec<String>) -> Result<Vec<String>> {
     Ok(target_cpus)
 }
 
-fn normalize_target_cpus(mut cpus: Vec<String>) -> Result<Vec<String>> {
+fn baseline_target_cpu(target_arch: &str) -> &'static str {
+    match target_arch {
+        "x86_64" => "x86-64",
+        _ => "generic",
+    }
+}
+
+fn normalize_target_cpus(mut cpus: Vec<String>, target_arch: &str) -> Result<Vec<String>> {
+    let baseline = baseline_target_cpu(target_arch);
     if cpus.iter().any(|cpu| cpu == "native") {
         bail!("target-cpu \"native\" is rejected because cargo-sonic builds portable artifacts");
     }
-    if cpus.iter().any(|cpu| cpu == "generic") {
-        bail!("target-cpu \"generic\" is implicit; remove it from --target-cpus");
+    if cpus.iter().any(|cpu| cpu == baseline) {
+        bail!("target-cpu \"{baseline}\" is implicit; remove it from --target-cpus");
     }
-    cpus.insert(0, "generic".to_string());
+    cpus.insert(0, baseline.to_string());
     Ok(cpus)
 }
 
@@ -3263,8 +3272,8 @@ fn target_feature_tier(arch: &str, target_kind: TargetKind) -> u8 {
     }
 }
 
-fn classify_target_cpu(cpu: &str, arch: &str) -> TargetKind {
-    if cpu == "generic" {
+fn classify_target_cpu(cpu: &str, arch: &str, baseline_cpu: &str) -> TargetKind {
+    if cpu == baseline_cpu {
         return TargetKind::Generic;
     }
     if arch == "x86_64" {
@@ -3584,20 +3593,34 @@ mod tests {
 
     #[test]
     fn native_target_cpu_is_rejected() {
-        assert!(normalize_target_cpus(vec!["native".into()]).is_err());
+        assert!(normalize_target_cpus(vec!["native".into()], "x86_64").is_err());
     }
 
     #[test]
-    fn generic_is_implicit_in_config() {
+    fn x86_64_baseline_is_implicit_in_config() {
         assert_eq!(
-            normalize_target_cpus(vec!["haswell".into()]).unwrap(),
-            vec!["generic", "haswell"]
+            normalize_target_cpus(vec!["haswell".into()], "x86_64").unwrap(),
+            vec!["x86-64", "haswell"]
         );
     }
 
     #[test]
-    fn explicit_generic_target_cpu_is_rejected() {
-        let err = normalize_target_cpus(vec!["generic".into()]).unwrap_err();
+    fn aarch64_generic_is_implicit_in_config() {
+        assert_eq!(
+            normalize_target_cpus(vec!["neoverse-v1".into()], "aarch64").unwrap(),
+            vec!["generic", "neoverse-v1"]
+        );
+    }
+
+    #[test]
+    fn explicit_baseline_target_cpu_is_rejected() {
+        let err = normalize_target_cpus(vec!["x86-64".into()], "x86_64").unwrap_err();
+        assert!(
+            err.to_string().contains("x86-64"),
+            "unexpected error: {err:#}"
+        );
+
+        let err = normalize_target_cpus(vec!["generic".into()], "aarch64").unwrap_err();
         assert!(
             err.to_string().contains("generic"),
             "unexpected error: {err:#}"
@@ -3615,14 +3638,14 @@ mod tests {
 
     #[test]
     fn x86_64_v1_spelling_is_not_accepted() {
-        let current = BTreeSet::from(["generic".into(), "x86-64".into(), "x86-64-v2".into()]);
+        let current = BTreeSet::from(["x86-64".into(), "x86-64-v2".into()]);
         let union = current.clone();
 
         let got =
-            filter_target_cpus(&["generic".into(), "x86-64".into()], &current, &union).unwrap();
-        assert_eq!(got, vec!["generic", "x86-64"]);
+            filter_target_cpus(&["x86-64".into(), "x86-64-v2".into()], &current, &union).unwrap();
+        assert_eq!(got, vec!["x86-64", "x86-64-v2"]);
 
-        let err = filter_target_cpus(&["generic".into(), "x86-64-v1".into()], &current, &union)
+        let err = filter_target_cpus(&["x86-64".into(), "x86-64-v1".into()], &current, &union)
             .unwrap_err();
         assert!(
             err.to_string().contains("x86-64-v1"),
@@ -3744,32 +3767,36 @@ mod tests {
     #[test]
     fn classifies_modern_x86_target_cpus_for_selector_affinity() {
         assert_eq!(
-            classify_target_cpu("sierraforest", "x86_64"),
+            classify_target_cpu("sierraforest", "x86_64", "x86-64"),
             TargetKind::X86IntelAtom
         );
         assert_eq!(
-            classify_target_cpu("clearwaterforest", "x86_64"),
+            classify_target_cpu("clearwaterforest", "x86_64", "x86-64"),
             TargetKind::X86IntelAtom
         );
         assert_eq!(
-            classify_target_cpu("grandridge", "x86_64"),
+            classify_target_cpu("grandridge", "x86_64", "x86-64"),
             TargetKind::X86IntelAtom
         );
         assert_eq!(
-            classify_target_cpu("sapphirerapids", "x86_64"),
+            classify_target_cpu("sapphirerapids", "x86_64", "x86-64"),
             TargetKind::X86IntelXeon
         );
         assert_eq!(
-            classify_target_cpu("graniterapids-d", "x86_64"),
+            classify_target_cpu("graniterapids-d", "x86_64", "x86-64"),
             TargetKind::X86IntelXeon
         );
         assert_eq!(
-            classify_target_cpu("arrowlake", "x86_64"),
+            classify_target_cpu("arrowlake", "x86_64", "x86-64"),
             TargetKind::X86IntelCore
         );
         assert_eq!(
-            classify_target_cpu("znver5", "x86_64"),
+            classify_target_cpu("znver5", "x86_64", "x86-64"),
             TargetKind::X86AmdZen { generation: 5 }
+        );
+        assert_eq!(
+            classify_target_cpu("x86-64", "x86_64", "x86-64"),
+            TargetKind::Generic
         );
     }
 
@@ -3803,25 +3830,29 @@ mod tests {
     #[test]
     fn classifies_modern_aarch64_target_cpus_for_selector_affinity() {
         assert_eq!(
-            classify_target_cpu("cortex-a725", "aarch64"),
+            classify_target_cpu("cortex-a725", "aarch64", "generic"),
             TargetKind::Aarch64ArmCortexA
         );
         assert_eq!(
-            classify_target_cpu("neoverse-n3", "aarch64"),
+            classify_target_cpu("neoverse-n3", "aarch64", "generic"),
             TargetKind::Aarch64ArmNeoverseN
         );
         assert_eq!(
-            classify_target_cpu("neoverse-v3ae", "aarch64"),
+            classify_target_cpu("neoverse-v3ae", "aarch64", "generic"),
             TargetKind::Aarch64ArmNeoverseV
         );
         assert_eq!(
-            classify_target_cpu("a64fx", "aarch64"),
+            classify_target_cpu("a64fx", "aarch64", "generic"),
             TargetKind::Aarch64Other
+        );
+        assert_eq!(
+            classify_target_cpu("generic", "aarch64", "generic"),
+            TargetKind::Generic
         );
     }
 
     #[test]
-    fn builds_and_runs_generic_fixture() {
+    fn builds_and_runs_baseline_fixture() {
         if !cfg!(target_os = "linux") || !cfg!(target_arch = "x86_64") {
             return;
         }
@@ -3830,7 +3861,7 @@ mod tests {
         let output = build(BuildOptions {
             cargo_args: Vec::new(),
             manifest_path: Some(manifest),
-            target_cpus: vec!["x86-64".into()],
+            target_cpus: vec!["x86-64-v2".into()],
             parallelism: 1,
             compress: PayloadCompression::None,
             compression_level: 22,
@@ -3850,7 +3881,7 @@ mod tests {
         assert!(stdout.contains("argv=one"));
         assert!(stdout.contains("keep=yes"));
         assert!(stdout.contains("enabled=1"));
-        assert!(stdout.contains("cpu=generic"));
+        assert!(stdout.contains("cpu=x86-64"));
         assert!(stdout.contains("flags="));
 
         if Command::new("readelf").arg("--version").output().is_ok() {

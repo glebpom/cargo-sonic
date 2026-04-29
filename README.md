@@ -45,7 +45,7 @@ On a Raptor Lake host, the performance delta is clear:
 | Selection Mode | Target CPU | Execution Time |
 | --- | --- | ---: |
 | Sonic (Optimized) | `raptorlake` | 154 ms |
-| Generic Fallback | `generic` | 2771 ms |
+| Baseline Fallback | `x86-64` | 2771 ms |
 
 ### Optimized Portability
 
@@ -56,8 +56,8 @@ runtime.
 
 - **Microarchitecture tuning:** enables the compiler to use efficient
   instruction weights and vectorization strategies for the specific host.
-- **Automated fallback:** includes a generic payload to preserve compatibility
-  with legacy hardware or restricted environments.
+- **Automated fallback:** includes a Rust baseline payload to preserve
+  compatibility with legacy hardware or restricted environments.
 - **Infrastructure simplicity:** provides the performance of specialized builds
   within a single portable deployment unit.
 
@@ -70,7 +70,7 @@ pipelines.
 This repository currently has a working Linux x86_64/AArch64 vertical slice:
 
 - CLI target CPU selection through `--target-cpus`
-- implicit `generic` payload, always built
+- implicit baseline payload, always built
 - target-cpu validation through `rustc --print target-cpus`
 - payload builds with isolated target directories
 - generated Rust 2024 `no_std`/`no_main` loader
@@ -195,14 +195,15 @@ interleaved cargo output remains attributable. Cargo's normal
 preserves colors when its output is attached to a terminal even though child
 Cargo output is buffered through pipes.
 
-`generic` is implicit. It is always built and is always eligible at runtime, so
-do not list it in `--target-cpus`. Pass at least one non-generic CPU; with only
-one generic payload there is no reason to use `cargo-sonic`.
+The baseline target CPU is implicit. It is always built and always eligible at
+runtime, so do not list it in `--target-cpus`. On x86_64 the baseline is
+`x86-64`; on AArch64 it is `generic`. Pass at least one non-baseline CPU; with
+only one baseline payload there is no reason to use `cargo-sonic`.
 
 Rules:
 
 - `--target-cpus` is required.
-- `generic` is added automatically and rejected if listed explicitly.
+- the target baseline is added automatically and rejected if listed explicitly.
 - `native` is rejected.
 - CPU names must exactly match local `rustc --print target-cpus` names.
 - Cross-architecture CPU names are skipped for the current target.
@@ -261,7 +262,7 @@ CARGO_SONIC_SELECTED_FLAGS=<rustc target_feature CSV>
 ```
 
 Selection is enabled by default. Set `CARGO_SONIC_ENABLE=0` or
-`CARGO_SONIC_ENABLE=false` to force the loader to select the `generic` payload:
+`CARGO_SONIC_ENABLE=false` to force the loader to select the baseline payload:
 
 ```bash
 CARGO_SONIC_ENABLE=0 target/sonic/x86_64-unknown-linux-gnu/release/sonic-cpu-benchmark
@@ -319,7 +320,7 @@ On a Raptor Lake host, `just run` prints:
 selected target-cpu: raptorlake
 ```
 
-Compare default selection with forced generic:
+Compare default selection with forced baseline:
 
 ```bash
 just compare
