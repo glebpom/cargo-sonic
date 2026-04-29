@@ -90,51 +90,49 @@ pub struct VariantMeta {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-struct Score {
-    baseline: u8,
-    exact: u8,
-    package: u8,
-    unknown_neutral: u8,
-    feature_score: u16,
-    count: u16,
-    tier: u8,
-    weak: u8,
-    generic_tie: u8,
-    lineage: u16,
+pub struct SelectionScore {
+    pub baseline: u8,
+    pub exact: u8,
+    pub package: u8,
+    pub unknown_neutral: u8,
+    pub vendor_affinity: u8,
+    pub feature_score: u16,
+    pub count: u16,
+    pub tier: u8,
+    pub generic_tie: u8,
+    pub lineage: u16,
 }
 
 pub fn select_variant(host: HostInfo, variants: &[VariantMeta]) -> &VariantMeta {
-    let mut best = None::<(&VariantMeta, Score)>;
-
-    for variant in variants {
-        if !eligible(host, variant) {
-            continue;
-        }
-        let score = score(host, variant);
-        match best {
-            None => best = Some((variant, score)),
-            Some((current, current_score)) => {
-                if score > current_score
-                    || (score == current_score && variant.target_cpu < current.target_cpu)
-                {
-                    best = Some((variant, score));
-                }
-            }
-        }
-    }
-
-    best.map(|(variant, _)| variant)
+    variants
+        .iter()
+        .filter(|variant| variant_eligible(host, variant))
+        .min_by(|a, b| compare_variants_by_score(host, a, b))
         .unwrap_or_else(|| &variants[0])
+}
+
+pub fn variant_eligible(host: HostInfo, variant: &VariantMeta) -> bool {
+    eligible(host, variant)
+}
+
+pub fn compare_variants_by_score(
+    host: HostInfo,
+    a: &VariantMeta,
+    b: &VariantMeta,
+) -> core::cmp::Ordering {
+    selection_score(host, b)
+        .cmp(&selection_score(host, a))
+        .then_with(|| a.target_cpu.cmp(b.target_cpu))
 }
 
 fn eligible(host: HostInfo, variant: &VariantMeta) -> bool {
     variant.target_kind.is_generic() || variant.required_features.is_subset_of(host.features)
 }
 
-fn score(host: HostInfo, variant: &VariantMeta) -> Score {
+pub fn selection_score(host: HostInfo, variant: &VariantMeta) -> SelectionScore {
     let exact = exact_affinity(host.identity, variant.target_kind, variant.target_cpu);
     let core_specific_penalty = host.heterogeneous && variant.target_kind.is_core_specific();
-    Score {
+    SelectionScore {
         baseline: if core_specific_penalty {
             0
         } else {
@@ -153,6 +151,11 @@ fn score(host: HostInfo, variant: &VariantMeta) -> Score {
         } else {
             0
         },
+        vendor_affinity: if core_specific_penalty {
+            0
+        } else {
+            weak_affinity(host.identity, variant.target_kind)
+        },
         feature_score: if core_specific_penalty {
             0
         } else {
@@ -167,11 +170,6 @@ fn score(host: HostInfo, variant: &VariantMeta) -> Score {
             0
         } else {
             variant.feature_tier
-        },
-        weak: if core_specific_penalty {
-            0
-        } else {
-            weak_affinity(host.identity, variant.target_kind)
         },
         generic_tie: if variant.target_kind.is_generic() {
             1
@@ -1236,6 +1234,71 @@ mod tests {
             )
             .target_cpu,
             "znver5"
+        );
+    }
+
+    #[test]
+    fn vendor_affinity_beats_feature_score_when_no_exact_affinity() {
+        let variants = [
+            v(
+                "intel-wide",
+                &[Feature::Avx512F, Feature::Avx512Bw],
+                2,
+                TargetKind::X86IntelCore,
+            ),
+            v(
+                "amd-narrow",
+                &[Feature::Avx512F],
+                2,
+                TargetKind::X86AmdOther,
+            ),
+        ];
+        let identity = CpuIdentity::X86 {
+            vendor: X86Vendor::Amd,
+            family: 22,
+            model: 1,
+            stepping: 0,
+        };
+        assert_eq!(
+            select_variant(
+                host(&[Feature::Avx512F, Feature::Avx512Bw], identity),
+                &variants
+            )
+            .target_cpu,
+            "amd-narrow"
+        );
+    }
+
+    #[test]
+    fn score_comparator_matches_select_variant() {
+        let mut variants = [
+            v(
+                "intel-wide",
+                &[Feature::Avx512F, Feature::Avx512Bw],
+                2,
+                TargetKind::X86IntelCore,
+            ),
+            v(
+                "amd-narrow",
+                &[Feature::Avx512F],
+                2,
+                TargetKind::X86AmdOther,
+            ),
+            v("generic", &[], 0, TargetKind::Generic),
+        ];
+        let host = host(
+            &[Feature::Avx512F, Feature::Avx512Bw],
+            CpuIdentity::X86 {
+                vendor: X86Vendor::Amd,
+                family: 22,
+                model: 1,
+                stepping: 0,
+            },
+        );
+        variants.sort_by(|a, b| compare_variants_by_score(host, a, b));
+        assert_eq!(
+            variants[0].target_cpu,
+            select_variant(host, &variants).target_cpu
         );
     }
 

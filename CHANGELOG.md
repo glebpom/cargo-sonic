@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add `cargo sonic score` to rank rustc-supported target CPUs compatible with the current host without requiring `--target-cpus`.
 - Fix generated x86_64 GNU loaders so they no longer force the system linker path in CI.
 
 # 0.1.5

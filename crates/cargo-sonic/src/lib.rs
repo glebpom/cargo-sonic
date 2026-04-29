@@ -16,7 +16,8 @@ pub mod select;
 
 use crate::feature_mask::{FeatureMask, feature_by_name};
 use crate::select::{
-    CpuIdentity, HostInfo, TargetArch, TargetKind, VariantMeta, X86Vendor, select_variant,
+    CpuIdentity, HostInfo, TargetArch, TargetKind, VariantMeta, X86Vendor,
+    compare_variants_by_score, select_variant, selection_score, variant_eligible,
 };
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
@@ -55,6 +56,11 @@ pub struct BuildOutput {
 pub struct ProbeOptions {
     pub cargo_args: Vec<String>,
     pub target_cpus: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScoreOptions {
+    pub cargo_args: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -370,6 +376,129 @@ pub fn probe(options: ProbeOptions) -> Result<()> {
     Ok(())
 }
 
+pub fn score(options: ScoreOptions) -> Result<()> {
+    let cargo_args = parse_cargo_args(&options.cargo_args);
+    let target = match cargo_args.target.clone() {
+        Some(target) => target,
+        None => rustc_default_target()?,
+    };
+    let cfg = rustc_cfg(&target, None)?;
+    let target_os = cfg_value(&cfg, "target_os").unwrap_or_default();
+    let target_arch = cfg_value(&cfg, "target_arch").unwrap_or_default();
+    if target_os != "linux" {
+        bail!("cargo-sonic supports Linux targets only; `{target}` has target_os={target_os:?}");
+    }
+    if target_arch != "x86_64" && target_arch != "aarch64" {
+        bail!(
+            "cargo-sonic currently supports x86_64 and aarch64 only; `{target}` has target_arch={target_arch:?}"
+        );
+    }
+
+    let host = detect_current_host(&target_arch)?;
+    let baseline_cpu = baseline_target_cpu(&target_arch);
+    let mut candidates = rustc_target_cpus(&target)?;
+    candidates.remove("native");
+    if baseline_cpu != "generic" {
+        candidates.remove("generic");
+    }
+    candidates.insert(baseline_cpu.to_string());
+
+    let mut metas = Vec::new();
+    let mut display = Vec::new();
+    let mut skipped = 0usize;
+    for cpu in candidates {
+        if !rustc_accepts_target_cpu_for_payload(&target, &cpu)? {
+            skipped += 1;
+            continue;
+        }
+        let cfg = match rustc_cfg(&target, Some(&cpu)) {
+            Ok(cfg) => cfg,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
+        };
+        let features = parse_target_features_from_rustc_cfg(&cfg);
+        let feature_set = classify_runtime_features(&features);
+        if cpu != baseline_cpu && !feature_set.unknown.is_empty() {
+            skipped += 1;
+            continue;
+        }
+        let feature_names = feature_set.known;
+        let rank_features = feature_mask(&feature_names)?;
+        let required_feature_names = safety_required_features(&feature_names);
+        let required_features = if cpu == baseline_cpu {
+            FeatureMask::EMPTY
+        } else {
+            feature_mask(&required_feature_names)?
+        };
+        let target_kind = classify_target_cpu(&cpu, &target_arch, baseline_cpu);
+        if !score_target_kind_matches_host(host, target_kind) {
+            skipped += 1;
+            continue;
+        }
+        metas.push(VariantMeta {
+            target_cpu: leaked_str(&cpu),
+            required_features,
+            rank_features,
+            rank_feature_count: rank_features.count(),
+            feature_tier: target_feature_tier(&target_arch, target_kind),
+            target_kind,
+        });
+        display.push(ProbeVariant {
+            target_cpu: cpu,
+            required_features,
+            rank_features,
+            feature_names,
+            feature_tier: target_feature_tier(&target_arch, target_kind),
+        });
+    }
+
+    print_score_report(&target, host, &metas, &display, skipped);
+    Ok(())
+}
+
+fn score_target_kind_matches_host(host: HostInfo, target_kind: TargetKind) -> bool {
+    if target_kind.is_generic() || target_kind.is_neutral_x86() {
+        return true;
+    }
+    match host.identity {
+        CpuIdentity::Unknown => true,
+        CpuIdentity::X86 {
+            vendor: X86Vendor::Amd,
+            ..
+        } => matches!(
+            target_kind,
+            TargetKind::X86AmdZen { .. } | TargetKind::X86AmdOther
+        ),
+        CpuIdentity::X86 {
+            vendor: X86Vendor::Intel,
+            ..
+        } => matches!(
+            target_kind,
+            TargetKind::X86IntelCore | TargetKind::X86IntelXeon | TargetKind::X86IntelAtom
+        ),
+        CpuIdentity::X86 {
+            vendor: X86Vendor::Other,
+            ..
+        } => false,
+        CpuIdentity::Aarch64 {
+            implementer: 0x41, ..
+        } => matches!(
+            target_kind,
+            TargetKind::Aarch64ArmNeoverseN
+                | TargetKind::Aarch64ArmNeoverseV
+                | TargetKind::Aarch64ArmNeoverseE
+                | TargetKind::Aarch64ArmCortexA
+                | TargetKind::Aarch64ArmCortexX
+        ),
+        CpuIdentity::Aarch64 {
+            implementer: 0xc0, ..
+        } => matches!(target_kind, TargetKind::Aarch64Ampere),
+        CpuIdentity::Aarch64 { .. } => false,
+    }
+}
+
 fn parse_cargo_args(args: &[String]) -> CargoArgs {
     let matches = cargo_args_command()
         .try_get_matches_from(known_cargo_args(args))
@@ -494,6 +623,74 @@ fn print_probe_report(
         "{}",
         format_probe_report(target, host, variants, skipped, selected)
     );
+}
+
+fn print_score_report(
+    target: &str,
+    host: HostInfo,
+    metas: &[VariantMeta],
+    variants: &[ProbeVariant],
+    skipped: usize,
+) {
+    print!(
+        "{}",
+        format_score_report(target, host, metas, variants, skipped)
+    );
+}
+
+fn format_score_report(
+    target: &str,
+    host: HostInfo,
+    metas: &[VariantMeta],
+    variants: &[ProbeVariant],
+    skipped: usize,
+) -> String {
+    let mut compatible = metas
+        .iter()
+        .filter(|variant| variant_eligible(host, variant))
+        .collect::<Vec<_>>();
+    compatible.sort_by(|a, b| compare_variants_by_score(host, a, b));
+    let mut out = String::new();
+    out.push_str("cargo-sonic score\n");
+    out.push_str(&format!("  target={target}\n"));
+    out.push_str(&format!("  host.arch={}\n", host_arch_name(host.arch)));
+    out.push_str(&format!(
+        "  host.features={}\n",
+        format_words(host.features)
+    ));
+    out.push_str(&format!(
+        "  host.feature_names=[{}]\n",
+        feature_names(host.features).join(",")
+    ));
+    out.push_str(&format!(
+        "  host.identity={}\n",
+        format_identity(host.identity)
+    ));
+    if let Some(selected) = compatible.first() {
+        out.push_str(&format!("  selected={}\n", selected.target_cpu));
+    }
+    out.push_str("  compatible:\n");
+    for (index, meta) in compatible.iter().enumerate() {
+        let score = selection_score(host, meta);
+        let variant = variants
+            .iter()
+            .find(|variant| variant.target_cpu == meta.target_cpu)
+            .expect("score display metadata must match selector metadata");
+        out.push_str(&format!(
+            "    rank={} target_cpu={} exact={} vendor_affinity={} feature_score={} tier={} count={} required={} flags=[{}]\n",
+            index + 1,
+            variant.target_cpu,
+            score.exact,
+            score.vendor_affinity,
+            score.feature_score,
+            variant.feature_tier,
+            variant.rank_features.count(),
+            format_words(variant.required_features),
+            variant.feature_names.join(",")
+        ));
+    }
+    out.push_str(&format!("  skipped={skipped}\n"));
+    out
 }
 
 fn format_probe_report(
@@ -974,6 +1171,48 @@ fn rustc_cfg(target: &str, cpu: Option<&str>) -> Result<String> {
         );
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+fn rustc_accepts_target_cpu_for_payload(target: &str, cpu: &str) -> Result<bool> {
+    let object_path = std::env::temp_dir().join(format!(
+        "cargo-sonic-target-cpu-probe-{}-{}.o",
+        std::process::id(),
+        sanitize_cpu(cpu)
+    ));
+    let mut child = Command::new("rustc")
+        .args([
+            "--crate-name",
+            "cargo_sonic_target_cpu_probe",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "obj",
+            "--target",
+            target,
+            "-C",
+            &format!("target-cpu={cpu}"),
+            "-C",
+            "panic=abort",
+            "-",
+            "-o",
+        ])
+        .arg(&object_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| "failed to spawn rustc target-cpu probe")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("failed to open rustc target-cpu probe stdin")?;
+    stdin
+        .write_all(b"#![no_std]\n#[no_mangle]\npub extern \"C\" fn cargo_sonic_probe() {}\n")
+        .context("failed to write rustc target-cpu probe source")?;
+    drop(stdin);
+    let success = child.wait()?.success();
+    let _ = fs::remove_file(&object_path);
+    Ok(success)
 }
 
 fn cfg_value(cfg: &str, key: &str) -> Option<String> {
@@ -3290,6 +3529,7 @@ fn classify_target_cpu(cpu: &str, arch: &str, baseline_cpu: &str) -> TargetKind 
                 || c.contains("goldmont")
                 || c.contains("gracemont")
                 || c.contains("forest")
+                || matches!(c, "bonnell" | "slm" | "tremont")
                 || c == "grandridge" =>
             {
                 TargetKind::X86IntelAtom
@@ -3297,11 +3537,18 @@ fn classify_target_cpu(cpu: &str, arch: &str, baseline_cpu: &str) -> TargetKind 
             c if c.contains("lake")
                 || c.contains("well")
                 || c.contains("bridge")
+                || c.starts_with("core_")
+                || c.starts_with("core-")
+                || c.starts_with("corei")
                 || matches!(c, "nocona" | "core2" | "penryn" | "nehalem" | "westmere") =>
             {
                 TargetKind::X86IntelCore
             }
-            c if c.contains("rapids") || c.contains("skx") || c.contains("skylake-avx512") => {
+            c if c.contains("rapids")
+                || c.contains("skx")
+                || c.contains("skylake-avx512")
+                || matches!(c, "knl" | "knm" | "mic_avx512") =>
+            {
                 TargetKind::X86IntelXeon
             }
             _ => TargetKind::X86AmdOther,
@@ -3735,6 +3982,85 @@ mod tests {
     }
 
     #[test]
+    fn score_report_orders_and_prints_selector_scores() {
+        let mut avx512 = FeatureMask::EMPTY;
+        avx512.insert(crate::feature_mask::Feature::Avx512F);
+        let mut avx2 = FeatureMask::EMPTY;
+        avx2.insert(crate::feature_mask::Feature::Avx2);
+
+        let host = HostInfo {
+            arch: TargetArch::X86_64,
+            features: avx512,
+            identity: CpuIdentity::X86 {
+                vendor: X86Vendor::Amd,
+                family: 26,
+                model: 1,
+                stepping: 0,
+            },
+            heterogeneous: false,
+        };
+        let metas = [
+            VariantMeta {
+                target_cpu: "x86-64-v4",
+                required_features: avx512,
+                rank_features: avx512,
+                rank_feature_count: avx512.count(),
+                feature_tier: 1,
+                target_kind: TargetKind::X86NeutralLevel { level: 4 },
+            },
+            VariantMeta {
+                target_cpu: "znver5",
+                required_features: avx512,
+                rank_features: avx512,
+                rank_feature_count: avx512.count(),
+                feature_tier: 2,
+                target_kind: TargetKind::X86AmdZen { generation: 5 },
+            },
+            VariantMeta {
+                target_cpu: "generic",
+                required_features: FeatureMask::EMPTY,
+                rank_features: FeatureMask::EMPTY,
+                rank_feature_count: 0,
+                feature_tier: 0,
+                target_kind: TargetKind::Generic,
+            },
+        ];
+        let variants = [
+            ProbeVariant {
+                target_cpu: "x86-64-v4".to_string(),
+                required_features: avx512,
+                rank_features: avx512,
+                feature_names: vec!["avx512f".to_string()],
+                feature_tier: 1,
+            },
+            ProbeVariant {
+                target_cpu: "znver5".to_string(),
+                required_features: avx512,
+                rank_features: avx512,
+                feature_names: vec!["avx512f".to_string()],
+                feature_tier: 2,
+            },
+            ProbeVariant {
+                target_cpu: "generic".to_string(),
+                required_features: FeatureMask::EMPTY,
+                rank_features: avx2,
+                feature_names: vec!["avx2".to_string()],
+                feature_tier: 0,
+            },
+        ];
+
+        let report = format_score_report("x86_64-unknown-linux-gnu", host, &metas, &variants, 2);
+
+        assert!(report.contains("cargo-sonic score"));
+        assert!(report.contains("selected=znver5"));
+        assert!(
+            report.contains("rank=1 target_cpu=znver5 exact=2 vendor_affinity=1 feature_score=")
+        );
+        assert!(report.contains("rank=2 target_cpu=x86-64-v4"));
+        assert!(report.contains("skipped=2"));
+    }
+
+    #[test]
     fn configured_collision_emits_warning() {
         let warnings = analyze_warnings(
             &BTreeMap::from([
@@ -3793,6 +4119,18 @@ mod tests {
             TargetKind::X86IntelCore
         );
         assert_eq!(
+            classify_target_cpu("core_5th_gen_avx", "x86_64", "x86-64"),
+            TargetKind::X86IntelCore
+        );
+        assert_eq!(
+            classify_target_cpu("slm", "x86_64", "x86-64"),
+            TargetKind::X86IntelAtom
+        );
+        assert_eq!(
+            classify_target_cpu("knl", "x86_64", "x86-64"),
+            TargetKind::X86IntelXeon
+        );
+        assert_eq!(
             classify_target_cpu("znver5", "x86_64", "x86-64"),
             TargetKind::X86AmdZen { generation: 5 }
         );
@@ -3800,6 +4138,45 @@ mod tests {
             classify_target_cpu("x86-64", "x86_64", "x86-64"),
             TargetKind::Generic
         );
+    }
+
+    #[test]
+    fn score_filters_cross_vendor_x86_targets() {
+        let amd = HostInfo {
+            arch: TargetArch::X86_64,
+            features: FeatureMask::EMPTY,
+            identity: CpuIdentity::X86 {
+                vendor: X86Vendor::Amd,
+                family: 26,
+                model: 1,
+                stepping: 0,
+            },
+            heterogeneous: false,
+        };
+        assert!(score_target_kind_matches_host(
+            amd,
+            TargetKind::X86AmdZen { generation: 5 }
+        ));
+        assert!(score_target_kind_matches_host(
+            amd,
+            TargetKind::X86NeutralLevel { level: 4 }
+        ));
+        assert!(score_target_kind_matches_host(
+            amd,
+            classify_target_cpu("x86-64-v4", "x86_64", "x86-64")
+        ));
+        assert!(!score_target_kind_matches_host(
+            amd,
+            TargetKind::X86IntelCore
+        ));
+        assert!(!score_target_kind_matches_host(
+            amd,
+            classify_target_cpu("tigerlake", "x86_64", "x86-64")
+        ));
+        assert!(!score_target_kind_matches_host(
+            amd,
+            classify_target_cpu("knl", "x86_64", "x86-64")
+        ));
     }
 
     #[test]
