@@ -38,21 +38,36 @@ The difference between a generic build and one tuned for a specific
 microarchitecture can be substantial, particularly for compute-heavy tasks where
 the compiler can leverage auto-vectorization.
 
-In the CPU benchmark included in the examples folder, a CPU-heavy floating point
-kernel repeatedly updates three large `f32` buffers and accumulates a checksum.
-On a Raptor Lake host, the performance delta is clear:
+The examples folder includes two release-mode benchmarks. The first is an
+aggressive CPU-heavy floating point kernel that repeatedly updates three large
+`f32` buffers and accumulates a checksum. On a Raptor Lake host, the performance
+delta is clear:
 
 | Selection Mode | Target CPU | Execution Time |
 | --- | --- | ---: |
 | Sonic (Optimized) | `raptorlake` | 154 ms |
 | Baseline Fallback | `x86-64` | 2771 ms |
 
+The second benchmark is intentionally less specialized. It uses `ndarray` matrix
+multiplication and array transforms instead of a hand-written element-wise hot
+loop. On the same Raptor Lake host, a local release run with `n=384` and
+`iterations=48` produced these median times over five runs:
+
+| Benchmark | Selection Mode | Target CPU | Execution Time |
+| --- | --- | --- | ---: |
+| `examples/ndarray-benchmark` | Sonic (Optimized) | `raptorlake` | 49 ms |
+| `examples/ndarray-benchmark` | Baseline Fallback | `x86-64` | 66 ms |
+
+This is a more realistic result: useful for this workload, but nowhere near the
+extreme delta from the synthetic element-wise benchmark.
+
 ### Optimized Portability
 
-`cargo-sonic` removes the need to choose between a single portable image and
-multiple hardware-specific builds. By packaging multiple optimized payloads into
-one fat executable, it lets the application negotiate with the silicon at
-runtime.
+`cargo-sonic` is useful when you want one Linux artifact that can run across a
+mixed fleet, but you still want the compiler to produce code for several CPU
+families. It is not a replacement for `-C target-cpu=native` when you already
+know the deployment machine, and it is not a general substitute for targeted
+runtime dispatch in a small hot loop.
 
 - **Microarchitecture tuning:** enables the compiler to use efficient
   instruction weights and vectorization strategies for the specific host.
@@ -61,9 +76,97 @@ runtime.
 - **Infrastructure simplicity:** provides the performance of specialized builds
   within a single portable deployment unit.
 
-By resolving this at the loader level, `cargo-sonic` lets Rust applications use
-more of the underlying hardware without manual dispatch code or complex CI/CD
-pipelines.
+By resolving selection at the loader level, `cargo-sonic` lets Rust applications
+use more of the underlying hardware without writing application-level dispatch
+code. The cost is that payloads are whole binaries, so size and build time scale
+with the number of selected target CPUs.
+
+## Tradeoffs
+
+`cargo-sonic` is deliberately a coarse-grained tool: it builds complete payload
+binaries for multiple `target-cpu` values and selects one at process startup.
+That has clear costs.
+
+### Binary Size
+
+The embedded loader stores one payload per target CPU plus the implicit baseline
+payload. Without compression, final binary size is roughly proportional to the
+number of payloads. Rust binaries often link dependencies statically, so this
+can be a large increase.
+
+Use a small target list. Prefer broad levels such as `x86-64-v3`/`x86-64-v4`
+when they cover your fleet, and add concrete CPUs only when you have evidence
+that they matter. `--compress=zstd` can reduce artifact size, but it is not free:
+compressed payloads must be decompressed before execution, and dictionary
+compression is only useful when it wins after accounting for dictionary and
+decoder overhead.
+
+For container images, `--loader=bundle` is often the more practical layout. It
+keeps a small launcher at the normal binary path and stores payloads next to it
+in `<bin>.bundle/`, which can preserve fast startup for uncompressed payloads.
+
+### Build Time
+
+Each target CPU is a real Cargo build with its own target directory and linker
+step. That is required because `target-cpu` and `target-feature` can affect code
+generation, inlining, and crates that compile target-specific code.
+
+Use `--parallelism` on CI builders with enough cores and memory:
+
+```bash
+cargo sonic --target-cpus=x86-64-v3,znver5 --parallelism=2 build --release
+```
+
+Build caches such as `sccache` can help, but LTO and final codegen/link steps
+still run per payload.
+
+### Startup And Memory
+
+The loader does not make Linux load every embedded payload into resident memory.
+The final executable is mapped by the kernel, and only touched pages become
+resident. However, embedded mode must still materialize the selected payload
+before `execveat`, either through the fast filesystem path or by copying into a
+`memfd`. Large debug binaries and short-lived CLI tools can therefore start much
+slower than the plain binary.
+
+Some constrained environments also care about virtual memory limits even when
+RSS stays low. Benchmark with the same container limits and filesystem you use
+in production.
+
+### Expected Performance
+
+The example benchmark is intentionally CPU-heavy and shows a case where LLVM can
+make a large difference from target-specific code generation. Most programs will
+not see that kind of speedup. I/O-bound services, database wrappers, and small
+CLIs may see little or no benefit.
+
+`cargo-sonic` is a better fit for:
+
+- CPU-heavy servers and workers
+- long-running services where startup is amortized
+- analytics, compression, search, simulation, media, or storage engines
+- one Docker image or binary that runs across a mixed VM/cloud fleet
+
+It is usually a poor fit for:
+
+- startup-sensitive CLI tools
+- tiny binaries where size matters more than throughput
+- deployments pinned to one known CPU model
+- embedded or storage-constrained devices
+
+### Relation To Function Multiversioning
+
+Function-level multiversioning and manual runtime dispatch can be more precise:
+only hot functions are duplicated, and the rest of the binary stays generic.
+That can produce a smaller artifact and lower startup cost. It also requires the
+application or libraries to be structured around dispatch points, and it only
+helps code that has been explicitly multiversioned.
+
+`cargo-sonic` instead asks LLVM to optimize the whole binary for each selected
+target CPU. That is simpler to apply to an existing application, but it is a
+bigger hammer. Use function-level dispatch for narrow hot paths when you can;
+use `cargo-sonic` when whole-program compiler tuning and deployment simplicity
+are the tradeoff you want.
 
 ## Status
 
@@ -87,22 +190,6 @@ Contributions and bug reports are welcome, especially reports from real
 hardware. CPU feature exposure varies across bare metal, virtual machines, cloud
 instances, firmware, kernels, and hypervisors, so real host reports are useful
 for improving selection safety and coverage.
-
-## Startup Cost
-
-`cargo-sonic` optimizes code generation for the selected CPU, not process
-startup. The generated executable is a selector plus embedded payload binaries,
-so startup can be slower than the plain binary, especially for very large debug
-builds or short-lived CLI tools.
-
-On reflink-capable filesystems, the loader tries to execute the selected payload
-through an unnamed cloned tmpfile. If that fast path is unavailable, it falls
-back to copying the selected payload into a `memfd` before `execveat`, and that
-copy cost is proportional to the payload size.
-
-Benchmark before using `cargo-sonic` for startup-sensitive commands. It is a
-better fit for servers, daemons, and other long-running applications where the
-one-time startup cost is amortized.
 
 ## Install
 
@@ -310,7 +397,8 @@ Debug output includes:
 
 ## Example
 
-See [examples/cpu-benchmark](examples/cpu-benchmark).
+See [examples/cpu-benchmark](examples/cpu-benchmark) and
+[examples/ndarray-benchmark](examples/ndarray-benchmark).
 
 It has a `justfile`:
 
@@ -321,9 +409,9 @@ just run
 just check-loader
 ```
 
-The example builds in release mode and runs a CPU-heavy floating point kernel
-implemented directly in the example, with no crate-level runtime CPU dispatch.
-On a Raptor Lake host, `just run` prints:
+The CPU benchmark builds in release mode and runs a CPU-heavy floating point
+kernel implemented directly in the example, with no crate-level runtime CPU
+dispatch. On a Raptor Lake host, `just run` prints:
 
 ```text
 selected target-cpu: raptorlake
@@ -336,6 +424,15 @@ just compare
 ```
 
 The loader itself prints nothing.
+
+The ndarray benchmark uses a general-purpose numeric crate:
+
+```bash
+cd examples/ndarray-benchmark
+just compare
+```
+
+It is intended as a less aggressive benchmark for ordinary Rust numeric code.
 
 ## Supported Targets
 
@@ -438,6 +535,7 @@ no NEEDED libc
 crates/cargo-sonic          Cargo subcommand, build orchestration, and loader logic
 crates/xtask                automation and QEMU matrix runner
 examples/cpu-benchmark    minimal CPU benchmark example
+examples/ndarray-benchmark ndarray-based benchmark example
 tests/cpu-fixtures          fixture-driven modern CPU selector suites
 tests/fixtures              integration fixtures
 tests/qemu                  QEMU system-mode matrix
