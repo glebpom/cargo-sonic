@@ -135,16 +135,27 @@ in production.
 
 ### Expected Performance
 
-The example benchmark is intentionally CPU-heavy and shows a case where LLVM can
-make a large difference from target-specific code generation. Most programs will
-not see that kind of speedup. I/O-bound services, database wrappers, and small
-CLIs may see little or no benefit.
+The synthetic example benchmark is intentionally CPU-heavy and shows a case
+where LLVM can make a large difference from target-specific code generation.
+Real applications should be judged by where they spend CPU time under load.
+
+Any CPU-bound part of an application may benefit, including services commonly
+described as I/O-heavy. Request parsing, validation, routing, compression,
+serialization, query planning, protocol handling, checksums, filtering, and
+business logic all execute on the CPU and can affect tail latency when the
+service is saturated. The more time a workload spends in such code, the more
+room there is for target-specific code generation to matter.
+
+The opposite is also true: the closer a service is to a trivial byte-copy or
+syscall-forwarding path, the less likely `cargo-sonic` is to improve throughput
+or latency.
 
 `cargo-sonic` is a better fit for:
 
-- CPU-heavy servers and workers
+- CPU-bound servers and workers
 - long-running services where startup is amortized
-- analytics, compression, search, simulation, media, or storage engines
+- analytics, compression, search, simulation, media, storage engines, or
+  nontrivial network services
 - one Docker image or binary that runs across a mixed VM/cloud fleet
 
 It is usually a poor fit for:
