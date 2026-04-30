@@ -1614,20 +1614,35 @@ enum PayloadRustflags {
 }
 
 fn payload_rustflags(target: &str, cpu: &str) -> PayloadRustflags {
+    rustflags_for_target(target, [target_cpu_rustflag(cpu)])
+}
+
+fn rustflags_for_target(
+    target: &str,
+    rustflags: impl IntoIterator<Item = String>,
+) -> PayloadRustflags {
+    let rustflags = rustflags.into_iter().collect::<Vec<_>>();
     if let Some(flags) = std::env::var_os("CARGO_ENCODED_RUSTFLAGS") {
-        return PayloadRustflags::Encoded(append_encoded_rustflag(flags, target_cpu_rustflag(cpu)));
+        return PayloadRustflags::Encoded(append_encoded_rustflags(flags, &rustflags));
     }
 
     if let Some(flags) = std::env::var_os("RUSTFLAGS") {
         let mut flags = flags;
-        if !flags.is_empty() {
+        if !flags.is_empty() && !rustflags.is_empty() {
             flags.push(" ");
         }
-        flags.push(target_cpu_rustflag(cpu));
+        flags.push(rustflags.join(" "));
         return PayloadRustflags::Plain(flags);
     }
 
-    PayloadRustflags::CargoConfig(target_cpu_config_arg(target, cpu))
+    PayloadRustflags::CargoConfig(target_rustflags_config_arg(target, &rustflags))
+}
+
+fn append_encoded_rustflags(mut flags: OsString, rustflags: &[String]) -> OsString {
+    for flag in rustflags {
+        flags = append_encoded_rustflag(flags, flag.clone());
+    }
+    flags
 }
 
 fn append_encoded_rustflag(mut flags: OsString, flag: String) -> OsString {
@@ -1643,15 +1658,23 @@ fn target_cpu_rustflag(cpu: &str) -> String {
     format!("-Ctarget-cpu={cpu}")
 }
 
-fn target_cpu_config_arg(target: &str, cpu: &str) -> String {
+fn target_rustflags_config_arg(target: &str, rustflags: &[String]) -> String {
     format!(
-        "target.{target}.rustflags=[\"{}\"]",
-        escape_toml_string(&target_cpu_rustflag(cpu))
+        "target.{target}.rustflags=[{}]",
+        rustflags
+            .iter()
+            .map(|flag| format!("\"{}\"", escape_toml_string(flag)))
+            .collect::<Vec<_>>()
+            .join(",")
     )
 }
 
 fn escape_toml_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn split_rustflags(flags: &str) -> Vec<String> {
+    flags.split_whitespace().map(str::to_string).collect()
 }
 
 fn forward_tagged_output(target_cpu: String, mut input: impl Read + Send + 'static) -> Result<()> {
@@ -2126,12 +2149,23 @@ fn build_loader(loader_dir: &Utf8Path, target: &str, profile: &str) -> Result<Ut
     if profile == "release" {
         cmd.arg("--release");
     }
-    let mut rustflags = loader_rustflags(target).to_string();
+    let mut rustflags = split_rustflags(loader_rustflags(target));
     if loader_dir.join("auditable.o").exists() {
-        rustflags
-            .push_str(" -C link-arg=auditable.o -C link-arg=-Wl,-u,__cargo_sonic_auditable_dep_v0");
+        rustflags.extend(split_rustflags(
+            "-C link-arg=auditable.o -C link-arg=-Wl,-u,__cargo_sonic_auditable_dep_v0",
+        ));
     }
-    cmd.env("RUSTFLAGS", rustflags);
+    match rustflags_for_target(target, rustflags) {
+        PayloadRustflags::Encoded(flags) => {
+            cmd.env("CARGO_ENCODED_RUSTFLAGS", flags);
+        }
+        PayloadRustflags::Plain(flags) => {
+            cmd.env("RUSTFLAGS", flags);
+        }
+        PayloadRustflags::CargoConfig(config) => {
+            cmd.args(["--config", config.as_str()]);
+        }
+    }
     let status = cmd
         .status()
         .context("failed to spawn cargo for generated loader")?;
@@ -3877,8 +3911,20 @@ mod tests {
     #[test]
     fn target_cpu_config_arg_escapes_toml_string() {
         assert_eq!(
-            target_cpu_config_arg("x86_64-unknown-linux-gnu", "quoted\"cpu"),
+            target_rustflags_config_arg(
+                "x86_64-unknown-linux-gnu",
+                &[target_cpu_rustflag("quoted\"cpu")]
+            ),
             "target.x86_64-unknown-linux-gnu.rustflags=[\"-Ctarget-cpu=quoted\\\"cpu\"]"
+        );
+    }
+
+    #[test]
+    fn target_rustflags_config_arg_preserves_loader_flags_as_target_config() {
+        let flags = split_rustflags("-C panic=abort -C link-arg=-nostartfiles");
+        assert_eq!(
+            target_rustflags_config_arg("aarch64-unknown-linux-gnu", &flags),
+            "target.aarch64-unknown-linux-gnu.rustflags=[\"-C\",\"panic=abort\",\"-C\",\"link-arg=-nostartfiles\"]"
         );
     }
 
