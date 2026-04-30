@@ -1476,7 +1476,17 @@ fn build_payload_variant(ctx: &PayloadBuildContext, cpu: &str) -> Result<Payload
     cmd.args(["--color", resolved_cargo_color(ctx.cargo_args.color)]);
     cmd.args(["--message-format", "json-render-diagnostics"]);
     cmd.args(["--target-dir", target_dir.as_str()]);
-    cmd.env("CARGO_ENCODED_RUSTFLAGS", encoded_rustflags(cpu));
+    match payload_rustflags(&ctx.target, cpu) {
+        PayloadRustflags::Encoded(flags) => {
+            cmd.env("CARGO_ENCODED_RUSTFLAGS", flags);
+        }
+        PayloadRustflags::Plain(flags) => {
+            cmd.env("RUSTFLAGS", flags);
+        }
+        PayloadRustflags::CargoConfig(config) => {
+            cmd.args(["--config", config.as_str()]);
+        }
+    }
     cmd.stdout(Stdio::piped());
     if ctx.tag_output {
         cmd.stderr(Stdio::piped());
@@ -1596,14 +1606,75 @@ fn resolved_cargo_color(color: Option<ColorMode>) -> &'static str {
     }
 }
 
-fn encoded_rustflags(cpu: &str) -> OsString {
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum PayloadRustflags {
+    Encoded(OsString),
+    Plain(OsString),
+    CargoConfig(String),
+}
+
+fn payload_rustflags(target: &str, cpu: &str) -> PayloadRustflags {
+    rustflags_for_target(target, [target_cpu_rustflag(cpu)])
+}
+
+fn rustflags_for_target(
+    target: &str,
+    rustflags: impl IntoIterator<Item = String>,
+) -> PayloadRustflags {
+    let rustflags = rustflags.into_iter().collect::<Vec<_>>();
+    if let Some(flags) = std::env::var_os("CARGO_ENCODED_RUSTFLAGS") {
+        return PayloadRustflags::Encoded(append_encoded_rustflags(flags, &rustflags));
+    }
+
+    if let Some(flags) = std::env::var_os("RUSTFLAGS") {
+        let mut flags = flags;
+        if !flags.is_empty() && !rustflags.is_empty() {
+            flags.push(" ");
+        }
+        flags.push(rustflags.join(" "));
+        return PayloadRustflags::Plain(flags);
+    }
+
+    PayloadRustflags::CargoConfig(target_rustflags_config_arg(target, &rustflags))
+}
+
+fn append_encoded_rustflags(mut flags: OsString, rustflags: &[String]) -> OsString {
+    for flag in rustflags {
+        flags = append_encoded_rustflag(flags, flag.clone());
+    }
+    flags
+}
+
+fn append_encoded_rustflag(mut flags: OsString, flag: String) -> OsString {
     let sep = '\x1f';
-    let mut flags = std::env::var_os("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
     if !flags.is_empty() {
         flags.push(sep.to_string());
     }
-    flags.push(format!("-Ctarget-cpu={cpu}"));
+    flags.push(flag);
     flags
+}
+
+fn target_cpu_rustflag(cpu: &str) -> String {
+    format!("-Ctarget-cpu={cpu}")
+}
+
+fn target_rustflags_config_arg(target: &str, rustflags: &[String]) -> String {
+    format!(
+        "target.{target}.rustflags=[{}]",
+        rustflags
+            .iter()
+            .map(|flag| format!("\"{}\"", escape_toml_string(flag)))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn escape_toml_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn split_rustflags(flags: &str) -> Vec<String> {
+    flags.split_whitespace().map(str::to_string).collect()
 }
 
 fn forward_tagged_output(target_cpu: String, mut input: impl Read + Send + 'static) -> Result<()> {
@@ -2078,12 +2149,23 @@ fn build_loader(loader_dir: &Utf8Path, target: &str, profile: &str) -> Result<Ut
     if profile == "release" {
         cmd.arg("--release");
     }
-    let mut rustflags = loader_rustflags(target).to_string();
+    let mut rustflags = split_rustflags(loader_rustflags(target));
     if loader_dir.join("auditable.o").exists() {
-        rustflags
-            .push_str(" -C link-arg=auditable.o -C link-arg=-Wl,-u,__cargo_sonic_auditable_dep_v0");
+        rustflags.extend(split_rustflags(
+            "-C link-arg=auditable.o -C link-arg=-Wl,-u,__cargo_sonic_auditable_dep_v0",
+        ));
     }
-    cmd.env("RUSTFLAGS", rustflags);
+    match rustflags_for_target(target, rustflags) {
+        PayloadRustflags::Encoded(flags) => {
+            cmd.env("CARGO_ENCODED_RUSTFLAGS", flags);
+        }
+        PayloadRustflags::Plain(flags) => {
+            cmd.env("RUSTFLAGS", flags);
+        }
+        PayloadRustflags::CargoConfig(config) => {
+            cmd.args(["--config", config.as_str()]);
+        }
+    }
     let status = cmd
         .status()
         .context("failed to spawn cargo for generated loader")?;
@@ -3614,6 +3696,10 @@ fn make_executable(_path: &Utf8Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const TARGET_RUSTFLAGS_ENV: &str = "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS";
 
     #[test]
     fn parses_aarch64_midr_identity() {
@@ -3810,6 +3896,76 @@ mod tests {
     }
 
     #[test]
+    fn payload_rustflags_use_cargo_config_by_default() {
+        with_rustflags_env(|| {
+            assert_eq!(
+                payload_rustflags("aarch64-unknown-linux-gnu", "neoverse-v1"),
+                PayloadRustflags::CargoConfig(
+                    "target.aarch64-unknown-linux-gnu.rustflags=[\"-Ctarget-cpu=neoverse-v1\"]"
+                        .into()
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn target_cpu_config_arg_escapes_toml_string() {
+        assert_eq!(
+            target_rustflags_config_arg(
+                "x86_64-unknown-linux-gnu",
+                &[target_cpu_rustflag("quoted\"cpu")]
+            ),
+            "target.x86_64-unknown-linux-gnu.rustflags=[\"-Ctarget-cpu=quoted\\\"cpu\"]"
+        );
+    }
+
+    #[test]
+    fn target_rustflags_config_arg_preserves_loader_flags_as_target_config() {
+        let flags = split_rustflags("-C panic=abort -C link-arg=-nostartfiles");
+        assert_eq!(
+            target_rustflags_config_arg("aarch64-unknown-linux-gnu", &flags),
+            "target.aarch64-unknown-linux-gnu.rustflags=[\"-C\",\"panic=abort\",\"-C\",\"link-arg=-nostartfiles\"]"
+        );
+    }
+
+    #[test]
+    fn payload_rustflags_preserve_cargo_encoded_rustflags_precedence() {
+        with_rustflags_env(|| {
+            unsafe {
+                std::env::set_var("CARGO_ENCODED_RUSTFLAGS", "-Clto\x1f-Cpanic=abort");
+                std::env::set_var("RUSTFLAGS", "-C debuginfo=1");
+                std::env::set_var(TARGET_RUSTFLAGS_ENV, "-C link-arg=-fuse-ld=lld");
+            }
+
+            let PayloadRustflags::Encoded(flags) =
+                payload_rustflags("aarch64-unknown-linux-gnu", "neoverse-n1")
+            else {
+                panic!("expected encoded rustflags");
+            };
+
+            assert_eq!(
+                decode_encoded_rustflags(&flags),
+                vec!["-Clto", "-Cpanic=abort", "-Ctarget-cpu=neoverse-n1"]
+            );
+        });
+    }
+
+    #[test]
+    fn payload_rustflags_preserve_plain_rustflags_precedence() {
+        with_rustflags_env(|| {
+            unsafe {
+                std::env::set_var("RUSTFLAGS", "-C debuginfo=1");
+                std::env::set_var(TARGET_RUSTFLAGS_ENV, "-C link-arg=-fuse-ld=lld");
+            }
+
+            assert_eq!(
+                payload_rustflags("aarch64-unknown-linux-gnu", "neoverse-n1"),
+                PayloadRustflags::Plain(OsString::from("-C debuginfo=1 -Ctarget-cpu=neoverse-n1"))
+            );
+        });
+    }
+
+    #[test]
     fn generated_aarch64_loader_does_not_read_midr_el1_before_fallbacks() {
         let source = generated_main(
             "aarch64-unknown-linux-musl",
@@ -3818,6 +3974,54 @@ mod tests {
         );
         assert!(source.contains("read_small_file_hex"));
         assert!(!source.contains("let midr = unsafe { read_midr_el1() };"));
+    }
+
+    fn with_rustflags_env(test: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let vars = [
+            "CARGO_ENCODED_RUSTFLAGS".to_string(),
+            "RUSTFLAGS".to_string(),
+            TARGET_RUSTFLAGS_ENV.to_string(),
+        ];
+        let _restore = EnvRestore {
+            saved: vars
+                .iter()
+                .map(|var| (var.clone(), std::env::var_os(var)))
+                .collect(),
+        };
+        unsafe {
+            for var in &vars {
+                std::env::remove_var(var);
+            }
+        }
+
+        test();
+    }
+
+    struct EnvRestore {
+        saved: Vec<(String, Option<OsString>)>,
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            unsafe {
+                for (var, value) in self.saved.drain(..) {
+                    if let Some(value) = value {
+                        std::env::set_var(var, value);
+                    } else {
+                        std::env::remove_var(var);
+                    }
+                }
+            }
+        }
+    }
+
+    fn decode_encoded_rustflags(flags: &OsString) -> Vec<String> {
+        flags
+            .to_string_lossy()
+            .split('\x1f')
+            .map(str::to_string)
+            .collect()
     }
 
     #[test]
