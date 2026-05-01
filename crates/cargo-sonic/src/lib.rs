@@ -2181,11 +2181,11 @@ fn build_loader(loader_dir: &Utf8Path, target: &str, profile: &str) -> Result<Ut
 
 fn loader_rustflags(target: &str) -> &'static str {
     if target.starts_with("x86_64-") && target.contains("-musl") {
-        "-C panic=abort -C code-model=large -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-static"
+        "-C panic=abort -C code-model=large -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-nostartfiles -C link-arg=-static"
     } else if target.starts_with("x86_64-") {
         "-C panic=abort -C code-model=large -C target-feature=+crt-static -C relocation-model=static -C link-arg=-nostartfiles -C link-arg=-static"
     } else if target.contains("-musl") {
-        "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-static"
+        "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-nostartfiles -C link-arg=-static"
     } else {
         "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-arg=-nostartfiles -C link-arg=-static"
     }
@@ -3881,10 +3881,10 @@ mod tests {
     }
 
     #[test]
-    fn musl_loader_rustflags_skip_startup_files() {
+    fn musl_loader_rustflags_skip_crt_startup_files() {
         let flags = loader_rustflags("aarch64-unknown-linux-musl");
         assert!(flags.contains("-C link-self-contained=no"));
-        assert!(!flags.contains("-C link-arg=-nostartfiles"));
+        assert!(flags.contains("-C link-arg=-nostartfiles"));
     }
 
     #[test]
