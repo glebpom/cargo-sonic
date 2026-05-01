@@ -515,8 +515,9 @@ zstd-compressed payloads, embedded and bundle loaders, and normal host builds
 plus cross/explicit target builds where applicable. Dynamic musl cases require a
 dynamic musl library directory with `libc.so` and `libgcc_s.so`; set
 `SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR` when those libraries are not available in the
-Rust target sysroot. Host `qemu-user`, host rustc, and checked-in
-selected-target goldens are intentionally not used as correctness oracles.
+Rust target sysroot. Missing dynamic musl inputs are hard setup errors, not
+skips. Host `qemu-user`, host rustc, and checked-in selected-target goldens are
+intentionally not used as correctness oracles.
 The generated test binaries include only the rustc target-cpus needed by the
 configured QEMU cases; cargo-sonic adds the architecture baseline payload
 implicitly.

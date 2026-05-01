@@ -70,16 +70,9 @@ fn qemu_system() -> Result<()> {
             continue;
         }
         let variants = rustc_payload_target_cpus(&asset_dir, arch, &cases)?;
+        ensure_qemu_build_variants_available(arch, &host_target)?;
         let mut apps = Vec::new();
         for build_variant in qemu_build_variants(arch, &host_target) {
-            if let Some(reason) = qemu_build_variant_skip_reason(arch, build_variant) {
-                println!(
-                    "skip qemu build variant {} {}: {reason}",
-                    arch.name,
-                    build_variant.id()
-                );
-                continue;
-            }
             apps.push(build_qemu_test_app(
                 &root,
                 &asset_dir,
@@ -370,19 +363,19 @@ fn qemu_build_variants(arch: &SystemArch, host_target: &str) -> Vec<QemuBuildVar
     variants
 }
 
-fn qemu_build_variant_skip_reason(
-    arch: &SystemArch,
-    build_variant: QemuBuildVariant,
-) -> Option<String> {
-    if matches!(build_variant.runtime, QemuRuntime::MuslDynamic)
-        && musl_dynamic_lib_dir(&arch.target).is_none()
-    {
-        return Some(
-            "dynamic musl libc/libgcc_s were not found; set SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR"
-                .to_string(),
-        );
+fn ensure_qemu_build_variants_available(arch: &SystemArch, host_target: &str) -> Result<()> {
+    for build_variant in qemu_build_variants(arch, host_target) {
+        if matches!(build_variant.runtime, QemuRuntime::MuslDynamic) {
+            musl_dynamic_lib_dir(&arch.target).with_context(|| {
+                format!(
+                    "qemu build variant {} {} requires dynamic musl libc/libgcc_s; set SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR to a directory containing libc.so and libgcc_s.so",
+                    arch.name,
+                    build_variant.id()
+                )
+            })?;
+        }
     }
-    None
+    Ok(())
 }
 
 fn format_qemu_failure_report(
@@ -1520,9 +1513,12 @@ fn install_musl_dynamic_runtime(rootfs: &Path, arch: &SystemArch) -> Result<()> 
     if !arch.target.contains("-musl") {
         return Ok(());
     }
-    let Some(lib_dir) = musl_dynamic_lib_dir(&arch.target) else {
-        return Ok(());
-    };
+    let lib_dir = musl_dynamic_lib_dir(&arch.target).with_context(|| {
+        format!(
+            "dynamic musl runtime for {} is required; set SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR",
+            arch.target
+        )
+    })?;
     let rootfs_lib = rootfs.join("lib");
     fs::create_dir_all(&rootfs_lib)
         .with_context(|| format!("failed to create {}", rootfs_lib.display()))?;
