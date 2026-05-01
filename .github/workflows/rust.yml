@@ -28,6 +28,17 @@ jobs:
         just qemu-prepare
 
         sudo dpkg --add-architecture arm64
+        sudo sed -i '/^Types: deb/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+        
+        sudo tee /etc/apt/sources.list.d/ubuntu-arm64.sources >/dev/null <<'EOF'
+        Types: deb
+        URIs: http://ports.ubuntu.com/ubuntu-ports
+        Suites: noble noble-updates noble-backports noble-security
+        Components: main universe restricted multiverse
+        Architectures: arm64
+        Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+        EOF
+        
         sudo apt update
         sudo apt install -y musl:arm64 musl-dev:arm64 libgcc-s1:arm64
 
