@@ -19,7 +19,7 @@ target a generic architecture baseline. While this ensures the application
 "just works" everywhere, it prevents the compiler from using the specific
 capabilities of modern hardware.
 
-### The Auto-Vectorization Gap
+### The Compiler Optimization Gap
 
 Many high-performance libraries, such as cryptography or compression libraries,
 use manual runtime detection to switch between hand-written assembly
@@ -30,15 +30,19 @@ For general-purpose code, performance depends on the compiler. When LLVM is
 restricted to a generic target, it must be conservative. It cannot safely use
 modern instruction sets such as AVX-512, and it cannot apply
 microarchitecture-specific scheduling weights that optimize instruction ordering
-for a particular chip pipeline.
+for a particular chip pipeline. Target CPU selection can also change inlining,
+basic block placement, loop layout, and the final instruction layout that the
+processor frontend sees. Auto-vectorization matters, but it is not the only
+reason target-specific builds can be faster.
 
 ### Performance Impact
 
 The difference between a generic build and one tuned for a specific
 microarchitecture can be substantial, particularly for compute-heavy tasks where
-the compiler can leverage auto-vectorization.
+the compiler can use CPU-specific instructions, scheduling weights, and code
+layout decisions.
 
-The examples folder includes two release-mode benchmarks. The first is an
+The examples folder includes three release-mode benchmarks. The first is an
 aggressive CPU-heavy floating point kernel that repeatedly updates three large
 `f32` buffers and accumulates a checksum. On a Raptor Lake host, the performance
 delta is clear:
@@ -61,6 +65,20 @@ loop. On the same Raptor Lake host, a local release run with `n=384` and
 This is a more realistic result: useful for this workload, but nowhere near the
 extreme delta from the synthetic element-wise benchmark.
 
+The third benchmark, `examples/blake3-benchmark`, uses a crypto/hash library
+that already performs runtime CPU feature detection and dispatches to optimized
+implementations internally. It is useful for measuring workloads where
+`cargo-sonic` can still tune surrounding code, even when the dominant library
+code is already doing its own feature-based selection.
+
+Even in this extremely optimized case, a local run with `input-mib=64` and
+`iterations=8` still improved throughput when the loader selected `znver5`:
+
+| Benchmark | Selection Mode | Target CPU | Execution Time | Throughput |
+| --- | --- | --- | ---: | ---: |
+| `examples/blake3-benchmark` | Sonic (Optimized) | `znver5` | 79 ms | 6479.0 MiB/s |
+| `examples/blake3-benchmark` | Baseline Fallback | `x86-64` | 90 ms | 5674.9 MiB/s |
+
 ### Optimized Portability
 
 `cargo-sonic` is useful when you want one Linux artifact that can run across a
@@ -70,7 +88,8 @@ know the deployment machine, and it is not a general substitute for targeted
 runtime dispatch in a small hot loop.
 
 - **Microarchitecture tuning:** enables the compiler to use efficient
-  instruction weights and vectorization strategies for the specific host.
+  instruction weights, vectorization strategies, and code layout choices for the
+  specific host.
 - **Automated fallback:** includes a Rust baseline payload to preserve
   compatibility with legacy hardware or restricted environments.
 - **Infrastructure simplicity:** provides the performance of specialized builds

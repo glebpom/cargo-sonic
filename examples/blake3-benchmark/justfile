@@ -1,0 +1,26 @@
+set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+
+sonic_manifest := "../../crates/cargo-sonic/Cargo.toml"
+target_dir := env_var_or_default("CARGO_TARGET_DIR", env_var_or_default("CARGO_TARGET", "target"))
+fat_binary := target_dir + "/sonic/x86_64-unknown-linux-gnu/release/sonic-blake3-benchmark"
+
+default: build
+
+build:
+    cargo run --manifest-path {{sonic_manifest}} -- sonic --target-cpus=x86-64-v3,x86-64-v4,znver5,raptorlake build --release
+
+run: build
+    {{fat_binary}}
+
+run-baseline: build
+    CARGO_SONIC_ENABLE=0 {{fat_binary}}
+
+compare: build
+    echo "default selection"
+    {{fat_binary}}
+    echo
+    echo "forced baseline"
+    CARGO_SONIC_ENABLE=0 {{fat_binary}}
+
+clean:
+    rm -rf {{target_dir}}
