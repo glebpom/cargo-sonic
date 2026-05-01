@@ -23,5 +23,6 @@ jobs:
         cargo fmt --all --check
         cargo clippy --all
         cargo test
+        rustup target add aarch64-unknown-linux-musl
         just qemu-prepare
         SONIC_QEMU_JOBS=4 just qemu
