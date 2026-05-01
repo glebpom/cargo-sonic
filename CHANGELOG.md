@@ -4,6 +4,9 @@
 
 - Add `cargo sonic score` to rank rustc-supported target CPUs compatible with the current host without requiring `--target-cpus`.
 - Fix generated x86_64 GNU loaders so they no longer force the system linker path in CI.
+- Extend the QEMU suite to exercise glibc and musl static/dynamic payloads plus no-std payloads across plain/zstd compression, embedded/bundle loaders, and normal/cross compilation modes.
+- Build generated loaders with controlled rustflags so ambient Cargo target rustflags cannot make the loader CPU-specific.
+- Fix generated musl loaders so they do not pass unsupported `-nostartfiles` linker arguments to `rust-lld`.
 
 # 0.1.5
 

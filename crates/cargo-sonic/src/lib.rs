@@ -1645,6 +1645,10 @@ fn append_encoded_rustflags(mut flags: OsString, rustflags: &[String]) -> OsStri
     flags
 }
 
+fn encode_rustflags(rustflags: &[String]) -> OsString {
+    append_encoded_rustflags(OsString::new(), rustflags)
+}
+
 fn append_encoded_rustflag(mut flags: OsString, flag: String) -> OsString {
     let sep = '\x1f';
     if !flags.is_empty() {
@@ -1656,6 +1660,22 @@ fn append_encoded_rustflag(mut flags: OsString, flag: String) -> OsString {
 
 fn target_cpu_rustflag(cpu: &str) -> String {
     format!("-Ctarget-cpu={cpu}")
+}
+
+fn cargo_target_rustflags_env(target: &str) -> String {
+    format!(
+        "CARGO_TARGET_{}_RUSTFLAGS",
+        target
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    )
 }
 
 fn target_rustflags_config_arg(target: &str, rustflags: &[String]) -> String {
@@ -2155,17 +2175,10 @@ fn build_loader(loader_dir: &Utf8Path, target: &str, profile: &str) -> Result<Ut
             "-C link-arg=auditable.o -C link-arg=-Wl,-u,__cargo_sonic_auditable_dep_v0",
         ));
     }
-    match rustflags_for_target(target, rustflags) {
-        PayloadRustflags::Encoded(flags) => {
-            cmd.env("CARGO_ENCODED_RUSTFLAGS", flags);
-        }
-        PayloadRustflags::Plain(flags) => {
-            cmd.env("RUSTFLAGS", flags);
-        }
-        PayloadRustflags::CargoConfig(config) => {
-            cmd.args(["--config", config.as_str()]);
-        }
-    }
+    cmd.env_remove("RUSTFLAGS");
+    cmd.env_remove("CARGO_BUILD_RUSTFLAGS");
+    cmd.env_remove(cargo_target_rustflags_env(target));
+    cmd.env("CARGO_ENCODED_RUSTFLAGS", encode_rustflags(&rustflags));
     let status = cmd
         .status()
         .context("failed to spawn cargo for generated loader")?;
@@ -2181,11 +2194,11 @@ fn build_loader(loader_dir: &Utf8Path, target: &str, profile: &str) -> Result<Ut
 
 fn loader_rustflags(target: &str) -> &'static str {
     if target.starts_with("x86_64-") && target.contains("-musl") {
-        "-C panic=abort -C code-model=large -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-nostartfiles -C link-arg=-static"
+        "-C panic=abort -C code-model=large -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-static"
     } else if target.starts_with("x86_64-") {
         "-C panic=abort -C code-model=large -C target-feature=+crt-static -C relocation-model=static -C link-arg=-nostartfiles -C link-arg=-static"
     } else if target.contains("-musl") {
-        "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-nostartfiles -C link-arg=-static"
+        "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-static"
     } else {
         "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-arg=-nostartfiles -C link-arg=-static"
     }
@@ -3884,7 +3897,7 @@ mod tests {
     fn musl_loader_rustflags_skip_crt_startup_files() {
         let flags = loader_rustflags("aarch64-unknown-linux-musl");
         assert!(flags.contains("-C link-self-contained=no"));
-        assert!(flags.contains("-C link-arg=-nostartfiles"));
+        assert!(!flags.contains("-C link-arg=-nostartfiles"));
     }
 
     #[test]

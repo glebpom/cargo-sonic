@@ -488,9 +488,15 @@ just qemu
 
 The QEMU correctness suite is system-mode only. It must boot a controlled Linux
 guest for each CPU model listed in `tests/qemu/system.toml`, run rustc inside
-that guest with `-C target-cpu=native`, run both cargo-sonic loader strategies
-inside the same guest, and compare each loader-selected target against the
-rustc-derived expectation. Host `qemu-user`, host rustc, and checked-in
+that guest with `-C target-cpu=native`, run the cargo-sonic output matrix inside
+the same guest, and compare each loader-selected target against the rustc-derived
+expectation. The matrix covers glibc static/dynamic and musl static/dynamic
+`std` payloads where those targets are configured, no-std payloads, plain and
+zstd-compressed payloads, embedded and bundle loaders, and normal host builds
+plus cross/explicit target builds where applicable. Dynamic musl cases require a
+dynamic musl library directory with `libc.so` and `libgcc_s.so`; set
+`SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR` when those libraries are not available in the
+Rust target sysroot. Host `qemu-user`, host rustc, and checked-in
 selected-target goldens are intentionally not used as correctness oracles.
 The generated test binaries include only the rustc target-cpus needed by the
 configured QEMU cases; cargo-sonic adds the architecture baseline payload
