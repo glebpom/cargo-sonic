@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Add `cargo sonic score` to rank rustc-supported target CPUs compatible with the current host without requiring `--target-cpus`.
+- Add a `blake3` benchmark example for workloads that already use runtime CPU feature detection in a dependency.
 - Fix generated x86_64 GNU loaders so they no longer force the system linker path in CI.
 
 # 0.1.5
