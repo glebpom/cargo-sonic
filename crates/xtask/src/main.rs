@@ -70,16 +70,9 @@ fn qemu_system() -> Result<()> {
             continue;
         }
         let variants = rustc_payload_target_cpus(&asset_dir, arch, &cases)?;
+        ensure_qemu_build_variants_available(arch, &host_target)?;
         let mut apps = Vec::new();
         for build_variant in qemu_build_variants(arch, &host_target) {
-            if let Some(reason) = qemu_build_variant_skip_reason(arch, build_variant) {
-                println!(
-                    "skip qemu build variant {} {}: {reason}",
-                    arch.name,
-                    build_variant.id()
-                );
-                continue;
-            }
             apps.push(build_qemu_test_app(
                 &root,
                 &asset_dir,
@@ -237,6 +230,9 @@ struct GuestComparison {
     native: String,
     selected: String,
     result: String,
+    failed_variant: Option<String>,
+    failed_app_status: Option<String>,
+    failed_reason: Option<String>,
 }
 
 struct QemuTestApp {
@@ -370,19 +366,19 @@ fn qemu_build_variants(arch: &SystemArch, host_target: &str) -> Vec<QemuBuildVar
     variants
 }
 
-fn qemu_build_variant_skip_reason(
-    arch: &SystemArch,
-    build_variant: QemuBuildVariant,
-) -> Option<String> {
-    if matches!(build_variant.runtime, QemuRuntime::MuslDynamic)
-        && musl_dynamic_lib_dir(&arch.target).is_none()
-    {
-        return Some(
-            "dynamic musl libc/libgcc_s were not found; set SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR"
-                .to_string(),
-        );
+fn ensure_qemu_build_variants_available(arch: &SystemArch, host_target: &str) -> Result<()> {
+    for build_variant in qemu_build_variants(arch, host_target) {
+        if matches!(build_variant.runtime, QemuRuntime::MuslDynamic) {
+            musl_dynamic_lib_dir(&arch.target).with_context(|| {
+                format!(
+                    "qemu build variant {} {} requires dynamic musl libc; set SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR to a directory containing libc.so",
+                    arch.name,
+                    build_variant.id()
+                )
+            })?;
+        }
     }
-    None
+    Ok(())
 }
 
 fn format_qemu_failure_report(
@@ -407,8 +403,26 @@ fn format_qemu_failure_report(
         .as_ref()
         .map(|path| format!(" log={}", path.display()))
         .unwrap_or_default();
+    let failed_variant = err
+        .comparison
+        .as_ref()
+        .and_then(|comparison| comparison.failed_variant.as_deref())
+        .map(|variant| format!(" failed_variant={variant}"))
+        .unwrap_or_default();
+    let failed_app_status = err
+        .comparison
+        .as_ref()
+        .and_then(|comparison| comparison.failed_app_status.as_deref())
+        .map(|status| format!(" app_status={status}"))
+        .unwrap_or_default();
+    let failed_reason = err
+        .comparison
+        .as_ref()
+        .and_then(|comparison| comparison.failed_reason.as_deref())
+        .map(|reason| format!(" reason={reason}"))
+        .unwrap_or_default();
     format!(
-        "{arch} {variant} {cpu}: native={native} selected={selected} result={result} status={} message={}{}",
+        "{arch} {variant} {cpu}: native={native} selected={selected} result={result}{failed_variant}{failed_app_status}{failed_reason} status={} message={}{}",
         err.status, err.message, log
     )
 }
@@ -971,8 +985,9 @@ fn qemu_payload_rustflags(arch: &SystemArch, runtime: QemuRuntime) -> Result<Opt
                     QemuRuntime::MuslDynamic.label()
                 )
             })?;
+            let dynamic_linker = musl_dynamic_linker_path(&arch.target);
             Some(format!(
-                "-C\x1ftarget-feature=-crt-static\x1f-L\x1fnative={}",
+                "--cfg\x1fcargo_sonic_dynamic_libc_probe\x1f-C\x1ftarget-feature=-crt-static\x1f-C\x1flink-self-contained=no\x1f-C\x1flink-arg=-dynamic-linker\x1f-C\x1flink-arg={dynamic_linker}\x1f-L\x1fnative={}",
                 lib_dir.display()
             ))
         }
@@ -1009,15 +1024,11 @@ fn musl_dynamic_lib_dir(target: &str) -> Option<PathBuf> {
 
 fn musl_dynamic_lib_dir_is_usable(path: &Path) -> bool {
     path.join("libc.so").exists()
-        && (path.join("libgcc_s.so").exists() || path.join("libgcc_s.so.1").exists())
 }
 
 fn qemu_app_source(runtime: QemuRuntime) -> &'static str {
     match runtime {
-        QemuRuntime::GlibcDynamic
-        | QemuRuntime::GlibcStatic
-        | QemuRuntime::MuslDynamic
-        | QemuRuntime::MuslStatic => {
+        QemuRuntime::GlibcDynamic | QemuRuntime::GlibcStatic | QemuRuntime::MuslStatic => {
             r#"fn main() {
     let variant = std::env::var("CARGO_SONIC_SELECTED_TARGET_CPU").unwrap_or_default();
     let len = std::env::var("SONIC_EXAMPLE_LEN").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(64);
@@ -1035,9 +1046,10 @@ fn qemu_app_source(runtime: QemuRuntime) -> &'static str {
     println!("checksum: {sum}");
 }"#
         }
-        QemuRuntime::NoStd => {
+        QemuRuntime::MuslDynamic | QemuRuntime::NoStd => {
             r##"#![no_std]
 #![no_main]
+#![allow(unexpected_cfgs)]
 
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
@@ -1074,8 +1086,17 @@ fn panic(_: &PanicInfo<'_>) -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn rust_eh_personality() {}
 
+#[cfg(cargo_sonic_dynamic_libc_probe)]
+#[link(name = "c")]
+unsafe extern "C" {
+    fn getpid() -> i32;
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn rust_entry(stack: *const usize) -> ! {
+    #[cfg(cargo_sonic_dynamic_libc_probe)]
+    let _ = unsafe { getpid() };
+
     let (selected, selected_len) = unsafe {
         find_env_value(stack, b"CARGO_SONIC_SELECTED_TARGET_CPU=")
             .unwrap_or((b"<missing>".as_ptr(), b"<missing>".len()))
@@ -1520,9 +1541,12 @@ fn install_musl_dynamic_runtime(rootfs: &Path, arch: &SystemArch) -> Result<()> 
     if !arch.target.contains("-musl") {
         return Ok(());
     }
-    let Some(lib_dir) = musl_dynamic_lib_dir(&arch.target) else {
-        return Ok(());
-    };
+    let lib_dir = musl_dynamic_lib_dir(&arch.target).with_context(|| {
+        format!(
+            "dynamic musl runtime for {} is required; set SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR",
+            arch.target
+        )
+    })?;
     let rootfs_lib = rootfs.join("lib");
     fs::create_dir_all(&rootfs_lib)
         .with_context(|| format!("failed to create {}", rootfs_lib.display()))?;
@@ -1532,7 +1556,7 @@ fn install_musl_dynamic_runtime(rootfs: &Path, arch: &SystemArch) -> Result<()> 
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name == "libc.so" || name.starts_with("libgcc_s.so") {
+        if name == "libc.so" {
             fs::copy(entry.path(), rootfs_lib.join(name.as_ref()))
                 .with_context(|| format!("failed to copy {}", entry.path().display()))?;
         }
@@ -1553,6 +1577,10 @@ fn musl_loader_name(target: &str) -> &'static str {
     } else {
         "ld-musl.so.1"
     }
+}
+
+fn musl_dynamic_linker_path(target: &str) -> String {
+    format!("/lib/{}", musl_loader_name(target))
 }
 
 fn bundle_dir_for(binary: &Path) -> PathBuf {
@@ -1698,7 +1726,39 @@ fn parse_guest_comparison(output: &str) -> Option<GuestComparison> {
         native: parse_guest_field(block, "native").unwrap_or_else(|| "<missing>".to_string()),
         selected: parse_guest_field(block, "selected").unwrap_or_else(|| "<missing>".to_string()),
         result: parse_guest_field(block, "result").unwrap_or_else(|| "<missing>".to_string()),
+        failed_variant: parse_failed_variant_field(block, "variant"),
+        failed_app_status: parse_failed_variant_field(block, "app_status"),
+        failed_reason: parse_failed_variant_field(block, "reason"),
     })
+}
+
+fn parse_failed_variant_field(block: &str, name: &str) -> Option<String> {
+    let mut current = GuestVariantBlock::default();
+    for line in block.lines() {
+        if let Some(value) = line.strip_prefix("variant=") {
+            current = GuestVariantBlock::default();
+            current.variant = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("app_status=") {
+            current.app_status = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("reason=") {
+            current.reason = Some(value.trim().to_string());
+        } else if line.trim() == "variant_result=fail" {
+            return match name {
+                "variant" => current.variant,
+                "app_status" => current.app_status,
+                "reason" => current.reason,
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct GuestVariantBlock {
+    variant: Option<String>,
+    app_status: Option<String>,
+    reason: Option<String>,
 }
 
 fn parse_guest_field(block: &str, name: &str) -> Option<String> {

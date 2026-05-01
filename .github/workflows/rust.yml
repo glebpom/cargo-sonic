@@ -19,7 +19,35 @@ jobs:
     - name: Build
       run: |
         sudo apt update
-        sudo apt install -y build-essential g++-aarch64-linux-gnu gcc-aarch64-linux-gnu
+        sudo apt install -y build-essential g++-aarch64-linux-gnu gcc-aarch64-linux-gnu just libglib2.0-dev
         cargo fmt --all --check
         cargo clippy --all
-        cargo test 
+        cargo test
+        rustup target add aarch64-unknown-linux-musl
+
+        just qemu-prepare
+
+        sudo dpkg --add-architecture arm64
+        sudo sed -i '/^Types: deb/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources
+        
+        sudo tee /etc/apt/sources.list.d/ubuntu-arm64.sources >/dev/null <<'EOF'
+        Types: deb
+        URIs: http://ports.ubuntu.com/ubuntu-ports
+        Suites: noble noble-updates noble-backports noble-security
+        Components: main universe restricted multiverse
+        Architectures: arm64
+        Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+        EOF
+        
+        sudo apt update
+        sudo apt install -y musl-dev:arm64
+
+        mkdir -p "$PWD/target/aarch64-musl-dynamic"
+
+        LIBC_SO="$(dpkg -L musl:arm64 musl-dev:arm64 | grep -E '/libc\.so$' | head -n1)"
+
+        ln -sf "$LIBC_SO" "$PWD/target/aarch64-musl-dynamic/libc.so"
+
+        export SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR="$PWD/target/aarch64-musl-dynamic"
+
+        SONIC_QEMU_JOBS=4 just qemu
