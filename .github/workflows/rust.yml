@@ -40,16 +40,13 @@ jobs:
         EOF
         
         sudo apt update
-        sudo apt install -y musl:arm64 musl-dev:arm64 libgcc-s1:arm64
+        sudo apt install -y musl-dev:arm64
 
         mkdir -p "$PWD/target/aarch64-musl-dynamic"
 
         LIBC_SO="$(dpkg -L musl:arm64 musl-dev:arm64 | grep -E '/libc\.so$' | head -n1)"
-        LIBGCC_SO="$(dpkg -L libgcc-s1:arm64 | grep -E '/libgcc_s\.so\.1$' | head -n1)"
 
         ln -sf "$LIBC_SO" "$PWD/target/aarch64-musl-dynamic/libc.so"
-        ln -sf "$LIBGCC_SO" "$PWD/target/aarch64-musl-dynamic/libgcc_s.so"
-        ln -sf "$LIBGCC_SO" "$PWD/target/aarch64-musl-dynamic/libgcc_s.so.1"
 
         export SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR="$PWD/target/aarch64-musl-dynamic"
 

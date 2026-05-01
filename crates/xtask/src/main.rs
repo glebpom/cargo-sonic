@@ -371,7 +371,7 @@ fn ensure_qemu_build_variants_available(arch: &SystemArch, host_target: &str) ->
         if matches!(build_variant.runtime, QemuRuntime::MuslDynamic) {
             musl_dynamic_lib_dir(&arch.target).with_context(|| {
                 format!(
-                    "qemu build variant {} {} requires dynamic musl libc/libgcc_s; set SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR to a directory containing libc.so and libgcc_s.so",
+                    "qemu build variant {} {} requires dynamic musl libc; set SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR to a directory containing libc.so",
                     arch.name,
                     build_variant.id()
                 )
@@ -985,8 +985,9 @@ fn qemu_payload_rustflags(arch: &SystemArch, runtime: QemuRuntime) -> Result<Opt
                     QemuRuntime::MuslDynamic.label()
                 )
             })?;
+            let dynamic_linker = musl_dynamic_linker_path(&arch.target);
             Some(format!(
-                "-C\x1ftarget-feature=-crt-static\x1f-L\x1fnative={}",
+                "--cfg\x1fcargo_sonic_dynamic_libc_probe\x1f-C\x1ftarget-feature=-crt-static\x1f-C\x1flink-self-contained=no\x1f-C\x1flink-arg=-dynamic-linker\x1f-C\x1flink-arg={dynamic_linker}\x1f-L\x1fnative={}",
                 lib_dir.display()
             ))
         }
@@ -1023,15 +1024,11 @@ fn musl_dynamic_lib_dir(target: &str) -> Option<PathBuf> {
 
 fn musl_dynamic_lib_dir_is_usable(path: &Path) -> bool {
     path.join("libc.so").exists()
-        && (path.join("libgcc_s.so").exists() || path.join("libgcc_s.so.1").exists())
 }
 
 fn qemu_app_source(runtime: QemuRuntime) -> &'static str {
     match runtime {
-        QemuRuntime::GlibcDynamic
-        | QemuRuntime::GlibcStatic
-        | QemuRuntime::MuslDynamic
-        | QemuRuntime::MuslStatic => {
+        QemuRuntime::GlibcDynamic | QemuRuntime::GlibcStatic | QemuRuntime::MuslStatic => {
             r#"fn main() {
     let variant = std::env::var("CARGO_SONIC_SELECTED_TARGET_CPU").unwrap_or_default();
     let len = std::env::var("SONIC_EXAMPLE_LEN").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(64);
@@ -1049,9 +1046,10 @@ fn qemu_app_source(runtime: QemuRuntime) -> &'static str {
     println!("checksum: {sum}");
 }"#
         }
-        QemuRuntime::NoStd => {
+        QemuRuntime::MuslDynamic | QemuRuntime::NoStd => {
             r##"#![no_std]
 #![no_main]
+#![allow(unexpected_cfgs)]
 
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
@@ -1088,8 +1086,17 @@ fn panic(_: &PanicInfo<'_>) -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn rust_eh_personality() {}
 
+#[cfg(cargo_sonic_dynamic_libc_probe)]
+#[link(name = "c")]
+unsafe extern "C" {
+    fn getpid() -> i32;
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn rust_entry(stack: *const usize) -> ! {
+    #[cfg(cargo_sonic_dynamic_libc_probe)]
+    let _ = unsafe { getpid() };
+
     let (selected, selected_len) = unsafe {
         find_env_value(stack, b"CARGO_SONIC_SELECTED_TARGET_CPU=")
             .unwrap_or((b"<missing>".as_ptr(), b"<missing>".len()))
@@ -1549,7 +1556,7 @@ fn install_musl_dynamic_runtime(rootfs: &Path, arch: &SystemArch) -> Result<()> 
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name == "libc.so" || name.starts_with("libgcc_s.so") {
+        if name == "libc.so" {
             fs::copy(entry.path(), rootfs_lib.join(name.as_ref()))
                 .with_context(|| format!("failed to copy {}", entry.path().display()))?;
         }
@@ -1570,6 +1577,10 @@ fn musl_loader_name(target: &str) -> &'static str {
     } else {
         "ld-musl.so.1"
     }
+}
+
+fn musl_dynamic_linker_path(target: &str) -> String {
+    format!("/lib/{}", musl_loader_name(target))
 }
 
 fn bundle_dir_for(binary: &Path) -> PathBuf {
