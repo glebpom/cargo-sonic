@@ -19,7 +19,8 @@ jobs:
     - name: Build
       run: |
         sudo apt update
-        sudo apt install -y build-essential g++-aarch64-linux-gnu gcc-aarch64-linux-gnu
+        sudo apt install -y build-essential g++-aarch64-linux-gnu gcc-aarch64-linux-gnu just
         cargo fmt --all --check
         cargo clippy --all
-        cargo test 
+        cargo test
+        SONIC_QEMU_JOBS=16 just qemu
