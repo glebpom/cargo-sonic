@@ -23,4 +23,5 @@ jobs:
         cargo fmt --all --check
         cargo clippy --all
         cargo test
-        SONIC_QEMU_JOBS=16 just qemu
+        just qemu-prepare
+        SONIC_QEMU_JOBS=4 just qemu
