@@ -7,6 +7,7 @@
 - Fix generated x86_64 GNU loaders so they no longer force the system linker path in CI.
 - Extend the QEMU suite to exercise glibc and musl static/dynamic payloads plus no-std payloads across plain/zstd compression, embedded/bundle loaders, and normal/cross compilation modes.
 - Make missing dynamic musl inputs a hard QEMU setup error instead of skipping musl-dynamic variants.
+- Include the first failing QEMU matrix sub-variant, app status, and reason in summary failures.
 - Build generated loaders with controlled rustflags so ambient Cargo target rustflags cannot make the loader CPU-specific.
 - Fix generated musl loaders so they do not pass unsupported `-nostartfiles` linker arguments to `rust-lld`.
 

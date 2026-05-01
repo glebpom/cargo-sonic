@@ -230,6 +230,9 @@ struct GuestComparison {
     native: String,
     selected: String,
     result: String,
+    failed_variant: Option<String>,
+    failed_app_status: Option<String>,
+    failed_reason: Option<String>,
 }
 
 struct QemuTestApp {
@@ -400,8 +403,26 @@ fn format_qemu_failure_report(
         .as_ref()
         .map(|path| format!(" log={}", path.display()))
         .unwrap_or_default();
+    let failed_variant = err
+        .comparison
+        .as_ref()
+        .and_then(|comparison| comparison.failed_variant.as_deref())
+        .map(|variant| format!(" failed_variant={variant}"))
+        .unwrap_or_default();
+    let failed_app_status = err
+        .comparison
+        .as_ref()
+        .and_then(|comparison| comparison.failed_app_status.as_deref())
+        .map(|status| format!(" app_status={status}"))
+        .unwrap_or_default();
+    let failed_reason = err
+        .comparison
+        .as_ref()
+        .and_then(|comparison| comparison.failed_reason.as_deref())
+        .map(|reason| format!(" reason={reason}"))
+        .unwrap_or_default();
     format!(
-        "{arch} {variant} {cpu}: native={native} selected={selected} result={result} status={} message={}{}",
+        "{arch} {variant} {cpu}: native={native} selected={selected} result={result}{failed_variant}{failed_app_status}{failed_reason} status={} message={}{}",
         err.status, err.message, log
     )
 }
@@ -1694,7 +1715,39 @@ fn parse_guest_comparison(output: &str) -> Option<GuestComparison> {
         native: parse_guest_field(block, "native").unwrap_or_else(|| "<missing>".to_string()),
         selected: parse_guest_field(block, "selected").unwrap_or_else(|| "<missing>".to_string()),
         result: parse_guest_field(block, "result").unwrap_or_else(|| "<missing>".to_string()),
+        failed_variant: parse_failed_variant_field(block, "variant"),
+        failed_app_status: parse_failed_variant_field(block, "app_status"),
+        failed_reason: parse_failed_variant_field(block, "reason"),
     })
+}
+
+fn parse_failed_variant_field(block: &str, name: &str) -> Option<String> {
+    let mut current = GuestVariantBlock::default();
+    for line in block.lines() {
+        if let Some(value) = line.strip_prefix("variant=") {
+            current = GuestVariantBlock::default();
+            current.variant = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("app_status=") {
+            current.app_status = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("reason=") {
+            current.reason = Some(value.trim().to_string());
+        } else if line.trim() == "variant_result=fail" {
+            return match name {
+                "variant" => current.variant,
+                "app_status" => current.app_status,
+                "reason" => current.reason,
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct GuestVariantBlock {
+    variant: Option<String>,
+    app_status: Option<String>,
+    reason: Option<String>,
 }
 
 fn parse_guest_field(block: &str, name: &str) -> Option<String> {
