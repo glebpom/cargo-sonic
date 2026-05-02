@@ -23,6 +23,7 @@ jobs:
         cargo fmt --all --check
         cargo clippy --all
         cargo test
+        just miri
         rustup target add aarch64-unknown-linux-musl
 
         just qemu-prepare

@@ -497,6 +497,13 @@ the real loader selector chooses the expected rustc/LLVM target-cpu. They are
 not QEMU tests and do not execute a generated binary; they cover modern CPU
 identity cases that QEMU TCG cannot model as strict guest oracles.
 
+Run the generated-loader unsafe pointer suite under Miri for the supported Linux
+architectures:
+
+```bash
+just miri
+```
+
 Run the QEMU system-mode suite:
 
 ```bash

@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
+#[cfg(feature = "zstd")]
 use std::io::Cursor;
 use std::io::{IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
@@ -115,6 +116,7 @@ struct PayloadBuildContext {
     out_root: Utf8PathBuf,
     tag_output: bool,
     payload_compression: PayloadCompression,
+    #[cfg_attr(not(feature = "zstd"), allow(dead_code))]
     compression_level: i32,
 }
 
@@ -1575,14 +1577,23 @@ fn build_payload_variant(ctx: &PayloadBuildContext, cpu: &str) -> Result<Payload
             fs::copy(&executables[0], &payload)?;
         }
         PayloadCompression::Zstd => {
-            let input = fs::read(&executables[0])
-                .with_context(|| format!("failed to read payload artifact {}", executables[0]))?;
-            let compressed = zstd::stream::encode_all(Cursor::new(input), ctx.compression_level)
-                .with_context(|| {
-                    format!("failed to zstd-compress payload for target-cpu `{cpu}`")
+            #[cfg(feature = "zstd")]
+            {
+                let input = fs::read(&executables[0]).with_context(|| {
+                    format!("failed to read payload artifact {}", executables[0])
                 })?;
-            fs::write(&payload, compressed)
-                .with_context(|| format!("failed to write compressed payload {payload}"))?;
+                let compressed =
+                    zstd::stream::encode_all(Cursor::new(input), ctx.compression_level)
+                        .with_context(|| {
+                            format!("failed to zstd-compress payload for target-cpu `{cpu}`")
+                        })?;
+                fs::write(&payload, compressed)
+                    .with_context(|| format!("failed to write compressed payload {payload}"))?;
+            }
+            #[cfg(not(feature = "zstd"))]
+            {
+                bail!("zstd payload compression requires the `zstd` feature");
+            }
         }
     }
     Ok(PayloadArtifact {
@@ -3418,167 +3429,7 @@ pub unsafe fn exit(code: i32) -> ! {
 }
 
 fn generated_stack() -> &'static str {
-    r#"use crate::linux_sys;
-
-const AT_NULL: usize = 0;
-const AT_PHDR: usize = 3;
-const AT_HWCAP: usize = 16;
-const AT_HWCAP2: usize = 26;
-const AT_HWCAP3: usize = 29;
-
-pub struct InitialStack {
-    pub argc: usize,
-    pub argv: *const *const u8,
-    pub envp: *const *const u8,
-    pub envc: usize,
-    pub phdr: usize,
-    pub hwcap: usize,
-    pub hwcap2: usize,
-    pub hwcap3: usize,
-}
-
-impl InitialStack {
-    pub unsafe fn parse(sp: *const usize) -> Self {
-        unsafe {
-            let argc = *sp;
-            let argv = sp.add(1) as *const *const u8;
-            let envp = argv.add(argc + 1);
-            let mut envc = 0;
-            while !(*envp.add(envc)).is_null() {
-                envc += 1;
-            }
-            let mut aux = envp.add(envc + 1) as *const usize;
-            let mut phdr = 0;
-            let mut hwcap = 0;
-            let mut hwcap2 = 0;
-            let mut hwcap3 = 0;
-            while *aux != AT_NULL {
-                let key = *aux;
-                let val = *aux.add(1);
-                if key == AT_PHDR { phdr = val; }
-                if key == AT_HWCAP { hwcap = val; }
-                if key == AT_HWCAP2 { hwcap2 = val; }
-                if key == AT_HWCAP3 { hwcap3 = val; }
-                aux = aux.add(2);
-            }
-            Self { argc, argv, envp, envc, phdr, hwcap, hwcap2, hwcap3 }
-        }
-    }
-}
-
-pub unsafe fn build_envp(initial: &InitialStack, enabled: &'static [u8], cpu: &'static [u8], flags: &'static [u8]) -> *const *const u8 {
-    unsafe {
-        let mut kept = 0;
-        let mut i = 0;
-        while i < initial.envc {
-            let p = *initial.envp.add(i);
-            if !is_sonic_key(p) {
-                kept += 1;
-            }
-            i += 1;
-        }
-        let total = kept + 3 + 1;
-        let bytes = total * core::mem::size_of::<*const u8>();
-        let out = linux_sys::mmap(bytes) as *mut *const u8;
-        if out.is_null() || out as isize == -1 {
-            return core::ptr::null();
-        }
-        let mut j = 0;
-        i = 0;
-        while i < initial.envc {
-            let p = *initial.envp.add(i);
-            if !is_sonic_key(p) {
-                *out.add(j) = p;
-                j += 1;
-            }
-            i += 1;
-        }
-        *out.add(j) = enabled.as_ptr(); j += 1;
-        *out.add(j) = cpu.as_ptr(); j += 1;
-        *out.add(j) = flags.as_ptr(); j += 1;
-        *out.add(j) = core::ptr::null();
-        out
-    }
-}
-
-pub unsafe fn debug_enabled(initial: &InitialStack) -> bool {
-    unsafe {
-        let mut i = 0;
-        while i < initial.envc {
-            if env_name_matches(*initial.envp.add(i), b"CARGO_SONIC_DEBUG") {
-                return true;
-            }
-            i += 1;
-        }
-        false
-    }
-}
-
-pub unsafe fn sonic_enabled(initial: &InitialStack) -> bool {
-    unsafe {
-        let mut i = 0;
-        while i < initial.envc {
-            let p = *initial.envp.add(i);
-            if starts_with(p, b"CARGO_SONIC_ENABLE=") {
-                let value = p.add(b"CARGO_SONIC_ENABLE=".len());
-                return !is_disabled_value(value);
-            }
-            i += 1;
-        }
-        true
-    }
-}
-
-unsafe fn is_sonic_key(p: *const u8) -> bool {
-    unsafe {
-        starts_with(p, b"CARGO_SONIC_ENABLED=")
-            || starts_with(p, b"CARGO_SONIC_SELECTED_TARGET_CPU=")
-            || starts_with(p, b"CARGO_SONIC_SELECTED_FLAGS=")
-    }
-}
-
-unsafe fn env_name_matches(p: *const u8, name: &[u8]) -> bool {
-    unsafe {
-        let mut i = 0;
-        while i < name.len() {
-            if *p.add(i) != name[i] {
-                return false;
-            }
-            i += 1;
-        }
-        let next = *p.add(i);
-        next == 0 || next == b'='
-    }
-}
-
-unsafe fn is_disabled_value(p: *const u8) -> bool {
-    unsafe {
-        if *p == b'0' && *p.add(1) == 0 {
-            return true;
-        }
-        (*p == b'f' || *p == b'F')
-            && (*p.add(1) == b'a' || *p.add(1) == b'A')
-            && (*p.add(2) == b'l' || *p.add(2) == b'L')
-            && (*p.add(3) == b's' || *p.add(3) == b'S')
-            && (*p.add(4) == b'e' || *p.add(4) == b'E')
-            && *p.add(5) == 0
-    }
-}
-
-unsafe fn starts_with(mut p: *const u8, prefix: &[u8]) -> bool {
-    unsafe {
-        let mut i = 0;
-        while i < prefix.len() {
-            if *p != prefix[i] {
-                return false;
-            }
-            p = p.add(1);
-            i += 1;
-        }
-        true
-    }
-}
-"#
+    include_str!("loader_stack.rs")
 }
 
 fn escape_bytes(s: &str) -> String {
@@ -3704,6 +3555,17 @@ fn make_executable(path: &Utf8Path) -> Result<()> {
 #[cfg(not(unix))]
 fn make_executable(_path: &Utf8Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(all(test, miri))]
+mod linux_sys {
+    pub unsafe fn mmap(len: usize) -> *mut usize {
+        let words = len.div_ceil(core::mem::size_of::<usize>());
+        let mut out = Vec::<usize>::with_capacity(words);
+        let ptr = out.as_mut_ptr();
+        core::mem::forget(out);
+        ptr
+    }
 }
 
 #[cfg(test)]
@@ -4505,5 +4367,148 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[cfg(miri)]
+    mod loader_miri {
+        mod stack {
+            include!("loader_stack.rs");
+        }
+
+        use std::ffi::CStr;
+
+        const AT_NULL: usize = 0;
+        const AT_PHDR: usize = 3;
+        const AT_HWCAP: usize = 16;
+        const AT_HWCAP2: usize = 26;
+        const AT_HWCAP3: usize = 29;
+
+        #[test]
+        fn loader_miri_parses_initial_stack_layout() {
+            let words = stack_words(&[
+                b"KEEP_ME=yes\0",
+                b"CARGO_SONIC_DEBUG=1\0",
+                b"CARGO_SONIC_ENABLE=false\0",
+            ]);
+
+            let initial = unsafe { stack::InitialStack::parse(words.as_ptr()) };
+
+            assert_eq!(initial.argc, 2);
+            assert_eq!(initial.envc, 3);
+            assert_eq!(initial.phdr, 0x1234);
+            assert_eq!(initial.hwcap, 0xab);
+            assert_eq!(initial.hwcap2, 0xcd);
+            assert_eq!(initial.hwcap3, 0xef);
+            assert_eq!(unsafe { cstr(*initial.argv.add(0)) }, "loader");
+            assert_eq!(unsafe { cstr(*initial.argv.add(1)) }, "--flag");
+            assert!(unsafe { stack::debug_enabled(&initial) });
+            assert!(!unsafe { stack::sonic_enabled(&initial) });
+        }
+
+        #[test]
+        fn loader_miri_build_envp_filters_old_sonic_values() {
+            let words = stack_words(&[
+                b"KEEP_ME=yes\0",
+                b"CARGO_SONIC_ENABLED=old\0",
+                b"CARGO_SONIC_SELECTED_TARGET_CPU=old\0",
+                b"CARGO_SONIC_SELECTED_FLAGS=old\0",
+                b"CARGO_SONIC_ENABLE=1\0",
+            ]);
+            let initial = unsafe { stack::InitialStack::parse(words.as_ptr()) };
+
+            let envp = unsafe {
+                stack::build_envp(
+                    &initial,
+                    b"CARGO_SONIC_ENABLED=1\0",
+                    b"CARGO_SONIC_SELECTED_TARGET_CPU=x86-64\0",
+                    b"CARGO_SONIC_SELECTED_FLAGS=sse2\0",
+                )
+            };
+
+            assert!(!envp.is_null());
+            let got = unsafe { collect_envp(envp) };
+            unsafe {
+                let _ = Vec::from_raw_parts(envp.cast_mut().cast::<usize>(), 0, got.len() + 1);
+            }
+            assert_eq!(
+                got,
+                vec![
+                    "KEEP_ME=yes",
+                    "CARGO_SONIC_ENABLE=1",
+                    "CARGO_SONIC_ENABLED=1",
+                    "CARGO_SONIC_SELECTED_TARGET_CPU=x86-64",
+                    "CARGO_SONIC_SELECTED_FLAGS=sse2",
+                ]
+            );
+        }
+
+        #[test]
+        fn loader_miri_enable_flag_accepts_only_documented_disabled_values() {
+            for disabled in [
+                b"CARGO_SONIC_ENABLE=0\0".as_slice(),
+                b"CARGO_SONIC_ENABLE=false\0".as_slice(),
+                b"CARGO_SONIC_ENABLE=FALSE\0".as_slice(),
+            ] {
+                let words = stack_words(&[disabled]);
+                let initial = unsafe { stack::InitialStack::parse(words.as_ptr()) };
+                assert!(!unsafe { stack::sonic_enabled(&initial) });
+            }
+
+            for enabled in [
+                b"CARGO_SONIC_ENABLE=1\0".as_slice(),
+                b"CARGO_SONIC_ENABLE=true\0".as_slice(),
+                b"OTHER=value\0".as_slice(),
+            ] {
+                let words = stack_words(&[enabled]);
+                let initial = unsafe { stack::InitialStack::parse(words.as_ptr()) };
+                assert!(unsafe { stack::sonic_enabled(&initial) });
+            }
+        }
+
+        fn stack_words(env: &[&[u8]]) -> Vec<usize> {
+            let aux_words = 10;
+            let mut words = vec![0; 1 + 2 + 1 + env.len() + 1 + aux_words];
+            words[0] = 2;
+
+            unsafe {
+                let ptrs = words.as_mut_ptr().cast::<*const u8>();
+                ptrs.add(1).write(b"loader\0".as_ptr());
+                ptrs.add(2).write(b"--flag\0".as_ptr());
+                ptrs.add(3).write(core::ptr::null());
+                for (i, value) in env.iter().enumerate() {
+                    ptrs.add(4 + i).write(value.as_ptr());
+                }
+                ptrs.add(4 + env.len()).write(core::ptr::null());
+            }
+
+            let aux = 4 + env.len() + 1;
+            words[aux] = AT_PHDR;
+            words[aux + 1] = 0x1234;
+            words[aux + 2] = AT_HWCAP;
+            words[aux + 3] = 0xab;
+            words[aux + 4] = AT_HWCAP2;
+            words[aux + 5] = 0xcd;
+            words[aux + 6] = AT_HWCAP3;
+            words[aux + 7] = 0xef;
+            words[aux + 8] = AT_NULL;
+            words[aux + 9] = 0;
+            words
+        }
+
+        unsafe fn collect_envp(envp: *const *const u8) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut i = 0;
+            unsafe {
+                while !(*envp.add(i)).is_null() {
+                    out.push(cstr(*envp.add(i)));
+                    i += 1;
+                }
+            }
+            out
+        }
+
+        unsafe fn cstr(ptr: *const u8) -> String {
+            unsafe { CStr::from_ptr(ptr.cast()).to_string_lossy().into_owned() }
+        }
     }
 }
