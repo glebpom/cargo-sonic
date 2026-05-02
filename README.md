@@ -363,6 +363,30 @@ linked into the generated loader as a non-loaded ELF `.dep-v0` section. Payload
 binaries are not individually annotated; the final executable carries the
 dependency list for the selected package.
 
+## Loader Build Flags
+
+Payload builds use the normal Cargo environment and target-specific settings.
+The generated loader is built separately, and cargo-sonic intentionally does not
+reuse payload `RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`,
+or `CARGO_TARGET_<target>_RUSTFLAGS` for that loader build. Payload flags often
+describe the application link step, libc choice, or cross compiler setup, and
+those details are not necessarily valid for the small generated loader.
+
+Use `CARGO_SONIC_LOADER_RUSTFLAGS` when the loader itself needs extra rustflags,
+for example to select a cross linker:
+
+```bash
+CARGO_SONIC_LOADER_RUSTFLAGS="-C link-arg=--target=aarch64-unknown-linux-gnu -C link-arg=-fuse-ld=lld" \
+  cargo sonic --target-cpus=neoverse-n1 build --release --target aarch64-unknown-linux-gnu
+```
+
+Do not put Cargo or rustc's top-level `--target` option in
+`CARGO_SONIC_LOADER_RUSTFLAGS`. cargo-sonic already builds the loader with the
+same Cargo target selected for the payload. cargo-sonic appends its mandatory loader flags after
+`CARGO_SONIC_LOADER_RUSTFLAGS`. Mandatory flags, such as the loader's target
+configuration and required startup/link behavior, therefore still win even if a
+user-provided flag tries to redefine them.
+
 ## Probe
 
 Use `cargo sonic probe` to inspect the current host without building payloads:
