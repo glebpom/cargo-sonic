@@ -13,17 +13,22 @@ jobs:
   build:
 
     runs-on: ubuntu-latest
+    timeout-minutes: 180
 
     steps:
     - uses: actions/checkout@v4
     - name: Build
       run: |
         sudo apt update
-        sudo apt install -y build-essential g++-aarch64-linux-gnu gcc-aarch64-linux-gnu just libglib2.0-dev
+        sudo apt install -y build-essential clang g++-aarch64-linux-gnu gcc-aarch64-linux-gnu just libglib2.0-dev lld musl-dev
         cargo fmt --all --check
         cargo clippy --all
         cargo test
-        rustup target add aarch64-unknown-linux-musl
+        rustup target add \
+          x86_64-unknown-linux-gnu \
+          x86_64-unknown-linux-musl \
+          aarch64-unknown-linux-gnu \
+          aarch64-unknown-linux-musl
 
         just qemu-prepare
 
@@ -42,12 +47,16 @@ jobs:
         sudo apt update
         sudo apt install -y musl-dev:arm64
 
+        mkdir -p "$PWD/target/x86_64-musl-dynamic"
         mkdir -p "$PWD/target/aarch64-musl-dynamic"
 
-        LIBC_SO="$(dpkg -L musl:arm64 musl-dev:arm64 | grep -E '/libc\.so$' | head -n1)"
+        X86_64_LIBC_SO="$(dpkg -L musl musl-dev | grep -E '/libc\.so$' | head -n1)"
+        AARCH64_LIBC_SO="$(dpkg -L musl:arm64 musl-dev:arm64 | grep -E '/libc\.so$' | head -n1)"
 
-        ln -sf "$LIBC_SO" "$PWD/target/aarch64-musl-dynamic/libc.so"
+        ln -sf "$X86_64_LIBC_SO" "$PWD/target/x86_64-musl-dynamic/libc.so"
+        ln -sf "$AARCH64_LIBC_SO" "$PWD/target/aarch64-musl-dynamic/libc.so"
 
-        export SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR="$PWD/target/aarch64-musl-dynamic"
+        export CARGO_SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR_X86_64_UNKNOWN_LINUX_MUSL="$PWD/target/x86_64-musl-dynamic"
+        export CARGO_SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR_AARCH64_UNKNOWN_LINUX_MUSL="$PWD/target/aarch64-musl-dynamic"
 
-        SONIC_QEMU_JOBS=4 just qemu
+        CARGO_SONIC_QEMU_JOBS=4 CARGO_SONIC_QEMU_TIMEOUT_SECS=1200 just qemu

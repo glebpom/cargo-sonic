@@ -500,7 +500,7 @@ identity cases that QEMU TCG cannot model as strict guest oracles.
 Run the QEMU system-mode suite:
 
 ```bash
-rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-musl
+rustup target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl
 just qemu-prepare
 just qemu
 ```
@@ -512,9 +512,11 @@ the same guest, and compare each loader-selected target against the rustc-derive
 expectation. The matrix covers glibc static/dynamic and musl static/dynamic
 payloads where those targets are configured, no-std payloads, plain and
 zstd-compressed payloads, embedded and bundle loaders, and normal host builds
-plus cross/explicit target builds where applicable. Dynamic musl cases require a
-dynamic musl library directory with `libc.so`; set
-`SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR` when that library is not available in the Rust
+plus cross/explicit target builds where applicable. GNU cases cover gcc/ld and
+clang/lld; set `CARGO_SONIC_QEMU_CLANG` and `CARGO_SONIC_QEMU_LLD` when the
+host uses versioned LLVM tools such as `clang-22` and `lld-22`. Dynamic musl
+cases require a dynamic musl library directory with `libc.so`; set
+`CARGO_SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR` when that library is not available in the Rust
 target sysroot. Missing dynamic musl inputs are hard setup errors, not skips.
 Host `qemu-user`, host rustc, and checked-in selected-target goldens are
 intentionally not used as correctness oracles.
@@ -523,10 +525,17 @@ configured QEMU cases; cargo-sonic adds the architecture baseline payload
 implicitly.
 
 QEMU cases run in parallel. The default worker count is the number of available
-CPU cores; override it with `SONIC_QEMU_JOBS=<n>` when needed:
+CPU cores; override it with `CARGO_SONIC_QEMU_JOBS=<n>` when needed:
 
 ```bash
-SONIC_QEMU_JOBS=4 just qemu
+CARGO_SONIC_QEMU_JOBS=4 just qemu
+```
+
+Each QEMU case gets a timeout scaled to the generated app matrix size; override
+it with `CARGO_SONIC_QEMU_TIMEOUT_SECS=<seconds>` for slower hosts:
+
+```bash
+CARGO_SONIC_QEMU_TIMEOUT_SECS=1200 just qemu
 ```
 
 `just qemu-prepare` owns the asset directory under
