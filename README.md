@@ -72,12 +72,23 @@ implementations internally. It is useful for measuring workloads where
 code is already doing its own feature-based selection.
 
 Even in this extremely optimized case, a local run with `input-mib=64` and
-`iterations=8` still improved throughput when the loader selected `znver5`:
+`iterations=8` still improved throughput when the loader selected `znver5` or `raptorlake` on appropriate CPUs; 
+however `meteorlake` selection leads to slight slow-down:
 
 | Benchmark | Selection Mode | Target CPU | Execution Time | Throughput |
 | --- | --- | --- | ---: | ---: |
 | `examples/blake3-benchmark` | Sonic (Optimized) | `znver5` | 79 ms | 6479.0 MiB/s |
 | `examples/blake3-benchmark` | Baseline Fallback | `x86-64` | 90 ms | 5674.9 MiB/s |
+
+| Benchmark | Selection Mode | Target CPU | Execution Time | Throughput |
+| --- | --- | --- | ---: | ---: |
+| `examples/blake3-benchmark` | Sonic (Optimized) | `raptorlake` | 107 ms | 4767.7 MiB/s |
+| `examples/blake3-benchmark` | Baseline Fallback | `x86-64` | 117 ms | 4364.3 MiB/s |
+
+| Benchmark | Selection Mode | Target CPU | Execution Time | Throughput |
+| --- | --- | --- | ---: | ---: |
+| `examples/blake3-benchmark` | Sonic (Optimized) | `meteorlake` | 111 ms | 4590.3 MiB/s |
+| `examples/blake3-benchmark` | Baseline Fallback | `x86-64` | 108 ms | 4723.5 MiB/s |
 
 ### Optimized Portability
 
