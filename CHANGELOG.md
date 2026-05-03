@@ -12,6 +12,7 @@
 - Simplify CI dynamic musl setup to install and stage only the aarch64 musl `libc.so`.
 - Build generated loaders with controlled rustflags so ambient Cargo target rustflags cannot make the loader CPU-specific.
 - Fix generated musl loaders so they do not pass unsupported `-nostartfiles` linker arguments to `rust-lld`.
+- Add a `just miri` loader unsafe-code suite for Linux x86_64 and AArch64 and run it in CI.
 
 # 0.1.5
 
