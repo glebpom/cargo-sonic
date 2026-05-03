@@ -73,7 +73,7 @@ code is already doing its own feature-based selection.
 
 Even in this extremely optimized case, a local run with `input-mib=64` and
 `iterations=8` still improved throughput when the loader selected `znver5` or `raptorlake` on appropriate CPUs; 
-however `meteorlake` selection leads to slight slow-down:
+however `meteorlake` optimization leads to slight slow-down:
 
 | Benchmark | Selection Mode | Target CPU | Execution Time | Throughput |
 | --- | --- | --- | ---: | ---: |
