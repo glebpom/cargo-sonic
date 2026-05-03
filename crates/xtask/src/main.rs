@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -41,7 +42,7 @@ fn qemu_system() -> Result<()> {
     let root = repo_root();
     let asset_dir = qemu_asset_dir(&root)?;
     let manifest = read_targets(&root.join("tests/qemu/system.toml"))?;
-    let case_filter = std::env::var("SONIC_QEMU_CASE").ok();
+    let case_filter = std::env::var("CARGO_SONIC_QEMU_CASE").ok();
 
     let missing = missing_system_assets(&asset_dir, &manifest);
     if !missing.is_empty() {
@@ -69,26 +70,40 @@ fn qemu_system() -> Result<()> {
         if cases.is_empty() {
             continue;
         }
-        let variants = rustc_payload_target_cpus(&asset_dir, arch, &cases)?;
         ensure_qemu_build_variants_available(arch, &host_target)?;
+        let build_variants = qemu_build_variants(arch, &host_target);
+        let mut variants_by_target = BTreeMap::new();
+        for build_variant in &build_variants {
+            let target = build_variant.target.triple(&arch.name)?;
+            if !variants_by_target.contains_key(&target) {
+                let variants = rustc_payload_target_cpus(&asset_dir, arch, &target, &cases)?;
+                variants_by_target.insert(target, variants);
+            }
+        }
         let mut apps = Vec::new();
-        for build_variant in qemu_build_variants(arch, &host_target) {
+        for build_variant in build_variants {
+            let target = build_variant.target.triple(&arch.name)?;
+            let variants = variants_by_target
+                .get(&target)
+                .with_context(|| format!("missing target-cpu variants for {target}"))?;
             apps.push(build_qemu_test_app(
                 &root,
                 &asset_dir,
                 &cargo_sonic,
                 arch,
                 build_variant,
-                &variants,
+                variants,
             )?);
         }
         if apps.is_empty() {
             bail!("no qemu build variants are available for {}", arch.name);
         }
+        let app_count = apps.len();
         let initrd = build_test_initramfs(&asset_dir, arch, &apps)?;
         prepared.push(PreparedQemuArch {
             arch,
             variant: "matrix".to_string(),
+            app_count,
             initrd,
         });
     }
@@ -99,6 +114,7 @@ fn qemu_system() -> Result<()> {
             case_jobs.push(QemuCaseJob {
                 arch: prepared_arch.arch,
                 variant: &prepared_arch.variant,
+                app_count: prepared_arch.app_count,
                 case,
                 initrd: &prepared_arch.initrd,
             });
@@ -109,7 +125,7 @@ fn qemu_system() -> Result<()> {
             "no qemu cases matched{}",
             case_filter
                 .as_deref()
-                .map(|filter| format!(" SONIC_QEMU_CASE={filter:?}"))
+                .map(|filter| format!(" CARGO_SONIC_QEMU_CASE={filter:?}"))
                 .unwrap_or_default()
         );
     }
@@ -202,12 +218,14 @@ struct SystemException {
 struct PreparedQemuArch<'a> {
     arch: &'a SystemArch,
     variant: String,
+    app_count: usize,
     initrd: PathBuf,
 }
 
 struct QemuCaseJob<'a> {
     arch: &'a SystemArch,
     variant: &'a str,
+    app_count: usize,
     case: &'a SystemCase,
     initrd: &'a Path,
 }
@@ -237,23 +255,31 @@ struct GuestComparison {
 
 struct QemuTestApp {
     variant: String,
+    target: String,
+    needs_musl_dynamic_runtime: bool,
     binary: PathBuf,
 }
 
 #[derive(Clone, Copy)]
 struct QemuBuildVariant {
+    target: QemuBuildTarget,
     runtime: QemuRuntime,
     compression: QemuCompression,
     loader: QemuLoader,
+    linker: QemuLinker,
     compilation: QemuCompilation,
 }
 
 #[derive(Clone, Copy)]
+enum QemuBuildTarget {
+    Gnu,
+    Musl,
+}
+
+#[derive(Clone, Copy)]
 enum QemuRuntime {
-    GlibcDynamic,
-    GlibcStatic,
-    MuslDynamic,
-    MuslStatic,
+    Dynamic,
+    Static,
     NoStd,
 }
 
@@ -270,6 +296,13 @@ enum QemuLoader {
 }
 
 #[derive(Clone, Copy)]
+enum QemuLinker {
+    GccLd,
+    ClangLld,
+    RustLld,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum QemuCompilation {
     Normal,
     Cross,
@@ -278,22 +311,41 @@ enum QemuCompilation {
 impl QemuBuildVariant {
     fn id(self) -> String {
         format!(
-            "{}-{}-{}-{}",
+            "{}-{}-{}-{}-{}-{}",
+            self.target.label(),
             self.runtime.label(),
             self.compression.label(),
             self.loader.label(),
+            self.linker.label(),
             self.compilation.label()
         )
+    }
+}
+
+impl QemuBuildTarget {
+    fn label(self) -> &'static str {
+        match self {
+            QemuBuildTarget::Gnu => "gnu",
+            QemuBuildTarget::Musl => "musl",
+        }
+    }
+
+    fn triple(self, arch: &str) -> Result<String> {
+        match (arch, self) {
+            ("x86_64", QemuBuildTarget::Gnu) => Ok("x86_64-unknown-linux-gnu".to_string()),
+            ("x86_64", QemuBuildTarget::Musl) => Ok("x86_64-unknown-linux-musl".to_string()),
+            ("aarch64", QemuBuildTarget::Gnu) => Ok("aarch64-unknown-linux-gnu".to_string()),
+            ("aarch64", QemuBuildTarget::Musl) => Ok("aarch64-unknown-linux-musl".to_string()),
+            _ => bail!("unsupported qemu architecture `{arch}`"),
+        }
     }
 }
 
 impl QemuRuntime {
     fn label(self) -> &'static str {
         match self {
-            QemuRuntime::GlibcDynamic => "glibc-dynamic",
-            QemuRuntime::GlibcStatic => "glibc-static",
-            QemuRuntime::MuslDynamic => "musl-dynamic",
-            QemuRuntime::MuslStatic => "musl-static",
+            QemuRuntime::Dynamic => "dynamic",
+            QemuRuntime::Static => "static",
             QemuRuntime::NoStd => "nostd",
         }
     }
@@ -317,6 +369,16 @@ impl QemuLoader {
     }
 }
 
+impl QemuLinker {
+    fn label(self) -> &'static str {
+        match self {
+            QemuLinker::GccLd => "gcc-ld",
+            QemuLinker::ClangLld => "clang-lld",
+            QemuLinker::RustLld => "rust-lld",
+        }
+    }
+}
+
 impl QemuCompilation {
     fn label(self) -> &'static str {
         match self {
@@ -327,38 +389,45 @@ impl QemuCompilation {
 }
 
 fn qemu_build_variants(arch: &SystemArch, host_target: &str) -> Vec<QemuBuildVariant> {
-    let runtimes: &[QemuRuntime] = if arch.target.contains("-musl") {
-        &[
-            QemuRuntime::MuslDynamic,
-            QemuRuntime::MuslStatic,
-            QemuRuntime::NoStd,
-        ]
-    } else {
-        &[
-            QemuRuntime::GlibcDynamic,
-            QemuRuntime::GlibcStatic,
-            QemuRuntime::NoStd,
-        ]
-    };
+    let targets = [QemuBuildTarget::Gnu, QemuBuildTarget::Musl];
+    let runtimes = [
+        QemuRuntime::Dynamic,
+        QemuRuntime::Static,
+        QemuRuntime::NoStd,
+    ];
     let compressions = [QemuCompression::Plain, QemuCompression::Zstd];
     let loaders = [QemuLoader::Embedded, QemuLoader::Bundle];
-    let compilations: &[QemuCompilation] = if arch.target == host_target {
-        &[QemuCompilation::Normal, QemuCompilation::Cross]
-    } else {
-        &[QemuCompilation::Cross]
-    };
 
     let mut variants = Vec::new();
-    for runtime in runtimes {
-        for compression in compressions {
-            for loader in loaders {
-                for compilation in compilations {
-                    variants.push(QemuBuildVariant {
-                        runtime: *runtime,
-                        compression,
-                        loader,
-                        compilation: *compilation,
-                    });
+    for target in targets {
+        let target_triple = match target.triple(&arch.name) {
+            Ok(target_triple) => target_triple,
+            Err(_) => continue,
+        };
+        let compilations: &[QemuCompilation] = if target_triple == host_target {
+            &[QemuCompilation::Normal, QemuCompilation::Cross]
+        } else {
+            &[QemuCompilation::Cross]
+        };
+        let linkers: &[QemuLinker] = match target {
+            QemuBuildTarget::Gnu => &[QemuLinker::GccLd, QemuLinker::ClangLld],
+            QemuBuildTarget::Musl => &[QemuLinker::RustLld],
+        };
+        for runtime in runtimes {
+            for compression in compressions {
+                for loader in loaders {
+                    for linker in linkers {
+                        for compilation in compilations {
+                            variants.push(QemuBuildVariant {
+                                target,
+                                runtime,
+                                compression,
+                                loader,
+                                linker: *linker,
+                                compilation: *compilation,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -368,17 +437,62 @@ fn qemu_build_variants(arch: &SystemArch, host_target: &str) -> Vec<QemuBuildVar
 
 fn ensure_qemu_build_variants_available(arch: &SystemArch, host_target: &str) -> Result<()> {
     for build_variant in qemu_build_variants(arch, host_target) {
-        if matches!(build_variant.runtime, QemuRuntime::MuslDynamic) {
-            musl_dynamic_lib_dir(&arch.target).with_context(|| {
+        let target = build_variant.target.triple(&arch.name)?;
+        ensure_rust_target_available(&target)?;
+        if matches!(
+            (build_variant.target, build_variant.runtime),
+            (QemuBuildTarget::Musl, QemuRuntime::Dynamic)
+        ) {
+            musl_dynamic_lib_dir(&target).with_context(|| {
                 format!(
-                    "qemu build variant {} {} requires dynamic musl libc; set SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR to a directory containing libc.so",
+                    "qemu build variant {} {} requires dynamic musl libc; set {} or CARGO_SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR to a directory containing a target-compatible libc.so",
                     arch.name,
-                    build_variant.id()
+                    build_variant.id(),
+                    musl_dynamic_lib_dir_env(&target)
                 )
             })?;
         }
+        if target.contains("-gnu") {
+            match build_variant.linker {
+                QemuLinker::GccLd => {
+                    ensure_tool(qemu_gnu_gcc_linker(&target, host_target))?;
+                }
+                QemuLinker::ClangLld => {
+                    ensure_tool(&qemu_clang_linker())?;
+                    ensure_tool(&qemu_lld_tool(&qemu_lld_linker()))?;
+                }
+                QemuLinker::RustLld => {}
+            }
+        }
     }
     Ok(())
+}
+
+fn ensure_rust_target_available(target: &str) -> Result<()> {
+    let output = Command::new("rustc")
+        .arg("--print")
+        .arg("sysroot")
+        .output()
+        .context("failed to run rustc --print sysroot")?;
+    if !output.status.success() {
+        bail!(
+            "rustc --print sysroot failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let sysroot = String::from_utf8(output.stdout)?;
+    let rustlib = PathBuf::from(sysroot.trim())
+        .join("lib")
+        .join("rustlib")
+        .join(target)
+        .join("lib");
+    if rustlib.exists() {
+        Ok(())
+    } else {
+        bail!(
+            "Rust target `{target}` is not installed for the host toolchain; run `rustup target add {target}`"
+        )
+    }
 }
 
 fn format_qemu_failure_report(
@@ -460,8 +574,14 @@ fn run_qemu_cases_parallel(
                         break;
                     }
                     let job = &jobs_to_run[index];
-                    let outcome =
-                        run_qemu_case(asset_dir, job.arch, job.variant, job.case, job.initrd);
+                    let outcome = run_qemu_case(
+                        asset_dir,
+                        job.arch,
+                        job.variant,
+                        job.app_count,
+                        job.case,
+                        job.initrd,
+                    );
                     results.lock().expect("qemu result mutex poisoned").push((
                         index,
                         QemuCaseResult {
@@ -798,7 +918,7 @@ for app in /sonic-qemu-app-*; do
   variant="${{app#/sonic-qemu-app-}}"
   safe_variant="$(echo "$variant" | sed 's/[^A-Za-z0-9_.-]/_/g')"
   set +e
-  CARGO_SONIC_DEBUG=1 SONIC_EXAMPLE_ITERS=1 SONIC_EXAMPLE_LEN=64 "$app" > "/tmp/app-$safe_variant.out" 2> "/tmp/app-$safe_variant.err"
+  CARGO_SONIC_DEBUG=1 CARGO_SONIC_EXAMPLE_ITERS=1 CARGO_SONIC_EXAMPLE_LEN=64 "$app" > "/tmp/app-$safe_variant.out" 2> "/tmp/app-$safe_variant.err"
   app_status="$?"
   set -e
   selected="$(sed -n 's/^selected target-cpu: //p' "/tmp/app-$safe_variant.out" | head -n1)"
@@ -870,6 +990,7 @@ fn build_qemu_test_app(
     variants: &[String],
 ) -> Result<QemuTestApp> {
     let variant = build_variant.id();
+    let target = build_variant.target.triple(&arch.name)?;
     let package_name = format!("sonic-qemu-app-{variant}");
     let project = asset_dir
         .join("work")
@@ -898,10 +1019,7 @@ panic = "abort"
 "#
         ),
     )?;
-    fs::write(
-        project.join("src/main.rs"),
-        qemu_app_source(build_variant.runtime),
-    )?;
+    fs::write(project.join("src/main.rs"), qemu_app_source(build_variant))?;
 
     let target_dir = asset_dir
         .join("cargo-target")
@@ -914,11 +1032,11 @@ panic = "abort"
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_BUILD_RUSTFLAGS")
-        .env_remove(cargo_target_rustflags_env(&arch.target));
-    if arch.target == "aarch64-unknown-linux-musl" {
-        command.env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER", "rust-lld");
-    }
-    if let Some(rustflags) = qemu_payload_rustflags(arch, build_variant.runtime)? {
+        .env_remove("CARGO_SONIC_LOADER_RUSTFLAGS")
+        .env_remove(cargo_target_rustflags_env(&target))
+        .env_remove(cargo_target_linker_env(&target));
+    configure_qemu_target_linker(&mut command, &target, build_variant)?;
+    if let Some(rustflags) = qemu_payload_rustflags(&target, build_variant)? {
         command.env("CARGO_ENCODED_RUSTFLAGS", rustflags);
     }
     let target_cpus = variants.join(",");
@@ -939,7 +1057,7 @@ panic = "abort"
     }
     args.extend(["build".to_string(), "--release".to_string()]);
     if matches!(build_variant.compilation, QemuCompilation::Cross) {
-        args.extend(["--target".to_string(), arch.target.clone()]);
+        args.extend(["--target".to_string(), target.clone()]);
     }
     args.push("--manifest-path".to_string());
     let output = command
@@ -971,40 +1089,133 @@ panic = "abort"
     }
     Ok(QemuTestApp {
         variant,
+        target,
+        needs_musl_dynamic_runtime: matches!(
+            (build_variant.target, build_variant.runtime),
+            (QemuBuildTarget::Musl, QemuRuntime::Dynamic)
+        ),
         binary: path,
     })
 }
 
-fn qemu_payload_rustflags(arch: &SystemArch, runtime: QemuRuntime) -> Result<Option<String>> {
-    let flags = match runtime {
-        QemuRuntime::GlibcDynamic => Some("-C\x1ftarget-feature=-crt-static".to_string()),
-        QemuRuntime::MuslDynamic => {
-            let lib_dir = musl_dynamic_lib_dir(&arch.target).with_context(|| {
-                format!(
-                    "dynamic musl libs are required for {}",
-                    QemuRuntime::MuslDynamic.label()
-                )
+fn configure_qemu_target_linker(
+    command: &mut Command,
+    target: &str,
+    build_variant: QemuBuildVariant,
+) -> Result<()> {
+    if target.contains("-musl") {
+        command.env(cargo_target_linker_env(target), "rust-lld");
+        return Ok(());
+    }
+
+    let host_target = host_target_triple()?;
+    match build_variant.linker {
+        QemuLinker::GccLd => {
+            command.env(
+                cargo_target_linker_env(target),
+                qemu_gnu_gcc_linker(target, &host_target),
+            );
+        }
+        QemuLinker::ClangLld => {
+            let linker_flags = format!(
+                "-C link-arg=--target={target} -C link-arg=-fuse-ld={}",
+                qemu_lld_linker()
+            );
+            command.env(cargo_target_linker_env(target), qemu_clang_linker());
+            command.env(cargo_target_rustflags_env(target), &linker_flags);
+            command.env("CARGO_SONIC_LOADER_RUSTFLAGS", linker_flags);
+        }
+        QemuLinker::RustLld => {}
+    }
+    Ok(())
+}
+
+fn qemu_clang_linker() -> String {
+    std::env::var("CARGO_SONIC_QEMU_CLANG").unwrap_or_else(|_| "clang".to_string())
+}
+
+fn qemu_lld_linker() -> String {
+    std::env::var("CARGO_SONIC_QEMU_LLD").unwrap_or_else(|_| "lld".to_string())
+}
+
+fn qemu_lld_tool(linker: &str) -> String {
+    if linker == "lld" {
+        "ld.lld".to_string()
+    } else if let Some(version) = linker.strip_prefix("lld-") {
+        format!("ld.lld-{version}")
+    } else {
+        linker.to_string()
+    }
+}
+
+fn qemu_gnu_gcc_linker<'a>(target: &'a str, host_target: &str) -> &'a str {
+    if target == host_target {
+        "gcc"
+    } else if target.starts_with("aarch64-") {
+        "aarch64-linux-gnu-gcc"
+    } else if target.starts_with("x86_64-") {
+        "x86_64-linux-gnu-gcc"
+    } else {
+        "gcc"
+    }
+}
+
+fn qemu_payload_rustflags(target: &str, build_variant: QemuBuildVariant) -> Result<Option<String>> {
+    let mut flags = match (build_variant.target, build_variant.runtime) {
+        (QemuBuildTarget::Gnu, QemuRuntime::Dynamic) => {
+            Some("-C\x1ftarget-feature=-crt-static".to_string())
+        }
+        (QemuBuildTarget::Musl, QemuRuntime::Dynamic) => {
+            let lib_dir = musl_dynamic_lib_dir(target).with_context(|| {
+                format!("dynamic musl libs are required for {}", build_variant.id())
             })?;
-            let dynamic_linker = musl_dynamic_linker_path(&arch.target);
+            let dynamic_linker = musl_dynamic_linker_path(target);
             Some(format!(
                 "--cfg\x1fcargo_sonic_dynamic_libc_probe\x1f-C\x1ftarget-feature=-crt-static\x1f-C\x1flink-self-contained=no\x1f-C\x1flink-arg=-dynamic-linker\x1f-C\x1flink-arg={dynamic_linker}\x1f-L\x1fnative={}",
                 lib_dir.display()
             ))
         }
-        QemuRuntime::GlibcStatic | QemuRuntime::MuslStatic => {
-            Some("-C\x1ftarget-feature=+crt-static".to_string())
-        }
-        QemuRuntime::NoStd if arch.target.contains("-musl") => {
+        (_, QemuRuntime::Static) => Some("-C\x1ftarget-feature=+crt-static".to_string()),
+        (QemuBuildTarget::Musl, QemuRuntime::NoStd) => {
             Some("-Clink-self-contained=no\x1f-C\x1flink-arg=-static".to_string())
         }
-        QemuRuntime::NoStd => Some("-C\x1flink-arg=-nostartfiles".to_string()),
+        (QemuBuildTarget::Gnu, QemuRuntime::NoStd) => {
+            Some("-C\x1flink-arg=-nostartfiles".to_string())
+        }
     };
+    if matches!(build_variant.linker, QemuLinker::ClangLld) {
+        flags = Some(append_encoded_rustflags(
+            flags,
+            &[
+                "-C".to_string(),
+                format!("link-arg=--target={target}"),
+                "-C".to_string(),
+                "link-arg=-fuse-ld=lld".to_string(),
+            ],
+        ));
+    }
     Ok(flags)
 }
 
+fn append_encoded_rustflags(flags: Option<String>, extra: &[String]) -> String {
+    let mut parts = flags
+        .map(|flags| flags.split('\x1f').map(str::to_string).collect::<Vec<_>>())
+        .unwrap_or_default();
+    parts.extend(extra.iter().cloned());
+    parts.join("\x1f")
+}
+
 fn musl_dynamic_lib_dir(target: &str) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR").map(PathBuf::from) {
-        return musl_dynamic_lib_dir_is_usable(&path).then_some(path);
+    if let Some(path) = std::env::var_os(musl_dynamic_lib_dir_env(target)).map(PathBuf::from)
+        && musl_dynamic_lib_dir_is_usable(&path, target)
+    {
+        return Some(path);
+    }
+
+    if let Some(path) = std::env::var_os("CARGO_SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR").map(PathBuf::from)
+        && musl_dynamic_lib_dir_is_usable(&path, target)
+    {
+        return Some(path);
     }
 
     let sysroot = Command::new("rustc")
@@ -1019,20 +1230,60 @@ fn musl_dynamic_lib_dir(target: &str) -> Option<PathBuf> {
         .join("rustlib")
         .join(target)
         .join("lib");
-    musl_dynamic_lib_dir_is_usable(&lib_dir).then_some(lib_dir)
+    musl_dynamic_lib_dir_is_usable(&lib_dir, target).then_some(lib_dir)
 }
 
-fn musl_dynamic_lib_dir_is_usable(path: &Path) -> bool {
-    path.join("libc.so").exists()
+fn musl_dynamic_lib_dir_env(target: &str) -> String {
+    format!(
+        "CARGO_SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR_{}",
+        target
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    )
 }
 
-fn qemu_app_source(runtime: QemuRuntime) -> &'static str {
-    match runtime {
-        QemuRuntime::GlibcDynamic | QemuRuntime::GlibcStatic | QemuRuntime::MuslStatic => {
+fn musl_dynamic_lib_dir_is_usable(path: &Path, target: &str) -> bool {
+    musl_libc_matches_target(&path.join("libc.so"), target)
+}
+
+fn musl_libc_matches_target(path: &Path, target: &str) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let Some(machine) = elf_machine(&bytes) else {
+        return false;
+    };
+    if target.starts_with("x86_64-") {
+        machine == 62
+    } else if target.starts_with("aarch64-") {
+        machine == 183
+    } else {
+        false
+    }
+}
+
+fn elf_machine(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 20 || &bytes[0..4] != b"\x7fELF" || bytes[5] != 1 {
+        return None;
+    }
+    Some(u16::from_le_bytes([bytes[18], bytes[19]]))
+}
+
+fn qemu_app_source(build_variant: QemuBuildVariant) -> &'static str {
+    match (build_variant.target, build_variant.runtime) {
+        (QemuBuildTarget::Gnu, QemuRuntime::Dynamic | QemuRuntime::Static)
+        | (QemuBuildTarget::Musl, QemuRuntime::Static) => {
             r#"fn main() {
     let variant = std::env::var("CARGO_SONIC_SELECTED_TARGET_CPU").unwrap_or_default();
-    let len = std::env::var("SONIC_EXAMPLE_LEN").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(64);
-    let iters = std::env::var("SONIC_EXAMPLE_ITERS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1);
+    let len = std::env::var("CARGO_SONIC_EXAMPLE_LEN").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(64);
+    let iters = std::env::var("CARGO_SONIC_EXAMPLE_ITERS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1);
     let mut sum = 0u64;
     for r in 0..iters {
         for i in 0..len {
@@ -1046,7 +1297,7 @@ fn qemu_app_source(runtime: QemuRuntime) -> &'static str {
     println!("checksum: {sum}");
 }"#
         }
-        QemuRuntime::MuslDynamic | QemuRuntime::NoStd => {
+        (QemuBuildTarget::Musl, QemuRuntime::Dynamic) | (_, QemuRuntime::NoStd) => {
             r##"#![no_std]
 #![no_main]
 #![allow(unexpected_cfgs)]
@@ -1270,12 +1521,28 @@ fn cargo_target_rustflags_env(target: &str) -> String {
     )
 }
 
+fn cargo_target_linker_env(target: &str) -> String {
+    format!(
+        "CARGO_TARGET_{}_LINKER",
+        target
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    )
+}
+
 fn rustc_payload_target_cpus(
     asset_dir: &Path,
     arch: &SystemArch,
+    target: &str,
     cases: &[&SystemCase],
 ) -> Result<Vec<String>> {
-    let target = &arch.target;
     let valid = rustc_target_cpus(target)?;
     let requested = qemu_payload_candidates(arch, cases);
     let probe_dir = asset_dir
@@ -1506,7 +1773,7 @@ fn build_test_initramfs(
             }
         }
     }
-    install_musl_dynamic_runtime(&rootfs, arch)?;
+    install_musl_dynamic_runtimes(&rootfs, apps)?;
     for app in apps {
         let guest_name = qemu_guest_app_name(&app.variant);
         let guest_path = rootfs.join(&guest_name);
@@ -1537,14 +1804,25 @@ fn qemu_guest_app_name(variant: &str) -> String {
     format!("sonic-qemu-app-{variant}")
 }
 
-fn install_musl_dynamic_runtime(rootfs: &Path, arch: &SystemArch) -> Result<()> {
-    if !arch.target.contains("-musl") {
-        return Ok(());
+fn install_musl_dynamic_runtimes(rootfs: &Path, apps: &[QemuTestApp]) -> Result<()> {
+    let mut targets = apps
+        .iter()
+        .filter(|app| app.needs_musl_dynamic_runtime)
+        .map(|app| app.target.as_str())
+        .collect::<Vec<_>>();
+    targets.sort_unstable();
+    targets.dedup();
+    for target in targets {
+        install_musl_dynamic_runtime(rootfs, target)?;
     }
-    let lib_dir = musl_dynamic_lib_dir(&arch.target).with_context(|| {
+    Ok(())
+}
+
+fn install_musl_dynamic_runtime(rootfs: &Path, target: &str) -> Result<()> {
+    let lib_dir = musl_dynamic_lib_dir(target).with_context(|| {
         format!(
-            "dynamic musl runtime for {} is required; set SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR",
-            arch.target
+            "dynamic musl runtime for {target} is required; set {} or CARGO_SONIC_QEMU_MUSL_DYNAMIC_LIB_DIR",
+            musl_dynamic_lib_dir_env(target)
         )
     })?;
     let rootfs_lib = rootfs.join("lib");
@@ -1561,7 +1839,7 @@ fn install_musl_dynamic_runtime(rootfs: &Path, arch: &SystemArch) -> Result<()> 
                 .with_context(|| format!("failed to copy {}", entry.path().display()))?;
         }
     }
-    let loader = rootfs_lib.join(musl_loader_name(&arch.target));
+    let loader = rootfs_lib.join(musl_loader_name(target));
     if !loader.exists() && rootfs_lib.join("libc.so").exists() {
         std::os::unix::fs::symlink("libc.so", &loader)
             .with_context(|| format!("failed to create {}", loader.display()))?;
@@ -1613,6 +1891,7 @@ fn run_qemu_case(
     asset_dir: &Path,
     arch: &SystemArch,
     variant: &str,
+    app_count: usize,
     case: &SystemCase,
     initrd: &Path,
 ) -> std::result::Result<(), Box<QemuCaseFailure>> {
@@ -1640,8 +1919,9 @@ fn run_qemu_case(
         args.extend(["-append".into(), "console=ttyS0 panic=-1 init=/init".into()]);
     }
 
+    let timeout_secs = qemu_case_timeout_secs(app_count);
     let output = Command::new("timeout")
-        .arg("180s")
+        .arg(format!("{timeout_secs}s"))
         .arg(qemu)
         .args(args)
         .output()
@@ -1677,6 +1957,18 @@ fn run_qemu_case(
         }));
     }
     Ok(())
+}
+
+fn qemu_case_timeout_secs(app_count: usize) -> usize {
+    std::env::var("CARGO_SONIC_QEMU_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or_else(|| default_qemu_case_timeout_secs(app_count))
+}
+
+fn default_qemu_case_timeout_secs(app_count: usize) -> usize {
+    180.max(90 + app_count.saturating_mul(12))
 }
 
 fn write_qemu_case_log(
@@ -1882,7 +2174,7 @@ fn parallel_jobs() -> usize {
 }
 
 fn qemu_jobs() -> usize {
-    std::env::var("SONIC_QEMU_JOBS")
+    std::env::var("CARGO_SONIC_QEMU_JOBS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|jobs| *jobs > 0)
@@ -1906,12 +2198,19 @@ fn write_qemu_readme(asset_dir: &Path, manifest: &SystemManifest) -> Result<()> 
     );
     for arch in &manifest.arch {
         text.push_str(&format!("## {}\n\n", arch.name));
-        text.push_str(&format!("- target: `{}`\n", arch.target));
+        let targets = [QemuBuildTarget::Gnu, QemuBuildTarget::Musl]
+            .into_iter()
+            .filter_map(|target| target.triple(&arch.name).ok())
+            .collect::<Vec<_>>();
+        text.push_str(&format!("- guest rust target: `{}`\n", arch.target));
+        text.push_str(&format!("- build targets: `{}`\n", targets.join("`, `")));
         text.push_str(&format!("- qemu: `{}`\n", arch.qemu_system));
         text.push_str(&format!("- qemu binary: `{}`\n", arch.qemu_binary));
         text.push_str(&format!("- kernel: `{}`\n", arch.kernel));
         text.push_str(&format!("- initrd: `{}`\n", arch.initrd));
-        text.push_str("- variants: rustc target-cpus needed by configured qemu cases, excluding `native` and the implicit cargo-sonic baseline\n");
+        text.push_str("- build matrix: gnu/musl, dynamic/static/nostd, plain/zstd, embedded/bundle, gcc-ld/clang-lld for gnu, normal/cross where applicable\n");
+        text.push_str("- clang-lld tools: set `CARGO_SONIC_QEMU_CLANG` and `CARGO_SONIC_QEMU_LLD` to override the default `clang` and `lld`\n");
+        text.push_str("- cpu variants: rustc target-cpus needed by configured qemu cases, excluding `native` and the implicit cargo-sonic baseline\n");
         text.push_str(&format!("- cpu cases: `{}`\n", arch.case.len()));
         text.push_str(&format!(
             "- cpus: `{}`\n\n",
@@ -1963,4 +2262,90 @@ fn qemu_asset_dir(root: &Path) -> Result<PathBuf> {
         });
     }
     Ok(root.join("target").join(QEMU_ASSET_SUBDIR))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arch(name: &str, target: &str) -> SystemArch {
+        SystemArch {
+            name: name.to_string(),
+            target: target.to_string(),
+            qemu_system: String::new(),
+            qemu_binary: String::new(),
+            kernel: String::new(),
+            initrd: String::new(),
+            guest_archive_url: String::new(),
+            guest_archive_sha256: String::new(),
+            guest_kernel_member: String::new(),
+            guest_initrd_member: String::new(),
+            rootfs_archive_url: String::new(),
+            rootfs_archive_sha256: String::new(),
+            rust_archive_url: String::new(),
+            rust_archive_sha256: String::new(),
+            case: Vec::new(),
+            exception: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn qemu_gnu_variants_cover_gcc_ld_and_clang_lld() {
+        let variants = qemu_build_variants(
+            &arch("aarch64", "aarch64-unknown-linux-gnu"),
+            "x86_64-unknown-linux-gnu",
+        );
+        let ids = variants
+            .iter()
+            .map(|variant| variant.id())
+            .collect::<Vec<_>>();
+
+        assert!(
+            ids.iter()
+                .any(|id| id.starts_with("gnu-dynamic-plain-embedded-gcc-ld-cross"))
+        );
+        assert!(
+            ids.iter()
+                .any(|id| id.starts_with("gnu-dynamic-plain-embedded-clang-lld-cross"))
+        );
+        assert!(
+            ids.iter()
+                .all(|id| !id.starts_with("musl-") || id.contains("-rust-lld-"))
+        );
+    }
+
+    #[test]
+    fn clang_lld_payload_flags_are_encoded_for_gnu_builds() {
+        let flags = qemu_payload_rustflags(
+            "aarch64-unknown-linux-gnu",
+            QemuBuildVariant {
+                target: QemuBuildTarget::Gnu,
+                runtime: QemuRuntime::Dynamic,
+                compression: QemuCompression::Plain,
+                loader: QemuLoader::Embedded,
+                linker: QemuLinker::ClangLld,
+                compilation: QemuCompilation::Cross,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let parts = flags.split('\x1f').collect::<Vec<_>>();
+
+        assert!(parts.contains(&"target-feature=-crt-static"));
+        assert!(parts.contains(&"link-arg=--target=aarch64-unknown-linux-gnu"));
+        assert!(parts.contains(&"link-arg=-fuse-ld=lld"));
+    }
+
+    #[test]
+    fn qemu_lld_tool_maps_common_fuse_ld_names() {
+        assert_eq!(qemu_lld_tool("lld"), "ld.lld");
+        assert_eq!(qemu_lld_tool("lld-22"), "ld.lld-22");
+        assert_eq!(qemu_lld_tool("/usr/bin/ld.lld-22"), "/usr/bin/ld.lld-22");
+    }
+
+    #[test]
+    fn qemu_case_timeout_scales_with_matrix_size() {
+        assert_eq!(default_qemu_case_timeout_secs(1), 180);
+        assert_eq!(default_qemu_case_timeout_secs(60), 810);
+    }
 }

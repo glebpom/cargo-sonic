@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 
 const OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 const OUTPUT_FLUSH_BYTES: usize = 8 * 1024;
+const LOADER_RUSTFLAGS_ENV: &str = "CARGO_SONIC_LOADER_RUSTFLAGS";
 
 #[derive(Debug, Clone)]
 pub struct BuildOptions {
@@ -2180,12 +2181,7 @@ fn build_loader(loader_dir: &Utf8Path, target: &str, profile: &str) -> Result<Ut
     if profile == "release" {
         cmd.arg("--release");
     }
-    let mut rustflags = split_rustflags(loader_rustflags(target));
-    if loader_dir.join("auditable.o").exists() {
-        rustflags.extend(split_rustflags(
-            "-C link-arg=auditable.o -C link-arg=-Wl,-u,__cargo_sonic_auditable_dep_v0",
-        ));
-    }
+    let rustflags = loader_build_rustflags(target, loader_dir.join("auditable.o").exists());
     cmd.env_remove("RUSTFLAGS");
     cmd.env_remove("CARGO_BUILD_RUSTFLAGS");
     cmd.env_remove(cargo_target_rustflags_env(target));
@@ -2201,6 +2197,20 @@ fn build_loader(loader_dir: &Utf8Path, target: &str, profile: &str) -> Result<Ut
         .join(profile)
         .join("sonic-generated-loader");
     Ok(exe)
+}
+
+fn loader_build_rustflags(target: &str, auditable: bool) -> Vec<String> {
+    let mut rustflags = Vec::new();
+    if let Some(flags) = std::env::var_os(LOADER_RUSTFLAGS_ENV) {
+        rustflags.extend(split_rustflags(&flags.to_string_lossy()));
+    }
+    rustflags.extend(split_rustflags(loader_rustflags(target)));
+    if auditable {
+        rustflags.extend(split_rustflags(
+            "-C link-arg=auditable.o -C link-arg=-Wl,-u,__cargo_sonic_auditable_dep_v0",
+        ));
+    }
+    rustflags
 }
 
 fn loader_rustflags(target: &str) -> &'static str {
@@ -3804,6 +3814,46 @@ mod tests {
     }
 
     #[test]
+    fn loader_rustflags_use_loader_specific_env_only() {
+        with_rustflags_env(|| {
+            unsafe {
+                std::env::set_var("CARGO_ENCODED_RUSTFLAGS", "-Clto\x1f-Cpanic=abort");
+                std::env::set_var("RUSTFLAGS", "-C debuginfo=1");
+                std::env::set_var(
+                    TARGET_RUSTFLAGS_ENV,
+                    "-C link-arg=--target=aarch64-unknown-linux-gnu",
+                );
+                std::env::set_var(
+                    LOADER_RUSTFLAGS_ENV,
+                    "-C panic=unwind -C link-arg=--target=aarch64-unknown-linux-gnu -C link-arg=-fuse-ld=lld",
+                );
+            }
+
+            assert_eq!(
+                loader_build_rustflags("aarch64-unknown-linux-gnu", false),
+                vec![
+                    "-C",
+                    "panic=unwind",
+                    "-C",
+                    "link-arg=--target=aarch64-unknown-linux-gnu",
+                    "-C",
+                    "link-arg=-fuse-ld=lld",
+                    "-C",
+                    "panic=abort",
+                    "-C",
+                    "target-feature=+crt-static",
+                    "-C",
+                    "relocation-model=static",
+                    "-C",
+                    "link-arg=-nostartfiles",
+                    "-C",
+                    "link-arg=-static"
+                ]
+            );
+        });
+    }
+
+    #[test]
     fn payload_rustflags_preserve_cargo_encoded_rustflags_precedence() {
         with_rustflags_env(|| {
             unsafe {
@@ -3856,6 +3906,8 @@ mod tests {
         let vars = [
             "CARGO_ENCODED_RUSTFLAGS".to_string(),
             "RUSTFLAGS".to_string(),
+            "CARGO_BUILD_RUSTFLAGS".to_string(),
+            LOADER_RUSTFLAGS_ENV.to_string(),
             TARGET_RUSTFLAGS_ENV.to_string(),
         ];
         let _restore = EnvRestore {
