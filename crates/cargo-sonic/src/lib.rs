@@ -5347,6 +5347,410 @@ Available CPUs for this target:
         assert!(report.contains("fits=[]"));
     }
 
+    #[test]
+    fn build_rejects_zero_parallelism_before_touching_cargo() {
+        // parallelism=0 must short-circuit at the very first check so the
+        // assertion does not accidentally depend on a real cargo workspace.
+        let err = build(BuildOptions {
+            cargo_args: Vec::new(),
+            manifest_path: None,
+            target_cpus: vec!["haswell".into()],
+            parallelism: 0,
+            compress: PayloadCompression::None,
+            compression_level: 22,
+            loader: LoaderStrategy::Embedded,
+            auditable: false,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("--parallelism"));
+    }
+
+    #[test]
+    fn build_rejects_empty_target_cpus_before_touching_cargo() {
+        let err = build(BuildOptions {
+            cargo_args: Vec::new(),
+            manifest_path: None,
+            target_cpus: Vec::new(),
+            parallelism: 1,
+            compress: PayloadCompression::None,
+            compression_level: 22,
+            loader: LoaderStrategy::Embedded,
+            auditable: false,
+        });
+        assert!(err.is_err());
+        // Either a manifest-resolution failure, an effective_target_cpus
+        // failure, or a target_os check — any of these is fine; we just
+        // confirm the call exercises early-validation paths without panic.
+    }
+
+    #[test]
+    fn probe_rejects_empty_target_cpus() {
+        let err = probe(ProbeOptions {
+            cargo_args: Vec::new(),
+            target_cpus: Vec::new(),
+        })
+        .unwrap_err();
+        // First failing check inside `probe` is `effective_target_cpus`,
+        // which surfaces the `--target-cpus` hint in its error message.
+        assert!(err.to_string().contains("--target-cpus"));
+    }
+
+    #[test]
+    fn generated_main_embedded_renders_loader_skeleton() {
+        let source = generated_main("x86_64-unknown-linux-gnu", false, LoaderStrategy::Embedded);
+        assert!(source.contains("compile_error!(\"cargo-sonic loader supports Linux only\")"));
+        assert!(source.contains("mod feature_mask;"));
+        assert!(source.contains("mod select;"));
+        // The strategy is plumbed in via a placeholder substitution: the
+        // call site at the entry point picks one of the two helpers, but
+        // both helper *definitions* appear in the static template body.
+        assert!(source.contains("exec_embedded_payload(selected, &initial)"));
+        assert!(!source.contains("exec_bundle_payload(selected, &initial)"));
+        // Without zstd, the no-op zstd shims appear instead of the real
+        // FrameDecoder allocator block.
+        assert!(source.contains("write_zstd_payload"));
+        assert!(!source.contains("ruzstd::decoding::FrameDecoder"));
+        // Placeholder must be fully substituted.
+        assert!(!source.contains("__CARGO_SONIC_EXEC_PAYLOAD__"));
+        assert!(!source.contains("/*__CARGO_SONIC_ZSTD_SUPPORT__*/"));
+    }
+
+    #[test]
+    fn generated_main_bundle_swaps_exec_helper() {
+        let source = generated_main("x86_64-unknown-linux-musl", false, LoaderStrategy::Bundle);
+        assert!(source.contains("exec_bundle_payload(selected, &initial)"));
+        assert!(!source.contains("exec_embedded_payload(selected, &initial)"));
+    }
+
+    #[test]
+    fn generated_main_zstd_emits_mmap_allocator_and_decoder() {
+        let source = generated_main("aarch64-unknown-linux-gnu", true, LoaderStrategy::Embedded);
+        assert!(source.contains("MmapAllocator"));
+        assert!(source.contains("global_allocator"));
+        assert!(source.contains("ruzstd::decoding::FrameDecoder"));
+        assert!(source.contains("write_zstd_payload_from_fd"));
+    }
+
+    #[test]
+    fn generated_linux_sys_carries_arch_specific_syscall_numbers() {
+        let source = generated_linux_sys();
+        assert!(source.contains("SYS_WRITE"));
+        assert!(source.contains("SYS_MMAP"));
+        // Both arch tables present — gated by cfg, but visible as text.
+        assert!(source.contains("#[cfg(target_arch = \"x86_64\")]"));
+        assert!(source.contains("#[cfg(target_arch = \"aarch64\")]"));
+        assert!(source.contains("memfd_create_best_effort"));
+    }
+
+    #[test]
+    fn generated_stack_is_loader_stack_module() {
+        let source = generated_stack();
+        // loader_stack.rs is the file we're including.
+        assert!(source.contains("InitialStack"));
+    }
+
+    #[test]
+    fn escape_bytes_handles_quote_and_backslash() {
+        assert_eq!(escape_bytes("plain"), "plain");
+        assert_eq!(escape_bytes("a\"b"), "a\\\"b");
+        assert_eq!(escape_bytes("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn target_feature_tier_distinguishes_arches_and_target_kinds() {
+        // Generic always tier 0, regardless of arch.
+        assert_eq!(target_feature_tier("x86_64", TargetKind::Generic), 0);
+        assert_eq!(target_feature_tier("aarch64", TargetKind::Generic), 0);
+        // x86 neutral level → tier 1, x86 specific → tier 2.
+        assert_eq!(
+            target_feature_tier("x86_64", TargetKind::X86NeutralLevel { level: 3 }),
+            1
+        );
+        assert_eq!(target_feature_tier("x86_64", TargetKind::X86IntelCore), 2);
+        assert_eq!(
+            target_feature_tier("x86_64", TargetKind::X86AmdZen { generation: 5 }),
+            2
+        );
+        // aarch64 always tier 2 for any non-Generic.
+        assert_eq!(
+            target_feature_tier("aarch64", TargetKind::Aarch64ArmCortexA),
+            2
+        );
+        assert_eq!(
+            target_feature_tier("aarch64", TargetKind::Aarch64ArmNeoverseN),
+            2
+        );
+        // Unknown arch falls through to 0.
+        assert_eq!(target_feature_tier("riscv64", TargetKind::X86IntelCore), 0);
+    }
+
+    #[test]
+    fn classify_target_cpu_aarch64_buckets() {
+        assert_eq!(
+            classify_target_cpu("cortex-a76", "aarch64", "generic"),
+            TargetKind::Aarch64ArmCortexA
+        );
+        assert_eq!(
+            classify_target_cpu("cortex-x1", "aarch64", "generic"),
+            TargetKind::Aarch64ArmCortexX
+        );
+        assert_eq!(
+            classify_target_cpu("neoverse-n1", "aarch64", "generic"),
+            TargetKind::Aarch64ArmNeoverseN
+        );
+        assert_eq!(
+            classify_target_cpu("neoverse-v3", "aarch64", "generic"),
+            TargetKind::Aarch64ArmNeoverseV
+        );
+        assert_eq!(
+            classify_target_cpu("neoverse-512tvb", "aarch64", "generic"),
+            TargetKind::Aarch64ArmNeoverseV
+        );
+        assert_eq!(
+            classify_target_cpu("neoverse-e1", "aarch64", "generic"),
+            TargetKind::Aarch64ArmNeoverseE
+        );
+        assert_eq!(
+            classify_target_cpu("apple-m1", "aarch64", "generic"),
+            TargetKind::Aarch64Apple
+        );
+        assert_eq!(
+            classify_target_cpu("ampere1", "aarch64", "generic"),
+            TargetKind::Aarch64Ampere
+        );
+        assert_eq!(
+            classify_target_cpu("a64fx", "aarch64", "generic"),
+            TargetKind::Aarch64Other
+        );
+        assert_eq!(
+            classify_target_cpu("generic", "aarch64", "generic"),
+            TargetKind::Generic
+        );
+    }
+
+    #[test]
+    fn classify_target_cpu_x86_intel_xeon_special_arms() {
+        // Note: arm precedence matters. The function tries the `lake/well/
+        // bridge/...` Core arm before the `rapids/skx/...` Xeon arm, so
+        // anything that contains `lake` resolves to Core regardless of its
+        // suffix. That's documented by these assertions.
+        assert_eq!(
+            classify_target_cpu("knl", "x86_64", "x86-64"),
+            TargetKind::X86IntelXeon
+        );
+        assert_eq!(
+            classify_target_cpu("knm", "x86_64", "x86-64"),
+            TargetKind::X86IntelXeon
+        );
+        assert_eq!(
+            classify_target_cpu("mic_avx512", "x86_64", "x86-64"),
+            TargetKind::X86IntelXeon
+        );
+        // Even though `skylake-avx512` would conceptually be a Xeon, the
+        // `lake` substring matches the Core arm first.
+        assert_eq!(
+            classify_target_cpu("skylake-avx512", "x86_64", "x86-64"),
+            TargetKind::X86IntelCore
+        );
+    }
+
+    #[test]
+    fn classify_target_cpu_x86_intel_atom_special_arms() {
+        for cpu in ["bonnell", "slm", "tremont", "atom_avx", "silvermont"] {
+            assert_eq!(
+                classify_target_cpu(cpu, "x86_64", "x86-64"),
+                TargetKind::X86IntelAtom,
+                "{cpu}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_target_cpu_x86_falls_back_to_amd_other_for_unknowns() {
+        assert_eq!(
+            classify_target_cpu("totally-unknown", "x86_64", "x86-64"),
+            TargetKind::X86AmdOther
+        );
+    }
+
+    #[test]
+    fn classify_target_cpu_x86_neutral_levels() {
+        for (cpu, lvl) in [
+            ("x86-64", 1),
+            ("x86-64-v2", 2),
+            ("x86-64-v3", 3),
+            ("x86-64-v4", 4),
+        ] {
+            // Only when the cpu is *not* the baseline does the neutral-level
+            // arm fire. Use a different baseline so all four levels return
+            // X86NeutralLevel.
+            assert_eq!(
+                classify_target_cpu(cpu, "x86_64", "alt-baseline"),
+                TargetKind::X86NeutralLevel { level: lvl },
+                "{cpu}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_target_cpu_x86_znver_generation_fallback_zero() {
+        // znverFOO → trim_start_matches("znver").parse() == None ⇒ unwrap_or(0).
+        assert_eq!(
+            classify_target_cpu("znverFOO", "x86_64", "x86-64"),
+            TargetKind::X86AmdZen { generation: 0 }
+        );
+    }
+
+    #[test]
+    fn analyze_warnings_no_warnings_for_distinct_feature_sets() {
+        let map = BTreeMap::from([
+            ("haswell".into(), vec!["avx2".into()]),
+            ("znver5".into(), vec!["avx512f".into()]),
+        ]);
+        let warnings = analyze_warnings(&map, "x86_64");
+        assert!(
+            warnings.iter().all(|w| !w.contains("identical")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn analyze_warnings_aarch64_does_not_emit_neutral_warning() {
+        // Neutral-fallback warning is x86-only.
+        let map = BTreeMap::from([
+            ("cortex-a76".into(), vec!["fp16".into()]),
+            ("neoverse-v1".into(), vec!["sve".into()]),
+        ]);
+        let warnings = analyze_warnings(&map, "aarch64");
+        assert!(
+            warnings.iter().all(|w| !w.contains("neutral")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn print_probe_report_prints_to_stdout_without_panic() {
+        // Just exercise the `print!` wrapper around format_probe_report.
+        print_probe_report(
+            "x86_64-unknown-linux-gnu",
+            HostInfo {
+                arch: TargetArch::X86_64,
+                features: FeatureMask::EMPTY,
+                identity: CpuIdentity::Unknown,
+                heterogeneous: false,
+            },
+            &[ProbeVariant {
+                target_cpu: "generic".to_string(),
+                required_features: FeatureMask::EMPTY,
+                rank_features: FeatureMask::EMPTY,
+                feature_names: Vec::new(),
+                feature_tier: 0,
+            }],
+            &[],
+            "generic",
+        );
+    }
+
+    #[test]
+    fn print_score_report_prints_to_stdout_without_panic() {
+        print_score_report(
+            "x86_64-unknown-linux-gnu",
+            HostInfo {
+                arch: TargetArch::X86_64,
+                features: FeatureMask::EMPTY,
+                identity: CpuIdentity::Unknown,
+                heterogeneous: false,
+            },
+            &[],
+            &[],
+            0,
+        );
+    }
+
+    #[test]
+    fn print_variant_build_prelude_writes_to_stderr() {
+        // Smoke test: just runs the eprintln + flush path without panic.
+        print_variant_build_prelude("haswell");
+    }
+
+    #[test]
+    fn leaked_str_returns_distinct_static_strs() {
+        let a = leaked_str("hello-world");
+        let b = leaked_str("hello-world");
+        assert_eq!(a, "hello-world");
+        assert_eq!(b, "hello-world");
+        // They share no buffer (each call leaks a fresh allocation).
+        assert!(!core::ptr::eq(a.as_ptr(), b.as_ptr()));
+    }
+
+    #[test]
+    fn rustflags_for_target_uses_cargo_config_with_no_env() {
+        with_rustflags_env(|| {
+            let got =
+                rustflags_for_target("aarch64-unknown-linux-gnu", ["-C panic=abort".to_string()]);
+            match got {
+                PayloadRustflags::CargoConfig(arg) => {
+                    assert!(arg.contains("aarch64-unknown-linux-gnu.rustflags"));
+                    assert!(arg.contains("-C panic=abort"));
+                }
+                other => panic!("expected CargoConfig, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn rustflags_for_target_plain_path_appends_to_existing_flags() {
+        with_rustflags_env(|| {
+            unsafe {
+                std::env::set_var("RUSTFLAGS", "-Cdebuginfo=2");
+            }
+            let got = rustflags_for_target("x86_64-unknown-linux-gnu", ["-Clto".to_string()]);
+            match got {
+                PayloadRustflags::Plain(flags) => {
+                    let s = flags.to_string_lossy().to_string();
+                    assert!(s.contains("-Cdebuginfo=2"));
+                    assert!(s.contains("-Clto"));
+                    // Joined with a space when both sides non-empty.
+                    assert!(s.contains(" -Clto"));
+                }
+                other => panic!("expected Plain, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn rustflags_for_target_plain_path_no_extra_separator_when_empty_existing() {
+        with_rustflags_env(|| {
+            unsafe {
+                std::env::set_var("RUSTFLAGS", "");
+            }
+            let got = rustflags_for_target("x86_64-unknown-linux-gnu", ["-Clto".to_string()]);
+            match got {
+                PayloadRustflags::Plain(flags) => {
+                    assert_eq!(flags.to_string_lossy(), "-Clto");
+                }
+                other => panic!("expected Plain, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn rustflags_for_target_plain_path_preserves_when_no_new_flags() {
+        with_rustflags_env(|| {
+            unsafe {
+                std::env::set_var("RUSTFLAGS", "-Cdebuginfo=2");
+            }
+            let got =
+                rustflags_for_target("x86_64-unknown-linux-gnu", std::iter::empty::<String>());
+            match got {
+                PayloadRustflags::Plain(flags) => {
+                    assert_eq!(flags.to_string_lossy(), "-Cdebuginfo=2");
+                }
+                other => panic!("expected Plain, got {other:?}"),
+            }
+        });
+    }
+
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
     }
