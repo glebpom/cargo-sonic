@@ -5751,6 +5751,329 @@ Available CPUs for this target:
         });
     }
 
+    #[test]
+    fn select_package_picks_root_when_present() {
+        // Use this very crate's metadata: cargo-sonic is in a workspace, so
+        // root_package() is None and there are multiple workspace_members.
+        // First check the explicit-by-name path.
+        let metadata = MetadataCommand::new()
+            .manifest_path(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")))
+            .exec()
+            .unwrap();
+        let pkg = select_package(&metadata, Some("cargo-sonic")).unwrap();
+        assert_eq!(pkg.name.as_str(), "cargo-sonic");
+    }
+
+    #[test]
+    fn select_package_errors_on_unknown_package_name() {
+        let metadata = MetadataCommand::new()
+            .manifest_path(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")))
+            .exec()
+            .unwrap();
+        let err = select_package(&metadata, Some("definitely-not-real")).unwrap_err();
+        assert!(err.to_string().contains("definitely-not-real"));
+    }
+
+    #[test]
+    fn select_package_falls_back_to_root_or_workspace_member() {
+        // No package hint: must succeed when there's a clear single root or
+        // single workspace member, else error with --package hint.
+        let metadata = MetadataCommand::new()
+            .manifest_path(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")))
+            .exec()
+            .unwrap();
+        // cargo-sonic crate Cargo.toml IS the package itself ⇒ root_package returns Some.
+        let pkg = select_package(&metadata, None).unwrap();
+        assert_eq!(pkg.name.as_str(), "cargo-sonic");
+    }
+
+    #[test]
+    fn select_package_errors_when_no_root_and_multi_members() {
+        // Workspace root: root_package() is None, workspace_members > 1, so
+        // select_package must surface the `--package` hint.
+        let workspace_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+        let metadata = MetadataCommand::new()
+            .manifest_path(format!("{workspace_root}/Cargo.toml"))
+            .exec()
+            .unwrap();
+        // The workspace root itself has `members = ["crates/*"]`, no root.
+        if metadata.root_package().is_none() && metadata.workspace_members.len() > 1 {
+            let err = select_package(&metadata, None).unwrap_err();
+            assert!(err.to_string().contains("--package"));
+        }
+    }
+
+    #[test]
+    fn resolve_bin_name_uses_explicit_override() {
+        let metadata = MetadataCommand::new()
+            .manifest_path(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")))
+            .exec()
+            .unwrap();
+        let pkg = select_package(&metadata, Some("cargo-sonic")).unwrap();
+        let got = resolve_bin_name(pkg, Some("explicit-name"), &[]).unwrap();
+        assert_eq!(got, "explicit-name");
+    }
+
+    #[test]
+    fn resolve_bin_name_picks_single_bin_target_automatically() {
+        // cargo-sonic itself has exactly one [[bin]]: cargo-sonic.
+        let metadata = MetadataCommand::new()
+            .manifest_path(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")))
+            .exec()
+            .unwrap();
+        let pkg = select_package(&metadata, Some("cargo-sonic")).unwrap();
+        let got = resolve_bin_name(pkg, None, &[]).unwrap();
+        assert_eq!(got, "cargo-sonic");
+    }
+
+    fn synth_variant_build(target_cpu: &str, artifact: &Utf8Path) -> VariantBuild {
+        VariantBuild {
+            target_cpu: target_cpu.to_string(),
+            required_features: FeatureMask::EMPTY,
+            rank_features: FeatureMask::EMPTY,
+            feature_names: Vec::new(),
+            feature_tier: 0,
+            target_kind: TargetKind::Generic,
+            artifact: artifact.to_path_buf(),
+            payload_compression: PayloadCompression::None,
+            uncompressed_len: 0,
+            bundle_path: "generic.elf",
+        }
+    }
+
+    #[test]
+    fn prepare_bundle_directory_replaces_existing_dir_and_copies_payloads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+        let final_binary = root.join("myapp");
+        let bundle_dir = bundle_dir_for(&final_binary);
+
+        // Pre-create the bundle dir with a stale entry so we exercise the
+        // "exists ⇒ remove_dir_all" branch.
+        fs::create_dir_all(&bundle_dir).unwrap();
+        fs::write(bundle_dir.join("stale-file"), b"stale").unwrap();
+
+        // Two real payload files to copy in.
+        let payload_a = root.join("payload-a.elf");
+        fs::write(&payload_a, b"AAAA").unwrap();
+        let payload_b = root.join("payload-b.elf");
+        fs::write(&payload_b, b"BBBB").unwrap();
+        let variants = [
+            VariantBuild {
+                bundle_path: "x86-64.elf",
+                ..synth_variant_build("x86-64", &payload_a)
+            },
+            VariantBuild {
+                bundle_path: "haswell.elf",
+                ..synth_variant_build("haswell", &payload_b)
+            },
+        ];
+
+        prepare_bundle_directory(&final_binary, &variants).unwrap();
+
+        // Stale file gone, new files present.
+        assert!(!bundle_dir.join("stale-file").exists());
+        assert_eq!(fs::read(bundle_dir.join("x86-64.elf")).unwrap(), b"AAAA");
+        assert_eq!(fs::read(bundle_dir.join("haswell.elf")).unwrap(), b"BBBB");
+
+        // make_executable ran on each payload (Unix only).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(bundle_dir.join("x86-64.elf"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert!(mode & 0o111 != 0, "expected executable bit, got {mode:o}");
+        }
+    }
+
+    #[test]
+    fn prepare_bundle_directory_handles_missing_source_gracefully() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+        let final_binary = root.join("myapp");
+
+        let missing = root.join("does-not-exist.elf");
+        let variants = [synth_variant_build("haswell", &missing)];
+
+        let err = prepare_bundle_directory(&final_binary, &variants).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("failed to copy"));
+    }
+
+    #[test]
+    fn generated_manifest_includes_payload_paths_and_sanitized_consts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+        // Variant artifact must exist so fs::metadata().len() succeeds in the
+        // embedded path and reports the right size.
+        let payload = root.join("payload.elf");
+        fs::write(&payload, b"hello").unwrap();
+
+        let mut features = FeatureMask::EMPTY;
+        features.insert(crate::feature_mask::Feature::Avx2);
+        let variant = VariantBuild {
+            target_cpu: "haswell".to_string(),
+            required_features: features,
+            rank_features: features,
+            feature_names: vec!["avx2".to_string()],
+            feature_tier: 2,
+            target_kind: TargetKind::X86IntelCore,
+            artifact: payload,
+            payload_compression: PayloadCompression::None,
+            uncompressed_len: 5,
+            bundle_path: "haswell.elf",
+        };
+
+        let manifest = generated_manifest(std::slice::from_ref(&variant), LoaderStrategy::Embedded);
+        assert!(manifest.contains("pub static VARIANTS"));
+        assert!(manifest.contains("target_cpu: \"haswell\""));
+        assert!(manifest.contains("PAYLOAD_HASWELL"));
+        assert!(manifest.contains("AlignedPayload"));
+        assert!(
+            manifest.contains(
+                "env_selected_target_cpu: b\"CARGO_SONIC_SELECTED_TARGET_CPU=haswell\\0\""
+            )
+        );
+        assert!(manifest.contains("payload_compression: PayloadCompression::None"));
+
+        let bundle_manifest = generated_manifest(&[variant], LoaderStrategy::Bundle);
+        // Bundle strategy uses an empty payload reference instead of an
+        // include_bytes! constant.
+        assert!(bundle_manifest.contains("payload: &[]"));
+        assert!(!bundle_manifest.contains("AlignedPayload"));
+    }
+
+    #[test]
+    fn generated_manifest_with_no_variants_emits_empty_table() {
+        let manifest = generated_manifest(&[], LoaderStrategy::Embedded);
+        assert!(manifest.contains("pub static VARIANTS: &[Variant] = &[\n];"));
+    }
+
+    #[test]
+    fn generated_manifest_with_zstd_uses_zstd_compression_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+        let payload = root.join("payload.elf.zstd");
+        fs::write(&payload, b"compressed").unwrap();
+
+        let variant = VariantBuild {
+            payload_compression: PayloadCompression::Zstd,
+            ..synth_variant_build("znver5", &payload)
+        };
+        let manifest = generated_manifest(&[variant], LoaderStrategy::Embedded);
+        assert!(manifest.contains("payload_compression: PayloadCompression::Zstd"));
+    }
+
+    #[test]
+    fn generate_loader_crate_writes_full_workspace_layout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let loader_dir = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+
+        // No variants: loader without zstd dependency.
+        generate_loader_crate(
+            &loader_dir,
+            "x86_64-unknown-linux-gnu",
+            &[],
+            LoaderStrategy::Embedded,
+            None,
+        )
+        .unwrap();
+        let cargo_toml = fs::read_to_string(loader_dir.join("Cargo.toml")).unwrap();
+        assert!(cargo_toml.contains("name = \"sonic-generated-loader\""));
+        assert!(!cargo_toml.contains("ruzstd"));
+
+        // src files all present.
+        for f in [
+            "src/feature_mask.rs",
+            "src/select.rs",
+            "src/arch_x86_64.rs",
+            "src/arch_aarch64.rs",
+            "src/linux_sys.rs",
+            "src/stack.rs",
+            "src/generated_manifest.rs",
+            "src/main.rs",
+        ] {
+            assert!(loader_dir.join(f).exists(), "missing: {f}");
+        }
+        // No auditable.o without an audit section.
+        assert!(!loader_dir.join("auditable.o").exists());
+    }
+
+    #[test]
+    fn generate_loader_crate_emits_zstd_dependency_when_a_variant_uses_zstd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let loader_dir = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+
+        let payload = loader_dir.join("payload.elf.zstd");
+        fs::write(&payload, b"compressed").unwrap();
+        let variant = VariantBuild {
+            payload_compression: PayloadCompression::Zstd,
+            ..synth_variant_build("znver5", &payload)
+        };
+
+        generate_loader_crate(
+            &loader_dir,
+            "x86_64-unknown-linux-gnu",
+            &[variant],
+            LoaderStrategy::Embedded,
+            None,
+        )
+        .unwrap();
+        let cargo_toml = fs::read_to_string(loader_dir.join("Cargo.toml")).unwrap();
+        assert!(cargo_toml.contains("ruzstd"));
+    }
+
+    #[test]
+    fn generate_loader_crate_writes_auditable_object_when_section_provided() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let loader_dir = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+        generate_loader_crate(
+            &loader_dir,
+            "aarch64-unknown-linux-gnu",
+            &[],
+            LoaderStrategy::Embedded,
+            Some(b"audit-section-bytes"),
+        )
+        .unwrap();
+        let auditable = loader_dir.join("auditable.o");
+        assert!(auditable.exists(), "auditable.o should have been written");
+        let bytes = fs::read(&auditable).unwrap();
+        // ELF header.
+        assert_eq!(&bytes[..4], b"\x7fELF");
+    }
+
+    #[test]
+    fn cfg_value_strips_quoted_values() {
+        let cfg = "target_endian=\"little\"\ntarget_pointer_width=\"64\"\n";
+        assert_eq!(cfg_value(cfg, "target_endian").as_deref(), Some("little"));
+        assert_eq!(
+            cfg_value(cfg, "target_pointer_width").as_deref(),
+            Some("64")
+        );
+    }
+
+    #[test]
+    fn classify_runtime_features_handles_only_unknown() {
+        let set = classify_runtime_features(&["totally-bogus".into()]);
+        assert!(set.known.is_empty());
+        assert_eq!(set.unknown, vec!["totally-bogus"]);
+    }
+
+    #[test]
+    fn classify_runtime_features_drops_ignored_before_classification() {
+        let set = classify_runtime_features(&[
+            "crt-static".into(),
+            "ermsb".into(),
+            "lahfsahf".into(),
+            "prfchw".into(),
+            "x87".into(),
+        ]);
+        assert!(set.known.is_empty());
+        assert!(set.unknown.is_empty());
+    }
+
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
     }
