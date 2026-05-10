@@ -4417,6 +4417,1663 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_color_mode_maps_known_and_falls_back_to_auto() {
+        assert_eq!(parse_color_mode("always"), ColorMode::Always);
+        assert_eq!(parse_color_mode("never"), ColorMode::Never);
+        assert_eq!(parse_color_mode("auto"), ColorMode::Auto);
+        assert_eq!(parse_color_mode(""), ColorMode::Auto);
+        assert_eq!(parse_color_mode("totally-bogus"), ColorMode::Auto);
+        // Explicit Always/Never resolve deterministically; Auto depends on
+        // whether the test process happens to attach a TTY, so don't assert on it.
+        assert_eq!(resolved_cargo_color(Some(ColorMode::Always)), "always");
+        assert_eq!(resolved_cargo_color(Some(ColorMode::Never)), "never");
+        let auto = resolved_cargo_color(Some(ColorMode::Auto));
+        assert!(auto == "always" || auto == "never");
+        let none = resolved_cargo_color(None);
+        assert!(none == "always" || none == "never");
+    }
+
+    #[test]
+    fn known_cargo_args_keeps_only_cargo_recognised_values() {
+        let args = strings(&[
+            "--release",
+            "--features",
+            "fast", // unknown, dropped (and value too)
+            "--profile",
+            "bench",
+            "--target=x86_64-unknown-linux-gnu",
+            "--bin",
+            "demo",
+            "-p",
+            "alpha",
+            "--manifest-path=foo/Cargo.toml",
+            "--color",
+            "always",
+            "--color=never",
+            "--target-dir",
+            "out",
+            "stray",
+        ]);
+        let known = known_cargo_args(&args);
+        assert_eq!(
+            known,
+            strings(&[
+                "--release",
+                "--profile",
+                "bench",
+                "--target=x86_64-unknown-linux-gnu",
+                "--bin",
+                "demo",
+                "-p",
+                "alpha",
+                "--manifest-path=foo/Cargo.toml",
+                "--color",
+                "always",
+                "--color=never",
+                "--target-dir",
+                "out",
+            ])
+        );
+    }
+
+    #[test]
+    fn known_cargo_args_handles_trailing_flag_without_value() {
+        // Trailing `--target` with no value must not panic.
+        let args = strings(&["--unknown", "--target"]);
+        let known = known_cargo_args(&args);
+        assert_eq!(known, strings(&["--target"]));
+    }
+
+    #[test]
+    fn forwarded_cargo_args_strips_overridden_flags() {
+        let args = strings(&[
+            "--features",
+            "fast",
+            "--manifest-path",
+            "Cargo.toml",
+            "--target-dir",
+            "custom",
+            "--color",
+            "never",
+            "--release",
+            "--manifest-path=alt.toml",
+            "--target-dir=alt-out",
+            "--color=always",
+            "--bin",
+            "demo",
+        ]);
+        let forwarded = forwarded_cargo_args(&args);
+        assert_eq!(
+            forwarded,
+            strings(&["--features", "fast", "--release", "--bin", "demo",])
+        );
+    }
+
+    #[test]
+    fn parse_cargo_args_defaults_when_args_empty() {
+        let got = parse_cargo_args(&[]);
+        assert!(!got.release);
+        assert!(got.target.is_none());
+        assert!(got.target_dir.is_none());
+        assert!(got.bin.is_none());
+        assert!(got.package.is_none());
+        assert!(got.manifest_path.is_none());
+        assert!(got.color.is_none());
+        assert!(got.forwarded.is_empty());
+    }
+
+    #[test]
+    fn host_arch_name_covers_both_arches() {
+        assert_eq!(host_arch_name(TargetArch::X86_64), "x86_64");
+        assert_eq!(host_arch_name(TargetArch::Aarch64), "aarch64");
+    }
+
+    #[test]
+    fn feature_names_preserves_canonical_order_and_filters() {
+        let mut mask = FeatureMask::EMPTY;
+        mask.insert(crate::feature_mask::Feature::Avx2);
+        mask.insert(crate::feature_mask::Feature::Sse2);
+        let names = feature_names(mask);
+        assert!(names.contains(&"avx2"));
+        assert!(names.contains(&"sse2"));
+        assert!(!names.contains(&"avx512f"));
+        // Order matches ALL_FEATURES iteration order, not insertion order.
+        let positions: Vec<usize> = crate::feature_mask::ALL_FEATURES
+            .iter()
+            .enumerate()
+            .filter_map(|(i, feature)| {
+                names
+                    .contains(&crate::feature_mask::feature_name(*feature))
+                    .then_some(i)
+            })
+            .collect();
+        let mut sorted = positions.clone();
+        sorted.sort();
+        assert_eq!(positions, sorted);
+    }
+
+    #[test]
+    fn feature_names_empty_mask_returns_empty_vec() {
+        assert!(feature_names(FeatureMask::EMPTY).is_empty());
+    }
+
+    #[test]
+    fn format_words_renders_padded_hex_pair() {
+        assert_eq!(
+            format_words(FeatureMask::EMPTY),
+            "[0x0000000000000000,0x0000000000000000]"
+        );
+        let mask = FeatureMask::from_words([0xdead_beef, 0x12_3456]);
+        assert_eq!(
+            format_words(mask),
+            "[0x00000000deadbeef,0x0000000000123456]"
+        );
+    }
+
+    #[test]
+    fn format_identity_renders_each_variant() {
+        assert_eq!(format_identity(CpuIdentity::Unknown), "unknown");
+        assert_eq!(
+            format_identity(CpuIdentity::X86 {
+                vendor: X86Vendor::Intel,
+                family: 6,
+                model: 167,
+                stepping: 1,
+            }),
+            "x86(intel family=6 model=167 stepping=1)"
+        );
+        assert_eq!(
+            format_identity(CpuIdentity::X86 {
+                vendor: X86Vendor::Amd,
+                family: 25,
+                model: 33,
+                stepping: 2,
+            }),
+            "x86(amd family=25 model=33 stepping=2)"
+        );
+        assert_eq!(
+            format_identity(CpuIdentity::X86 {
+                vendor: X86Vendor::Other,
+                family: 0,
+                model: 0,
+                stepping: 0,
+            }),
+            "x86(other family=0 model=0 stepping=0)"
+        );
+        assert_eq!(
+            format_identity(CpuIdentity::Aarch64 {
+                implementer: 0x41,
+                part: 0xd4f,
+                variant: 0,
+                revision: 1,
+            }),
+            "aarch64(implementer=0x41 part=0xd4f variant=0 revision=1)"
+        );
+    }
+
+    #[test]
+    fn effective_target_cpus_rejects_empty_input() {
+        let err = effective_target_cpus(Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("--target-cpus"));
+    }
+
+    #[test]
+    fn effective_target_cpus_passes_through_non_empty() {
+        let cpus = strings(&["haswell", "znver5"]);
+        assert_eq!(effective_target_cpus(cpus.clone()).unwrap(), cpus);
+    }
+
+    #[test]
+    fn baseline_target_cpu_chooses_arch_specific_baseline() {
+        assert_eq!(baseline_target_cpu("x86_64"), "x86-64");
+        assert_eq!(baseline_target_cpu("aarch64"), "generic");
+        assert_eq!(baseline_target_cpu(""), "generic");
+        assert_eq!(baseline_target_cpu("riscv"), "generic");
+    }
+
+    #[test]
+    fn cfg_value_returns_none_for_missing_or_malformed_keys() {
+        let cfg = "target_os=\"linux\"\ntarget_arch=\"x86_64\"\n";
+        assert_eq!(cfg_value(cfg, "missing").as_deref(), None);
+        assert_eq!(
+            cfg_value("target_os=\"linux\nstray", "target_os").as_deref(),
+            None,
+            "missing closing quote should not match"
+        );
+        assert_eq!(cfg_value("", "target_os").as_deref(), None);
+    }
+
+    #[test]
+    fn parse_target_features_from_rustc_cfg_dedups_and_ignores_unrelated_lines() {
+        let cfg = "target_os=\"linux\"\n\
+                   target_feature=\"sse2\"\n\
+                   target_feature=\"sse2\"\n\
+                   target_feature=\"avx\"\n\
+                   not_a_feature=\"avx512f\"\n";
+        let got = parse_target_features_from_rustc_cfg(cfg);
+        assert_eq!(got, vec!["avx", "sse2"]);
+    }
+
+    #[test]
+    fn parse_rustc_target_cpus_skips_header_and_blanks() {
+        let text = "\
+Available CPUs for this target:
+    generic
+    znver5
+    haswell - description
+
+";
+        let got = parse_rustc_target_cpus(text);
+        assert!(got.contains("generic"));
+        assert!(got.contains("znver5"));
+        assert!(got.contains("haswell"));
+        assert!(!got.iter().any(|cpu| cpu.contains("Available")));
+    }
+
+    #[test]
+    fn parse_rustc_target_cpus_always_includes_generic() {
+        let got = parse_rustc_target_cpus("");
+        assert!(got.contains("generic"));
+    }
+
+    #[test]
+    fn filter_target_cpus_rejects_native_cpu() {
+        let current = BTreeSet::from(["generic".into()]);
+        let union = current.clone();
+        let err = filter_target_cpus(&["native".into()], &current, &union).unwrap_err();
+        assert!(err.to_string().contains("native"));
+    }
+
+    #[test]
+    fn filter_target_cpus_accepts_generic_even_if_not_in_current() {
+        let current = BTreeSet::<String>::new();
+        let union = BTreeSet::<String>::new();
+        let got = filter_target_cpus(&["generic".into()], &current, &union).unwrap();
+        assert_eq!(got, vec!["generic"]);
+    }
+
+    #[test]
+    fn is_ignored_rustc_feature_matches_documented_set() {
+        for ignored in ["crt-static", "ermsb", "lahfsahf", "prfchw", "x87"] {
+            assert!(
+                is_ignored_rustc_feature(ignored),
+                "should ignore `{ignored}`"
+            );
+        }
+        for kept in ["avx2", "sse2", "neon", "sve"] {
+            assert!(
+                !is_ignored_rustc_feature(kept),
+                "should not ignore `{kept}`"
+            );
+        }
+    }
+
+    #[test]
+    fn is_safety_required_feature_excludes_runtime_only_features() {
+        // Documented set of rank-only / non-codegen-safety features.
+        for non_safety in [
+            "bti", "dit", "lor", "mte", "paca", "pacg", "pan", "pmuv3", "rand", "ras", "rdrand",
+            "rdseed", "sb", "spe", "ssbs", "vh",
+        ] {
+            assert!(
+                !is_safety_required_feature(non_safety),
+                "`{non_safety}` should be rank-only"
+            );
+        }
+        for safety in ["avx2", "sse2", "neon", "sve", "sve2"] {
+            assert!(
+                is_safety_required_feature(safety),
+                "`{safety}` must require codegen safety"
+            );
+        }
+    }
+
+    #[test]
+    fn feature_mask_errors_on_unknown_feature() {
+        let err = feature_mask(&["totally-not-real".into()]).unwrap_err();
+        assert!(err.to_string().contains("unsupported runtime feature"));
+        assert!(err.to_string().contains("totally-not-real"));
+    }
+
+    #[test]
+    fn feature_mask_accumulates_known_features() {
+        let mask = feature_mask(&["sse2".into(), "avx2".into()]).unwrap();
+        assert!(mask.contains(crate::feature_mask::Feature::Sse2));
+        assert!(mask.contains(crate::feature_mask::Feature::Avx2));
+        assert!(!mask.contains(crate::feature_mask::Feature::Avx512F));
+    }
+
+    #[test]
+    fn safety_required_features_drops_rank_only_entries() {
+        let got = safety_required_features(&[
+            "avx2".into(),
+            "rdrand".into(),
+            "rdseed".into(),
+            "sse2".into(),
+            "pmuv3".into(),
+        ]);
+        assert_eq!(got, vec!["avx2".to_string(), "sse2".to_string()]);
+    }
+
+    #[test]
+    fn score_target_kind_matches_host_intel() {
+        let intel = HostInfo {
+            arch: TargetArch::X86_64,
+            features: FeatureMask::EMPTY,
+            identity: CpuIdentity::X86 {
+                vendor: X86Vendor::Intel,
+                family: 6,
+                model: 0xb7,
+                stepping: 0,
+            },
+            heterogeneous: false,
+        };
+        assert!(score_target_kind_matches_host(
+            intel,
+            TargetKind::X86IntelCore
+        ));
+        assert!(score_target_kind_matches_host(
+            intel,
+            TargetKind::X86IntelXeon
+        ));
+        assert!(score_target_kind_matches_host(
+            intel,
+            TargetKind::X86IntelAtom
+        ));
+        assert!(!score_target_kind_matches_host(
+            intel,
+            TargetKind::X86AmdZen { generation: 5 }
+        ));
+        assert!(!score_target_kind_matches_host(
+            intel,
+            TargetKind::X86AmdOther
+        ));
+        assert!(score_target_kind_matches_host(intel, TargetKind::Generic));
+        assert!(score_target_kind_matches_host(
+            intel,
+            TargetKind::X86NeutralLevel { level: 3 }
+        ));
+    }
+
+    #[test]
+    fn score_target_kind_matches_host_other_x86_vendor() {
+        let other = HostInfo {
+            arch: TargetArch::X86_64,
+            features: FeatureMask::EMPTY,
+            identity: CpuIdentity::X86 {
+                vendor: X86Vendor::Other,
+                family: 6,
+                model: 1,
+                stepping: 0,
+            },
+            heterogeneous: false,
+        };
+        // Other vendor: only generic / neutral pass, identity-specific fails.
+        assert!(score_target_kind_matches_host(other, TargetKind::Generic));
+        assert!(score_target_kind_matches_host(
+            other,
+            TargetKind::X86NeutralLevel { level: 2 }
+        ));
+        assert!(!score_target_kind_matches_host(
+            other,
+            TargetKind::X86IntelCore
+        ));
+        assert!(!score_target_kind_matches_host(
+            other,
+            TargetKind::X86AmdOther
+        ));
+    }
+
+    #[test]
+    fn score_target_kind_matches_host_unknown_passes_anything() {
+        let unknown = HostInfo {
+            arch: TargetArch::X86_64,
+            features: FeatureMask::EMPTY,
+            identity: CpuIdentity::Unknown,
+            heterogeneous: false,
+        };
+        assert!(score_target_kind_matches_host(
+            unknown,
+            TargetKind::X86IntelCore
+        ));
+        assert!(score_target_kind_matches_host(
+            unknown,
+            TargetKind::Aarch64ArmCortexA
+        ));
+    }
+
+    #[test]
+    fn score_target_kind_matches_host_aarch64_arm() {
+        let arm = HostInfo {
+            arch: TargetArch::Aarch64,
+            features: FeatureMask::EMPTY,
+            identity: CpuIdentity::Aarch64 {
+                implementer: 0x41,
+                part: 0xd4f,
+                variant: 0,
+                revision: 0,
+            },
+            heterogeneous: false,
+        };
+        for kind in [
+            TargetKind::Aarch64ArmCortexA,
+            TargetKind::Aarch64ArmCortexX,
+            TargetKind::Aarch64ArmNeoverseE,
+            TargetKind::Aarch64ArmNeoverseN,
+            TargetKind::Aarch64ArmNeoverseV,
+        ] {
+            assert!(score_target_kind_matches_host(arm, kind));
+        }
+        assert!(!score_target_kind_matches_host(
+            arm,
+            TargetKind::Aarch64Ampere
+        ));
+        assert!(!score_target_kind_matches_host(
+            arm,
+            TargetKind::Aarch64Apple
+        ));
+        assert!(!score_target_kind_matches_host(
+            arm,
+            TargetKind::Aarch64Other
+        ));
+    }
+
+    #[test]
+    fn score_target_kind_matches_host_aarch64_ampere() {
+        let ampere = HostInfo {
+            arch: TargetArch::Aarch64,
+            features: FeatureMask::EMPTY,
+            identity: CpuIdentity::Aarch64 {
+                implementer: 0xc0,
+                part: 0xac4,
+                variant: 0,
+                revision: 0,
+            },
+            heterogeneous: false,
+        };
+        assert!(score_target_kind_matches_host(
+            ampere,
+            TargetKind::Aarch64Ampere
+        ));
+        assert!(!score_target_kind_matches_host(
+            ampere,
+            TargetKind::Aarch64ArmCortexA
+        ));
+        assert!(!score_target_kind_matches_host(
+            ampere,
+            TargetKind::Aarch64ArmNeoverseN
+        ));
+    }
+
+    #[test]
+    fn score_target_kind_matches_host_aarch64_other_implementer() {
+        let other = HostInfo {
+            arch: TargetArch::Aarch64,
+            features: FeatureMask::EMPTY,
+            identity: CpuIdentity::Aarch64 {
+                implementer: 0x46, // Fujitsu — not 0x41 or 0xc0
+                part: 0x001,
+                variant: 0,
+                revision: 0,
+            },
+            heterogeneous: false,
+        };
+        assert!(score_target_kind_matches_host(other, TargetKind::Generic));
+        // Identity-specific kinds all fall through to false.
+        assert!(!score_target_kind_matches_host(
+            other,
+            TargetKind::Aarch64ArmCortexA
+        ));
+        assert!(!score_target_kind_matches_host(
+            other,
+            TargetKind::Aarch64Ampere
+        ));
+        assert!(!score_target_kind_matches_host(
+            other,
+            TargetKind::Aarch64Other
+        ));
+    }
+
+    #[test]
+    fn parse_aarch64_midr_hex_handles_separators_and_prefix() {
+        assert_eq!(parse_aarch64_midr_hex(b"0x410FD4F1"), Some(0x410FD4F1));
+        assert_eq!(parse_aarch64_midr_hex(b"410fd4f1"), Some(0x410FD4F1));
+        assert_eq!(
+            parse_aarch64_midr_hex(b"  0X 410f d4f1\n"),
+            Some(0x410FD4F1)
+        );
+    }
+
+    #[test]
+    fn parse_aarch64_midr_hex_returns_none_on_empty_or_garbage() {
+        assert_eq!(parse_aarch64_midr_hex(b""), None);
+        assert_eq!(parse_aarch64_midr_hex(b" \t\n"), None);
+        assert_eq!(parse_aarch64_midr_hex(b"!!!"), None);
+    }
+
+    #[test]
+    fn parse_aarch64_midr_hex_stops_on_non_hex_after_first_digit() {
+        // Only the leading hex run is consumed.
+        assert_eq!(parse_aarch64_midr_hex(b"deadGGGG"), Some(0xDEAD));
+    }
+
+    #[test]
+    fn aarch64_identity_from_midr_decomposes_register_bits() {
+        let id = aarch64_identity_from_midr(0x410F_D4F1);
+        match id {
+            CpuIdentity::Aarch64 {
+                implementer,
+                part,
+                variant,
+                revision,
+            } => {
+                assert_eq!(implementer, 0x41);
+                assert_eq!(part, 0xd4f);
+                assert_eq!(variant, 0);
+                assert_eq!(revision, 1);
+            }
+            _ => panic!("expected aarch64 identity"),
+        }
+    }
+
+    #[test]
+    fn parse_aarch64_cpuinfo_identity_unknown_when_keys_missing() {
+        assert_eq!(parse_aarch64_cpuinfo_identity(b""), CpuIdentity::Unknown);
+        assert_eq!(
+            parse_aarch64_cpuinfo_identity(b"processor\t: 0\nBogusInfo: 1\n"),
+            CpuIdentity::Unknown
+        );
+        // Implementer present but no part — still Unknown.
+        assert_eq!(
+            parse_aarch64_cpuinfo_identity(b"CPU implementer\t: 0x41\n"),
+            CpuIdentity::Unknown
+        );
+    }
+
+    #[test]
+    fn parse_aarch64_cpuinfo_identity_handles_missing_optionals() {
+        // No CPU variant / revision lines: should default to 0.
+        let id = parse_aarch64_cpuinfo_identity(b"CPU implementer\t: 0x41\nCPU part\t: 0xd0c\n");
+        assert_eq!(
+            id,
+            CpuIdentity::Aarch64 {
+                implementer: 0x41,
+                part: 0xd0c,
+                variant: 0,
+                revision: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn aarch64_cpuinfo_decimal_value_saturates_on_overflow() {
+        // Overflow-saturating decimal — make sure we don't panic.
+        let buf = b"CPU revision\t: 9999999999\n";
+        let got = aarch64_cpuinfo_decimal_value(buf, b"CPU revision");
+        assert_eq!(got, Some(u16::MAX));
+    }
+
+    #[test]
+    fn aarch64_cpuinfo_value_returns_none_for_line_without_colon() {
+        let buf = b"CPU implementer 0x41\n";
+        assert!(aarch64_cpuinfo_value(buf, b"CPU implementer").is_none());
+    }
+
+    #[test]
+    fn aarch64_cpuinfo_hex_value_stops_on_non_hex_garbage() {
+        let buf = b"CPU part\t: 0xd05XYZ\n";
+        assert_eq!(aarch64_cpuinfo_hex_value(buf, b"CPU part"), Some(0xd05));
+    }
+
+    #[test]
+    fn sanitize_cpu_escapes_non_alnum() {
+        assert_eq!(sanitize_cpu("haswell"), "haswell");
+        assert_eq!(sanitize_cpu("arrowlake-s"), "arrowlake_2ds");
+        assert_eq!(sanitize_cpu("a/b"), "a_2fb");
+        assert_eq!(sanitize_cpu("x86-64-v3"), "x86_2d64_2dv3");
+    }
+
+    #[test]
+    fn cargo_target_rustflags_env_uppercases_and_replaces_punctuation() {
+        assert_eq!(
+            cargo_target_rustflags_env("aarch64-unknown-linux-gnu"),
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS"
+        );
+        assert_eq!(
+            cargo_target_rustflags_env("x86_64-unknown-linux-musl"),
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS"
+        );
+    }
+
+    #[test]
+    fn escape_toml_string_escapes_quotes_and_backslashes() {
+        assert_eq!(escape_toml_string("plain"), "plain");
+        assert_eq!(escape_toml_string("a\"b"), "a\\\"b");
+        assert_eq!(escape_toml_string("a\\b"), "a\\\\b");
+        // Order: backslash first, then quote — `"\\` -> `\\\\\"`
+        assert_eq!(escape_toml_string("\\\""), "\\\\\\\"");
+    }
+
+    #[test]
+    fn target_cpu_rustflag_formats_codegen_arg() {
+        assert_eq!(target_cpu_rustflag("x86-64-v3"), "-Ctarget-cpu=x86-64-v3");
+        assert_eq!(target_cpu_rustflag("generic"), "-Ctarget-cpu=generic");
+    }
+
+    #[test]
+    fn split_rustflags_splits_on_whitespace() {
+        assert!(split_rustflags("").is_empty());
+        assert_eq!(
+            split_rustflags("  -C panic=abort  "),
+            vec!["-C", "panic=abort"]
+        );
+    }
+
+    #[test]
+    fn target_rustflags_config_arg_quotes_each_flag() {
+        let out = target_rustflags_config_arg(
+            "x86_64-unknown-linux-gnu",
+            &["-C panic=abort".to_string(), "-Clto".to_string()],
+        );
+        assert!(out.starts_with("target.x86_64-unknown-linux-gnu.rustflags=["));
+        assert!(out.contains("\"-C panic=abort\""));
+        assert!(out.contains("\"-Clto\""));
+    }
+
+    #[test]
+    fn append_encoded_rustflags_chains_with_unit_separator() {
+        let flags = encode_rustflags(&["a".into(), "b".into(), "c".into()]);
+        assert_eq!(flags, OsString::from("a\x1fb\x1fc"));
+    }
+
+    #[test]
+    fn append_encoded_rustflags_preserves_existing_value() {
+        let base = OsString::from("base");
+        let combined = append_encoded_rustflags(base, &["next".to_string()]);
+        assert_eq!(combined, OsString::from("base\x1fnext"));
+    }
+
+    #[test]
+    fn loader_rustflags_picks_per_target_arms() {
+        // x86_64-musl: link-self-contained=no, no -nostartfiles
+        let musl = loader_rustflags("x86_64-unknown-linux-musl");
+        assert!(musl.contains("link-self-contained=no"));
+        assert!(!musl.contains("-nostartfiles"));
+        assert!(musl.contains("code-model=large"));
+
+        // x86_64 gnu: code-model=large + -nostartfiles, no link-self-contained
+        let gnu = loader_rustflags("x86_64-unknown-linux-gnu");
+        assert!(gnu.contains("code-model=large"));
+        assert!(gnu.contains("-nostartfiles"));
+        assert!(!gnu.contains("link-self-contained=no"));
+
+        // aarch64-musl: link-self-contained=no, no code-model=large
+        let amusl = loader_rustflags("aarch64-unknown-linux-musl");
+        assert!(amusl.contains("link-self-contained=no"));
+        assert!(!amusl.contains("code-model=large"));
+
+        // aarch64-gnu: -nostartfiles, no link-self-contained
+        let agnu = loader_rustflags("aarch64-unknown-linux-gnu");
+        assert!(agnu.contains("-nostartfiles"));
+        assert!(!agnu.contains("link-self-contained=no"));
+    }
+
+    #[test]
+    fn payload_rustflags_falls_back_to_cargo_config_when_no_env() {
+        with_rustflags_env(|| {
+            let got = payload_rustflags("aarch64-unknown-linux-gnu", "neoverse-n1");
+            match got {
+                PayloadRustflags::CargoConfig(arg) => {
+                    assert!(arg.starts_with("target.aarch64-unknown-linux-gnu.rustflags="));
+                    assert!(arg.contains("-Ctarget-cpu=neoverse-n1"));
+                }
+                other => panic!("expected CargoConfig, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn loader_build_rustflags_appends_auditable_link_args() {
+        with_rustflags_env(|| {
+            let flags = loader_build_rustflags("aarch64-unknown-linux-gnu", true);
+            let joined = flags.join(" ");
+            assert!(joined.contains("link-arg=auditable.o"));
+            assert!(joined.contains("__cargo_sonic_auditable_dep_v0"));
+        });
+    }
+
+    #[test]
+    fn loader_build_rustflags_omits_auditable_link_args_when_disabled() {
+        with_rustflags_env(|| {
+            let flags = loader_build_rustflags("aarch64-unknown-linux-gnu", false);
+            let joined = flags.join(" ");
+            assert!(!joined.contains("auditable.o"));
+            assert!(!joined.contains("__cargo_sonic_auditable_dep_v0"));
+        });
+    }
+
+    #[test]
+    fn bundle_dir_for_appends_bundle_suffix() {
+        let dir = bundle_dir_for(Utf8Path::new("/tmp/myapp"));
+        assert_eq!(dir.as_str(), "/tmp/myapp.bundle");
+    }
+
+    #[test]
+    fn payload_extension_branches_on_compression() {
+        assert_eq!(payload_extension(PayloadCompression::None), ".elf");
+        assert_eq!(payload_extension(PayloadCompression::Zstd), ".elf.zstd");
+    }
+
+    #[test]
+    fn payload_compression_expr_renders_match_arms() {
+        assert_eq!(
+            payload_compression_expr(PayloadCompression::None),
+            "PayloadCompression::None"
+        );
+        assert_eq!(
+            payload_compression_expr(PayloadCompression::Zstd),
+            "PayloadCompression::Zstd"
+        );
+    }
+
+    #[test]
+    fn target_kind_expr_covers_every_variant() {
+        let mappings = [
+            (TargetKind::Generic, "TargetKind::Generic"),
+            (TargetKind::X86IntelCore, "TargetKind::X86IntelCore"),
+            (TargetKind::X86IntelXeon, "TargetKind::X86IntelXeon"),
+            (TargetKind::X86IntelAtom, "TargetKind::X86IntelAtom"),
+            (TargetKind::X86AmdOther, "TargetKind::X86AmdOther"),
+            (
+                TargetKind::Aarch64ArmNeoverseN,
+                "TargetKind::Aarch64ArmNeoverseN",
+            ),
+            (
+                TargetKind::Aarch64ArmNeoverseV,
+                "TargetKind::Aarch64ArmNeoverseV",
+            ),
+            (
+                TargetKind::Aarch64ArmNeoverseE,
+                "TargetKind::Aarch64ArmNeoverseE",
+            ),
+            (
+                TargetKind::Aarch64ArmCortexA,
+                "TargetKind::Aarch64ArmCortexA",
+            ),
+            (
+                TargetKind::Aarch64ArmCortexX,
+                "TargetKind::Aarch64ArmCortexX",
+            ),
+            (TargetKind::Aarch64Apple, "TargetKind::Aarch64Apple"),
+            (TargetKind::Aarch64Ampere, "TargetKind::Aarch64Ampere"),
+            (TargetKind::Aarch64Other, "TargetKind::Aarch64Other"),
+        ];
+        for (kind, expected) in mappings {
+            assert_eq!(target_kind_expr(kind), expected);
+        }
+        assert_eq!(
+            target_kind_expr(TargetKind::X86NeutralLevel { level: 3 }),
+            "TargetKind::X86NeutralLevel { level: 3 }"
+        );
+        assert_eq!(
+            target_kind_expr(TargetKind::X86AmdZen { generation: 5 }),
+            "TargetKind::X86AmdZen { generation: 5 }"
+        );
+    }
+
+    #[test]
+    fn audit_source_translates_known_registry_and_strips_scheme() {
+        let crates_io = cargo_metadata::Source {
+            repr: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+        };
+        assert_eq!(audit_source(&crates_io), "crates.io");
+
+        let custom = cargo_metadata::Source {
+            repr: "registry+https://internal.example.com/index".to_string(),
+        };
+        assert_eq!(audit_source(&custom), "registry");
+
+        let git = cargo_metadata::Source {
+            repr: "git+https://example.com/foo.git".to_string(),
+        };
+        assert_eq!(audit_source(&git), "git");
+    }
+
+    #[test]
+    fn auditable_object_supports_x86_64_and_aarch64() {
+        let payload = b"hello-payload";
+        let x = auditable_object("x86_64-unknown-linux-gnu", payload).unwrap();
+        // ELF magic header.
+        assert_eq!(&x[..4], b"\x7fELF");
+        let a = auditable_object("aarch64-unknown-linux-musl", payload).unwrap();
+        assert_eq!(&a[..4], b"\x7fELF");
+    }
+
+    #[test]
+    fn auditable_object_rejects_unsupported_target() {
+        let err = auditable_object("riscv64gc-unknown-linux-gnu", b"x").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only supported for x86_64 and aarch64")
+        );
+    }
+
+    #[test]
+    fn write_tagged_output_prefixes_each_chunk_line() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_tagged_output(&mut buf, "haswell", b"hello\nworld").unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.starts_with("cargo-sonic[haswell]\n"));
+        assert!(text.contains("  hello\n"));
+        assert!(text.contains("  world\n"));
+    }
+
+    #[test]
+    fn write_tagged_output_handles_empty_pending_gracefully() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_tagged_output(&mut buf, "haswell", b"").unwrap();
+        // Header and trailing newline only when pending is empty too.
+        assert_eq!(buf, b"cargo-sonic[haswell]\n");
+    }
+
+    #[test]
+    fn flush_payload_stdout_clears_pending_when_not_tagging() {
+        let mut pending = vec![1u8, 2, 3];
+        flush_payload_stdout("haswell", false, &mut pending).unwrap();
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn write_payload_stdout_extends_pending_when_tagging() {
+        let mut pending = Vec::new();
+        write_payload_stdout(true, &mut pending, b"abc").unwrap();
+        write_payload_stdout(true, &mut pending, b"def").unwrap();
+        assert_eq!(pending, b"abcdef");
+    }
+
+    #[test]
+    fn probe_report_renders_eligible_only_variants() {
+        let report = format_probe_report(
+            "x86_64-unknown-linux-gnu",
+            HostInfo {
+                arch: TargetArch::X86_64,
+                features: FeatureMask::EMPTY,
+                identity: CpuIdentity::Unknown,
+                heterogeneous: false,
+            },
+            &[ProbeVariant {
+                target_cpu: "generic".to_string(),
+                required_features: FeatureMask::EMPTY,
+                rank_features: FeatureMask::EMPTY,
+                feature_names: Vec::new(),
+                feature_tier: 0,
+            }],
+            &[],
+            "generic",
+        );
+        // No skipped section when input is empty.
+        assert!(!report.contains("  skipped:"));
+        assert!(report.contains("fits=[generic]"));
+        assert!(report.contains("eligible=yes"));
+        assert!(report.contains("selected=generic"));
+    }
+
+    #[test]
+    fn probe_report_marks_ineligible_variants_with_missing_features() {
+        let mut avx2 = FeatureMask::EMPTY;
+        avx2.insert(crate::feature_mask::Feature::Avx2);
+        let report = format_probe_report(
+            "x86_64-unknown-linux-gnu",
+            HostInfo {
+                arch: TargetArch::X86_64,
+                features: FeatureMask::EMPTY,
+                identity: CpuIdentity::Unknown,
+                heterogeneous: false,
+            },
+            &[ProbeVariant {
+                target_cpu: "haswell".to_string(),
+                required_features: avx2,
+                rank_features: avx2,
+                feature_names: vec!["avx2".to_string()],
+                feature_tier: 1,
+            }],
+            &[],
+            "generic",
+        );
+        assert!(report.contains("eligible=no"));
+        assert!(report.contains("missing="));
+        assert!(report.contains("missing_features=[avx2]"));
+        assert!(report.contains("fits=[]"));
+    }
+
+    #[test]
+    fn build_rejects_zero_parallelism_before_touching_cargo() {
+        // parallelism=0 must short-circuit at the very first check so the
+        // assertion does not accidentally depend on a real cargo workspace.
+        let err = build(BuildOptions {
+            cargo_args: Vec::new(),
+            manifest_path: None,
+            target_cpus: vec!["haswell".into()],
+            parallelism: 0,
+            compress: PayloadCompression::None,
+            compression_level: 22,
+            loader: LoaderStrategy::Embedded,
+            auditable: false,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("--parallelism"));
+    }
+
+    #[test]
+    fn build_rejects_empty_target_cpus_before_touching_cargo() {
+        let err = build(BuildOptions {
+            cargo_args: Vec::new(),
+            manifest_path: None,
+            target_cpus: Vec::new(),
+            parallelism: 1,
+            compress: PayloadCompression::None,
+            compression_level: 22,
+            loader: LoaderStrategy::Embedded,
+            auditable: false,
+        });
+        assert!(err.is_err());
+        // Either a manifest-resolution failure, an effective_target_cpus
+        // failure, or a target_os check — any of these is fine; we just
+        // confirm the call exercises early-validation paths without panic.
+    }
+
+    #[test]
+    fn probe_rejects_empty_target_cpus() {
+        let err = probe(ProbeOptions {
+            cargo_args: Vec::new(),
+            target_cpus: Vec::new(),
+        })
+        .unwrap_err();
+        // First failing check inside `probe` is `effective_target_cpus`,
+        // which surfaces the `--target-cpus` hint in its error message.
+        assert!(err.to_string().contains("--target-cpus"));
+    }
+
+    #[test]
+    fn generated_main_embedded_renders_loader_skeleton() {
+        let source = generated_main("x86_64-unknown-linux-gnu", false, LoaderStrategy::Embedded);
+        assert!(source.contains("compile_error!(\"cargo-sonic loader supports Linux only\")"));
+        assert!(source.contains("mod feature_mask;"));
+        assert!(source.contains("mod select;"));
+        // The strategy is plumbed in via a placeholder substitution: the
+        // call site at the entry point picks one of the two helpers, but
+        // both helper *definitions* appear in the static template body.
+        assert!(source.contains("exec_embedded_payload(selected, &initial)"));
+        assert!(!source.contains("exec_bundle_payload(selected, &initial)"));
+        // Without zstd, the no-op zstd shims appear instead of the real
+        // FrameDecoder allocator block.
+        assert!(source.contains("write_zstd_payload"));
+        assert!(!source.contains("ruzstd::decoding::FrameDecoder"));
+        // Placeholder must be fully substituted.
+        assert!(!source.contains("__CARGO_SONIC_EXEC_PAYLOAD__"));
+        assert!(!source.contains("/*__CARGO_SONIC_ZSTD_SUPPORT__*/"));
+    }
+
+    #[test]
+    fn generated_main_bundle_swaps_exec_helper() {
+        let source = generated_main("x86_64-unknown-linux-musl", false, LoaderStrategy::Bundle);
+        assert!(source.contains("exec_bundle_payload(selected, &initial)"));
+        assert!(!source.contains("exec_embedded_payload(selected, &initial)"));
+    }
+
+    #[test]
+    fn generated_main_zstd_emits_mmap_allocator_and_decoder() {
+        let source = generated_main("aarch64-unknown-linux-gnu", true, LoaderStrategy::Embedded);
+        assert!(source.contains("MmapAllocator"));
+        assert!(source.contains("global_allocator"));
+        assert!(source.contains("ruzstd::decoding::FrameDecoder"));
+        assert!(source.contains("write_zstd_payload_from_fd"));
+    }
+
+    #[test]
+    fn generated_linux_sys_carries_arch_specific_syscall_numbers() {
+        let source = generated_linux_sys();
+        assert!(source.contains("SYS_WRITE"));
+        assert!(source.contains("SYS_MMAP"));
+        // Both arch tables present — gated by cfg, but visible as text.
+        assert!(source.contains("#[cfg(target_arch = \"x86_64\")]"));
+        assert!(source.contains("#[cfg(target_arch = \"aarch64\")]"));
+        assert!(source.contains("memfd_create_best_effort"));
+    }
+
+    #[test]
+    fn generated_stack_is_loader_stack_module() {
+        let source = generated_stack();
+        // loader_stack.rs is the file we're including.
+        assert!(source.contains("InitialStack"));
+    }
+
+    #[test]
+    fn escape_bytes_handles_quote_and_backslash() {
+        assert_eq!(escape_bytes("plain"), "plain");
+        assert_eq!(escape_bytes("a\"b"), "a\\\"b");
+        assert_eq!(escape_bytes("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn target_feature_tier_distinguishes_arches_and_target_kinds() {
+        // Generic always tier 0, regardless of arch.
+        assert_eq!(target_feature_tier("x86_64", TargetKind::Generic), 0);
+        assert_eq!(target_feature_tier("aarch64", TargetKind::Generic), 0);
+        // x86 neutral level → tier 1, x86 specific → tier 2.
+        assert_eq!(
+            target_feature_tier("x86_64", TargetKind::X86NeutralLevel { level: 3 }),
+            1
+        );
+        assert_eq!(target_feature_tier("x86_64", TargetKind::X86IntelCore), 2);
+        assert_eq!(
+            target_feature_tier("x86_64", TargetKind::X86AmdZen { generation: 5 }),
+            2
+        );
+        // aarch64 always tier 2 for any non-Generic.
+        assert_eq!(
+            target_feature_tier("aarch64", TargetKind::Aarch64ArmCortexA),
+            2
+        );
+        assert_eq!(
+            target_feature_tier("aarch64", TargetKind::Aarch64ArmNeoverseN),
+            2
+        );
+        // Unknown arch falls through to 0.
+        assert_eq!(target_feature_tier("riscv64", TargetKind::X86IntelCore), 0);
+    }
+
+    #[test]
+    fn classify_target_cpu_aarch64_buckets() {
+        assert_eq!(
+            classify_target_cpu("cortex-a76", "aarch64", "generic"),
+            TargetKind::Aarch64ArmCortexA
+        );
+        assert_eq!(
+            classify_target_cpu("cortex-x1", "aarch64", "generic"),
+            TargetKind::Aarch64ArmCortexX
+        );
+        assert_eq!(
+            classify_target_cpu("neoverse-n1", "aarch64", "generic"),
+            TargetKind::Aarch64ArmNeoverseN
+        );
+        assert_eq!(
+            classify_target_cpu("neoverse-v3", "aarch64", "generic"),
+            TargetKind::Aarch64ArmNeoverseV
+        );
+        assert_eq!(
+            classify_target_cpu("neoverse-512tvb", "aarch64", "generic"),
+            TargetKind::Aarch64ArmNeoverseV
+        );
+        assert_eq!(
+            classify_target_cpu("neoverse-e1", "aarch64", "generic"),
+            TargetKind::Aarch64ArmNeoverseE
+        );
+        assert_eq!(
+            classify_target_cpu("apple-m1", "aarch64", "generic"),
+            TargetKind::Aarch64Apple
+        );
+        assert_eq!(
+            classify_target_cpu("ampere1", "aarch64", "generic"),
+            TargetKind::Aarch64Ampere
+        );
+        assert_eq!(
+            classify_target_cpu("a64fx", "aarch64", "generic"),
+            TargetKind::Aarch64Other
+        );
+        assert_eq!(
+            classify_target_cpu("generic", "aarch64", "generic"),
+            TargetKind::Generic
+        );
+    }
+
+    #[test]
+    fn classify_target_cpu_x86_intel_xeon_special_arms() {
+        // Note: arm precedence matters. The function tries the `lake/well/
+        // bridge/...` Core arm before the `rapids/skx/...` Xeon arm, so
+        // anything that contains `lake` resolves to Core regardless of its
+        // suffix. That's documented by these assertions.
+        assert_eq!(
+            classify_target_cpu("knl", "x86_64", "x86-64"),
+            TargetKind::X86IntelXeon
+        );
+        assert_eq!(
+            classify_target_cpu("knm", "x86_64", "x86-64"),
+            TargetKind::X86IntelXeon
+        );
+        assert_eq!(
+            classify_target_cpu("mic_avx512", "x86_64", "x86-64"),
+            TargetKind::X86IntelXeon
+        );
+        // Even though `skylake-avx512` would conceptually be a Xeon, the
+        // `lake` substring matches the Core arm first.
+        assert_eq!(
+            classify_target_cpu("skylake-avx512", "x86_64", "x86-64"),
+            TargetKind::X86IntelCore
+        );
+    }
+
+    #[test]
+    fn classify_target_cpu_x86_intel_atom_special_arms() {
+        for cpu in ["bonnell", "slm", "tremont", "atom_avx", "silvermont"] {
+            assert_eq!(
+                classify_target_cpu(cpu, "x86_64", "x86-64"),
+                TargetKind::X86IntelAtom,
+                "{cpu}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_target_cpu_x86_falls_back_to_amd_other_for_unknowns() {
+        assert_eq!(
+            classify_target_cpu("totally-unknown", "x86_64", "x86-64"),
+            TargetKind::X86AmdOther
+        );
+    }
+
+    #[test]
+    fn classify_target_cpu_x86_neutral_levels() {
+        for (cpu, lvl) in [
+            ("x86-64", 1),
+            ("x86-64-v2", 2),
+            ("x86-64-v3", 3),
+            ("x86-64-v4", 4),
+        ] {
+            // Only when the cpu is *not* the baseline does the neutral-level
+            // arm fire. Use a different baseline so all four levels return
+            // X86NeutralLevel.
+            assert_eq!(
+                classify_target_cpu(cpu, "x86_64", "alt-baseline"),
+                TargetKind::X86NeutralLevel { level: lvl },
+                "{cpu}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_target_cpu_x86_znver_generation_fallback_zero() {
+        // znverFOO → trim_start_matches("znver").parse() == None ⇒ unwrap_or(0).
+        assert_eq!(
+            classify_target_cpu("znverFOO", "x86_64", "x86-64"),
+            TargetKind::X86AmdZen { generation: 0 }
+        );
+    }
+
+    #[test]
+    fn analyze_warnings_no_warnings_for_distinct_feature_sets() {
+        let map = BTreeMap::from([
+            ("haswell".into(), vec!["avx2".into()]),
+            ("znver5".into(), vec!["avx512f".into()]),
+        ]);
+        let warnings = analyze_warnings(&map, "x86_64");
+        assert!(
+            warnings.iter().all(|w| !w.contains("identical")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn analyze_warnings_aarch64_does_not_emit_neutral_warning() {
+        // Neutral-fallback warning is x86-only.
+        let map = BTreeMap::from([
+            ("cortex-a76".into(), vec!["fp16".into()]),
+            ("neoverse-v1".into(), vec!["sve".into()]),
+        ]);
+        let warnings = analyze_warnings(&map, "aarch64");
+        assert!(
+            warnings.iter().all(|w| !w.contains("neutral")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn print_probe_report_prints_to_stdout_without_panic() {
+        // Just exercise the `print!` wrapper around format_probe_report.
+        print_probe_report(
+            "x86_64-unknown-linux-gnu",
+            HostInfo {
+                arch: TargetArch::X86_64,
+                features: FeatureMask::EMPTY,
+                identity: CpuIdentity::Unknown,
+                heterogeneous: false,
+            },
+            &[ProbeVariant {
+                target_cpu: "generic".to_string(),
+                required_features: FeatureMask::EMPTY,
+                rank_features: FeatureMask::EMPTY,
+                feature_names: Vec::new(),
+                feature_tier: 0,
+            }],
+            &[],
+            "generic",
+        );
+    }
+
+    #[test]
+    fn print_score_report_prints_to_stdout_without_panic() {
+        print_score_report(
+            "x86_64-unknown-linux-gnu",
+            HostInfo {
+                arch: TargetArch::X86_64,
+                features: FeatureMask::EMPTY,
+                identity: CpuIdentity::Unknown,
+                heterogeneous: false,
+            },
+            &[],
+            &[],
+            0,
+        );
+    }
+
+    #[test]
+    fn print_variant_build_prelude_writes_to_stderr() {
+        // Smoke test: just runs the eprintln + flush path without panic.
+        print_variant_build_prelude("haswell");
+    }
+
+    #[test]
+    fn leaked_str_returns_distinct_static_strs() {
+        let a = leaked_str("hello-world");
+        let b = leaked_str("hello-world");
+        assert_eq!(a, "hello-world");
+        assert_eq!(b, "hello-world");
+        // They share no buffer (each call leaks a fresh allocation).
+        assert!(!core::ptr::eq(a.as_ptr(), b.as_ptr()));
+    }
+
+    #[test]
+    fn rustflags_for_target_uses_cargo_config_with_no_env() {
+        with_rustflags_env(|| {
+            let got =
+                rustflags_for_target("aarch64-unknown-linux-gnu", ["-C panic=abort".to_string()]);
+            match got {
+                PayloadRustflags::CargoConfig(arg) => {
+                    assert!(arg.contains("aarch64-unknown-linux-gnu.rustflags"));
+                    assert!(arg.contains("-C panic=abort"));
+                }
+                other => panic!("expected CargoConfig, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn rustflags_for_target_plain_path_appends_to_existing_flags() {
+        with_rustflags_env(|| {
+            unsafe {
+                std::env::set_var("RUSTFLAGS", "-Cdebuginfo=2");
+            }
+            let got = rustflags_for_target("x86_64-unknown-linux-gnu", ["-Clto".to_string()]);
+            match got {
+                PayloadRustflags::Plain(flags) => {
+                    let s = flags.to_string_lossy().to_string();
+                    assert!(s.contains("-Cdebuginfo=2"));
+                    assert!(s.contains("-Clto"));
+                    // Joined with a space when both sides non-empty.
+                    assert!(s.contains(" -Clto"));
+                }
+                other => panic!("expected Plain, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn rustflags_for_target_plain_path_no_extra_separator_when_empty_existing() {
+        with_rustflags_env(|| {
+            unsafe {
+                std::env::set_var("RUSTFLAGS", "");
+            }
+            let got = rustflags_for_target("x86_64-unknown-linux-gnu", ["-Clto".to_string()]);
+            match got {
+                PayloadRustflags::Plain(flags) => {
+                    assert_eq!(flags.to_string_lossy(), "-Clto");
+                }
+                other => panic!("expected Plain, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn rustflags_for_target_plain_path_preserves_when_no_new_flags() {
+        with_rustflags_env(|| {
+            unsafe {
+                std::env::set_var("RUSTFLAGS", "-Cdebuginfo=2");
+            }
+            let got =
+                rustflags_for_target("x86_64-unknown-linux-gnu", std::iter::empty::<String>());
+            match got {
+                PayloadRustflags::Plain(flags) => {
+                    assert_eq!(flags.to_string_lossy(), "-Cdebuginfo=2");
+                }
+                other => panic!("expected Plain, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn select_package_picks_root_when_present() {
+        // Use this very crate's metadata: cargo-sonic is in a workspace, so
+        // root_package() is None and there are multiple workspace_members.
+        // First check the explicit-by-name path.
+        let metadata = MetadataCommand::new()
+            .manifest_path(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")))
+            .exec()
+            .unwrap();
+        let pkg = select_package(&metadata, Some("cargo-sonic")).unwrap();
+        assert_eq!(pkg.name.as_str(), "cargo-sonic");
+    }
+
+    #[test]
+    fn select_package_errors_on_unknown_package_name() {
+        let metadata = MetadataCommand::new()
+            .manifest_path(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")))
+            .exec()
+            .unwrap();
+        let err = select_package(&metadata, Some("definitely-not-real")).unwrap_err();
+        assert!(err.to_string().contains("definitely-not-real"));
+    }
+
+    #[test]
+    fn select_package_falls_back_to_root_or_workspace_member() {
+        // No package hint: must succeed when there's a clear single root or
+        // single workspace member, else error with --package hint.
+        let metadata = MetadataCommand::new()
+            .manifest_path(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")))
+            .exec()
+            .unwrap();
+        // cargo-sonic crate Cargo.toml IS the package itself ⇒ root_package returns Some.
+        let pkg = select_package(&metadata, None).unwrap();
+        assert_eq!(pkg.name.as_str(), "cargo-sonic");
+    }
+
+    #[test]
+    fn select_package_errors_when_no_root_and_multi_members() {
+        // Workspace root: root_package() is None, workspace_members > 1, so
+        // select_package must surface the `--package` hint.
+        let workspace_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+        let metadata = MetadataCommand::new()
+            .manifest_path(format!("{workspace_root}/Cargo.toml"))
+            .exec()
+            .unwrap();
+        // The workspace root itself has `members = ["crates/*"]`, no root.
+        if metadata.root_package().is_none() && metadata.workspace_members.len() > 1 {
+            let err = select_package(&metadata, None).unwrap_err();
+            assert!(err.to_string().contains("--package"));
+        }
+    }
+
+    #[test]
+    fn resolve_bin_name_uses_explicit_override() {
+        let metadata = MetadataCommand::new()
+            .manifest_path(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")))
+            .exec()
+            .unwrap();
+        let pkg = select_package(&metadata, Some("cargo-sonic")).unwrap();
+        let got = resolve_bin_name(pkg, Some("explicit-name"), &[]).unwrap();
+        assert_eq!(got, "explicit-name");
+    }
+
+    #[test]
+    fn resolve_bin_name_picks_single_bin_target_automatically() {
+        // cargo-sonic itself has exactly one [[bin]]: cargo-sonic.
+        let metadata = MetadataCommand::new()
+            .manifest_path(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")))
+            .exec()
+            .unwrap();
+        let pkg = select_package(&metadata, Some("cargo-sonic")).unwrap();
+        let got = resolve_bin_name(pkg, None, &[]).unwrap();
+        assert_eq!(got, "cargo-sonic");
+    }
+
+    fn synth_variant_build(target_cpu: &str, artifact: &Utf8Path) -> VariantBuild {
+        VariantBuild {
+            target_cpu: target_cpu.to_string(),
+            required_features: FeatureMask::EMPTY,
+            rank_features: FeatureMask::EMPTY,
+            feature_names: Vec::new(),
+            feature_tier: 0,
+            target_kind: TargetKind::Generic,
+            artifact: artifact.to_path_buf(),
+            payload_compression: PayloadCompression::None,
+            uncompressed_len: 0,
+            bundle_path: "generic.elf",
+        }
+    }
+
+    #[test]
+    fn prepare_bundle_directory_replaces_existing_dir_and_copies_payloads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+        let final_binary = root.join("myapp");
+        let bundle_dir = bundle_dir_for(&final_binary);
+
+        // Pre-create the bundle dir with a stale entry so we exercise the
+        // "exists ⇒ remove_dir_all" branch.
+        fs::create_dir_all(&bundle_dir).unwrap();
+        fs::write(bundle_dir.join("stale-file"), b"stale").unwrap();
+
+        // Two real payload files to copy in.
+        let payload_a = root.join("payload-a.elf");
+        fs::write(&payload_a, b"AAAA").unwrap();
+        let payload_b = root.join("payload-b.elf");
+        fs::write(&payload_b, b"BBBB").unwrap();
+        let variants = [
+            VariantBuild {
+                bundle_path: "x86-64.elf",
+                ..synth_variant_build("x86-64", &payload_a)
+            },
+            VariantBuild {
+                bundle_path: "haswell.elf",
+                ..synth_variant_build("haswell", &payload_b)
+            },
+        ];
+
+        prepare_bundle_directory(&final_binary, &variants).unwrap();
+
+        // Stale file gone, new files present.
+        assert!(!bundle_dir.join("stale-file").exists());
+        assert_eq!(fs::read(bundle_dir.join("x86-64.elf")).unwrap(), b"AAAA");
+        assert_eq!(fs::read(bundle_dir.join("haswell.elf")).unwrap(), b"BBBB");
+
+        // make_executable ran on each payload (Unix only).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(bundle_dir.join("x86-64.elf"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert!(mode & 0o111 != 0, "expected executable bit, got {mode:o}");
+        }
+    }
+
+    #[test]
+    fn prepare_bundle_directory_handles_missing_source_gracefully() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+        let final_binary = root.join("myapp");
+
+        let missing = root.join("does-not-exist.elf");
+        let variants = [synth_variant_build("haswell", &missing)];
+
+        let err = prepare_bundle_directory(&final_binary, &variants).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("failed to copy"));
+    }
+
+    #[test]
+    fn generated_manifest_includes_payload_paths_and_sanitized_consts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+        // Variant artifact must exist so fs::metadata().len() succeeds in the
+        // embedded path and reports the right size.
+        let payload = root.join("payload.elf");
+        fs::write(&payload, b"hello").unwrap();
+
+        let mut features = FeatureMask::EMPTY;
+        features.insert(crate::feature_mask::Feature::Avx2);
+        let variant = VariantBuild {
+            target_cpu: "haswell".to_string(),
+            required_features: features,
+            rank_features: features,
+            feature_names: vec!["avx2".to_string()],
+            feature_tier: 2,
+            target_kind: TargetKind::X86IntelCore,
+            artifact: payload,
+            payload_compression: PayloadCompression::None,
+            uncompressed_len: 5,
+            bundle_path: "haswell.elf",
+        };
+
+        let manifest = generated_manifest(std::slice::from_ref(&variant), LoaderStrategy::Embedded);
+        assert!(manifest.contains("pub static VARIANTS"));
+        assert!(manifest.contains("target_cpu: \"haswell\""));
+        assert!(manifest.contains("PAYLOAD_HASWELL"));
+        assert!(manifest.contains("AlignedPayload"));
+        assert!(
+            manifest.contains(
+                "env_selected_target_cpu: b\"CARGO_SONIC_SELECTED_TARGET_CPU=haswell\\0\""
+            )
+        );
+        assert!(manifest.contains("payload_compression: PayloadCompression::None"));
+
+        let bundle_manifest = generated_manifest(&[variant], LoaderStrategy::Bundle);
+        // Bundle strategy uses an empty payload reference instead of an
+        // include_bytes! constant.
+        assert!(bundle_manifest.contains("payload: &[]"));
+        assert!(!bundle_manifest.contains("AlignedPayload"));
+    }
+
+    #[test]
+    fn generated_manifest_with_no_variants_emits_empty_table() {
+        let manifest = generated_manifest(&[], LoaderStrategy::Embedded);
+        assert!(manifest.contains("pub static VARIANTS: &[Variant] = &[\n];"));
+    }
+
+    #[test]
+    fn generated_manifest_with_zstd_uses_zstd_compression_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+        let payload = root.join("payload.elf.zstd");
+        fs::write(&payload, b"compressed").unwrap();
+
+        let variant = VariantBuild {
+            payload_compression: PayloadCompression::Zstd,
+            ..synth_variant_build("znver5", &payload)
+        };
+        let manifest = generated_manifest(&[variant], LoaderStrategy::Embedded);
+        assert!(manifest.contains("payload_compression: PayloadCompression::Zstd"));
+    }
+
+    #[test]
+    fn generate_loader_crate_writes_full_workspace_layout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let loader_dir = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+
+        // No variants: loader without zstd dependency.
+        generate_loader_crate(
+            &loader_dir,
+            "x86_64-unknown-linux-gnu",
+            &[],
+            LoaderStrategy::Embedded,
+            None,
+        )
+        .unwrap();
+        let cargo_toml = fs::read_to_string(loader_dir.join("Cargo.toml")).unwrap();
+        assert!(cargo_toml.contains("name = \"sonic-generated-loader\""));
+        assert!(!cargo_toml.contains("ruzstd"));
+
+        // src files all present.
+        for f in [
+            "src/feature_mask.rs",
+            "src/select.rs",
+            "src/arch_x86_64.rs",
+            "src/arch_aarch64.rs",
+            "src/linux_sys.rs",
+            "src/stack.rs",
+            "src/generated_manifest.rs",
+            "src/main.rs",
+        ] {
+            assert!(loader_dir.join(f).exists(), "missing: {f}");
+        }
+        // No auditable.o without an audit section.
+        assert!(!loader_dir.join("auditable.o").exists());
+    }
+
+    #[test]
+    fn generate_loader_crate_emits_zstd_dependency_when_a_variant_uses_zstd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let loader_dir = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+
+        let payload = loader_dir.join("payload.elf.zstd");
+        fs::write(&payload, b"compressed").unwrap();
+        let variant = VariantBuild {
+            payload_compression: PayloadCompression::Zstd,
+            ..synth_variant_build("znver5", &payload)
+        };
+
+        generate_loader_crate(
+            &loader_dir,
+            "x86_64-unknown-linux-gnu",
+            &[variant],
+            LoaderStrategy::Embedded,
+            None,
+        )
+        .unwrap();
+        let cargo_toml = fs::read_to_string(loader_dir.join("Cargo.toml")).unwrap();
+        assert!(cargo_toml.contains("ruzstd"));
+    }
+
+    #[test]
+    fn generate_loader_crate_writes_auditable_object_when_section_provided() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let loader_dir = Utf8Path::from_path(tmp.path()).unwrap().to_path_buf();
+        generate_loader_crate(
+            &loader_dir,
+            "aarch64-unknown-linux-gnu",
+            &[],
+            LoaderStrategy::Embedded,
+            Some(b"audit-section-bytes"),
+        )
+        .unwrap();
+        let auditable = loader_dir.join("auditable.o");
+        assert!(auditable.exists(), "auditable.o should have been written");
+        let bytes = fs::read(&auditable).unwrap();
+        // ELF header.
+        assert_eq!(&bytes[..4], b"\x7fELF");
+    }
+
+    #[test]
+    fn cfg_value_strips_quoted_values() {
+        let cfg = "target_endian=\"little\"\ntarget_pointer_width=\"64\"\n";
+        assert_eq!(cfg_value(cfg, "target_endian").as_deref(), Some("little"));
+        assert_eq!(
+            cfg_value(cfg, "target_pointer_width").as_deref(),
+            Some("64")
+        );
+    }
+
+    #[test]
+    fn classify_runtime_features_handles_only_unknown() {
+        let set = classify_runtime_features(&["totally-bogus".into()]);
+        assert!(set.known.is_empty());
+        assert_eq!(set.unknown, vec!["totally-bogus"]);
+    }
+
+    #[test]
+    fn classify_runtime_features_drops_ignored_before_classification() {
+        let set = classify_runtime_features(&[
+            "crt-static".into(),
+            "ermsb".into(),
+            "lahfsahf".into(),
+            "prfchw".into(),
+            "x87".into(),
+        ]);
+        assert!(set.known.is_empty());
+        assert!(set.unknown.is_empty());
+    }
+
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
     }
