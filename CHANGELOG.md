@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add extensive unit and CLI integration tests for the `cargo-sonic` crate, lifting crate line coverage from 73.5% to 87.4%.
+
 # 0.2.0
 
 - Add `cargo sonic score` to rank rustc-supported target CPUs compatible with the current host without requiring `--target-cpus`.

@@ -1,14 +1,20 @@
 //! End-to-end CLI tests that exercise the `cargo-sonic` binary as a child
-//! process. These cover argv parsing, help text, and the early-exit error
-//! paths that would otherwise live behind a real cargo build (e.g. the
-//! Linux-target enforcement and the `cannot identify package` rejection).
+//! process. These cover argv parsing, help text, and the runtime (anyhow)
+//! error paths that would otherwise live behind a real cargo build.
 //!
 //! These tests do not invoke a real cargo build; they exit before reaching
 //! the codegen pipeline. That keeps them fast and OS-agnostic — they pass on
-//! macOS / Linux / non-x86 hosts alike.
+//! macOS / Linux / non-x86 hosts alike. Tests that need a runtime failure
+//! force one deterministically by forwarding `--target BOGUS_TARGET` in the
+//! trailing cargo args: `rustc --print cfg` rejects the triple on every host,
+//! so the assertions never depend on whether host probing would succeed.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+
+/// A target triple rustc cannot load, used to force the anyhow error path
+/// before any host probing or payload build can start.
+const BOGUS_TARGET: &str = "sonic-test-no-such-target";
 
 fn cargo_sonic() -> Command {
     Command::cargo_bin("cargo-sonic").expect("cargo-sonic binary built by cargo test")
@@ -171,70 +177,103 @@ fn invalid_parallelism_value_is_rejected_by_clap() {
 
 #[test]
 fn score_runs_through_the_anyhow_error_pipeline() {
-    // Score with no extra args takes the early-exit path inside
-    // `cargo_sonic::score` (either `linux-only target` on non-Linux, or
-    // `cannot identify package` on Linux without a real Cargo workspace).
-    // Either way, the binary must exit with status 1 (error from anyhow,
-    // not 2 from clap argument parsing).
-    let assertion = cargo_sonic().args(["sonic", "score"]).assert().failure();
-    let output = assertion.get_output();
-    assert_ne!(
-        output.status.code(),
-        Some(2),
-        "score must not be a clap arg error"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // `score` succeeds on a plain Linux host (it just probes the host CPU),
+    // so force a runtime failure via a bogus `--target`. The binary must exit
+    // with status 1 (error from anyhow, not 2 from clap argument parsing) and
+    // surface an `Error:`-prefixed message naming the rejected triple.
+    let assertion = cargo_sonic()
+        .args(["sonic", "score", "--target", BOGUS_TARGET])
+        .assert()
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
     assert!(stderr.starts_with("Error: "), "unexpected stderr: {stderr}");
+    assert!(stderr.contains(BOGUS_TARGET), "unexpected stderr: {stderr}");
 }
 
 #[test]
-fn build_without_target_cpus_takes_runtime_error_path() {
-    // Same shape as score: must not be a clap parse error, must surface
-    // an anyhow `Error:`-prefixed line on stderr.
+fn build_takes_runtime_error_path() {
+    // Today this fails at package selection (the repo root is a virtual
+    // workspace, so `cannot identify package`); the bogus `--target` is a
+    // backstop that keeps the test failing fast instead of launching a real
+    // nested cargo build if the workspace layout ever changes.
     let assertion = cargo_sonic()
-        .args(["sonic", "--target-cpus", "haswell", "build"])
+        .args([
+            "sonic",
+            "--target-cpus",
+            "haswell",
+            "build",
+            "--target",
+            BOGUS_TARGET,
+        ])
         .assert()
-        .failure();
-    let output = assertion.get_output();
-    assert_ne!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
     assert!(stderr.starts_with("Error: "), "unexpected stderr: {stderr}");
 }
 
 #[test]
 fn probe_takes_runtime_error_path() {
     let assertion = cargo_sonic()
-        .args(["sonic", "--target-cpus", "haswell", "probe"])
+        .args([
+            "sonic",
+            "--target-cpus",
+            "haswell",
+            "probe",
+            "--target",
+            BOGUS_TARGET,
+        ])
         .assert()
-        .failure();
-    let output = assertion.get_output();
-    assert_ne!(output.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&output.stderr);
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
     assert!(stderr.starts_with("Error: "), "unexpected stderr: {stderr}");
+    assert!(stderr.contains(BOGUS_TARGET), "unexpected stderr: {stderr}");
 }
 
 #[test]
 fn target_cpus_value_delimiter_splits_on_commas() {
-    // Comma-separated list parses without rejection at the clap layer; the
-    // failure (when it comes) is from cargo metadata, not arg parsing.
+    // The bogus trailing element proves clap split the list: the error must
+    // name `not-a-real-cpu` on its own. Had clap kept the whole string as a
+    // single value, the error would quote the full comma-joined spelling.
     let assertion = cargo_sonic()
         .args([
             "sonic",
             "--target-cpus",
-            "haswell,znver5,neoverse-n1",
+            "haswell,znver5,neoverse-n1,not-a-real-cpu",
             "probe",
         ])
         .assert()
-        .failure();
-    assert_ne!(assertion.get_output().status.code(), Some(2));
+        .failure()
+        .code(1);
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).to_string();
+    assert!(stderr.starts_with("Error: "), "unexpected stderr: {stderr}");
+    // On non-Linux hosts probe bails on the host target before validating
+    // cpu spellings, so the strong assertion is Linux-only.
+    #[cfg(target_os = "linux")]
+    assert!(
+        stderr.contains("unknown target-cpu spelling `not-a-real-cpu`"),
+        "unexpected stderr: {stderr}"
+    );
 }
 
 #[test]
 fn auditable_flag_is_accepted_for_build() {
-    let assertion = cargo_sonic()
-        .args(["sonic", "--target-cpus", "haswell", "--auditable", "build"])
+    // Reaches the anyhow path (exit 1), not the clap path (exit 2), proving
+    // `--auditable` itself parsed. Bogus `--target` keeps the failure fast
+    // and deterministic; see build_takes_runtime_error_path.
+    cargo_sonic()
+        .args([
+            "sonic",
+            "--target-cpus",
+            "haswell",
+            "--auditable",
+            "build",
+            "--target",
+            BOGUS_TARGET,
+        ])
         .assert()
-        .failure();
-    // Reaches anyhow path, not clap path.
-    assert_ne!(assertion.get_output().status.code(), Some(2));
+        .failure()
+        .code(1);
 }
