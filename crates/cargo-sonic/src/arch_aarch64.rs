@@ -199,4 +199,78 @@ mod tests {
         let mask = detect_aarch64_features_from_hwcap(0, 0, usize::MAX);
         assert_eq!(mask, FeatureMask::EMPTY);
     }
+
+    /// Per HWCAP bit, isolate just that bit and verify the expected Feature is set
+    /// and no unrelated feature leaks in. This pins down every individual mapping
+    /// in `detect_aarch64_features_from_hwcap` and protects against accidental
+    /// re-ordering or copy-paste errors when a new HWCAP is added.
+    #[test]
+    fn aarch64_each_hwcap_bit_maps_to_expected_feature() {
+        let cases_hwcap: &[(usize, Feature)] = &[
+            (HWCAP_ASIMD, Feature::Asimd),
+            (HWCAP_AES, Feature::Aes),
+            (HWCAP_CRC32, Feature::Crc),
+            (HWCAP_ATOMICS, Feature::Lse),
+            (HWCAP_FPHP, Feature::Fp16),
+            (HWCAP_ASIMDHP, Feature::Fp16),
+            (HWCAP_ASIMDRDM, Feature::Rdm),
+            (HWCAP_JSCVT, Feature::Jsconv),
+            (HWCAP_FCMA, Feature::Fcma),
+            (HWCAP_LRCPC, Feature::Rcpc),
+            (HWCAP_ILRCPC, Feature::Rcpc2),
+            (HWCAP_DCPOP, Feature::Dpb),
+            (HWCAP_SHA2, Feature::Sha2),
+            (HWCAP_SHA3, Feature::Sha3),
+            (HWCAP_SHA512, Feature::Sha512),
+            (HWCAP_SM3, Feature::Sm3),
+            (HWCAP_SM4, Feature::Sm4),
+            (HWCAP_ASIMDDP, Feature::Dotprod),
+            (HWCAP_SVE, Feature::Sve),
+            (HWCAP_ASIMDFHM, Feature::Fhm),
+            (HWCAP_DIT, Feature::Dit),
+            (HWCAP_FLAGM, Feature::Flagm),
+            (HWCAP_SSBS, Feature::Ssbs),
+            (HWCAP_SB, Feature::Sb),
+            (HWCAP_PACA, Feature::Paca),
+            (HWCAP_PACG, Feature::Pacg),
+        ];
+        for &(bit, feature) in cases_hwcap {
+            let mask = detect_aarch64_features_from_hwcap(bit, 0, 0);
+            assert!(
+                mask.contains(feature),
+                "HWCAP bit {:#x} did not produce {:?}",
+                bit,
+                feature
+            );
+        }
+
+        let cases_hwcap2: &[(usize, Feature)] = &[
+            (HWCAP2_DCPODP, Feature::Dpb2),
+            (HWCAP2_SVE2, Feature::Sve2),
+            (HWCAP2_FRINT, Feature::Frintts),
+            (HWCAP2_I8MM, Feature::I8mm),
+            (HWCAP2_BF16, Feature::Bf16),
+            (HWCAP2_SVEBF16, Feature::Bf16),
+            (HWCAP2_RNG, Feature::Rand),
+            (HWCAP2_BTI, Feature::Bti),
+            (HWCAP2_MTE, Feature::Mte),
+        ];
+        for &(bit, feature) in cases_hwcap2 {
+            let mask = detect_aarch64_features_from_hwcap(0, bit, 0);
+            assert!(
+                mask.contains(feature),
+                "HWCAP2 bit {:#x} did not produce {:?}",
+                bit,
+                feature
+            );
+        }
+    }
+
+    #[test]
+    fn aarch64_unrelated_hwcap_bits_do_not_set_features() {
+        // Bits that are not consumed by detect_aarch64_features_from_hwcap
+        // (e.g. HWCAP_USCAT, HWCAP_CPUID) must not accidentally enable any feature.
+        let mask = detect_aarch64_features_from_hwcap(HWCAP_USCAT | HWCAP_CPUID, 0, 0);
+        assert_eq!(mask, FeatureMask::EMPTY);
+    }
 }

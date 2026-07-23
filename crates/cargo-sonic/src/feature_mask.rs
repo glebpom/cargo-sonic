@@ -424,3 +424,185 @@ pub const ALL_FEATURES: &[Feature] = &[
     Feature::Xsaveopt,
     Feature::Xsaves,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_mask_contains_no_features() {
+        let empty = FeatureMask::EMPTY;
+        assert_eq!(empty.count(), 0);
+        assert_eq!(empty.words(), [0, 0]);
+        for &feature in ALL_FEATURES {
+            assert!(!empty.contains(feature), "EMPTY contains {:?}", feature);
+        }
+    }
+
+    #[test]
+    fn insert_and_contains_round_trip_for_every_feature() {
+        for &feature in ALL_FEATURES {
+            let mut mask = FeatureMask::EMPTY;
+            mask.insert(feature);
+            assert!(
+                mask.contains(feature),
+                "insert/contains failed for {:?}",
+                feature
+            );
+            assert_eq!(
+                mask.count(),
+                1,
+                "count != 1 after single insert of {:?}",
+                feature
+            );
+        }
+    }
+
+    #[test]
+    fn insert_is_idempotent() {
+        let mut mask = FeatureMask::EMPTY;
+        mask.insert(Feature::Sse2);
+        mask.insert(Feature::Sse2);
+        assert_eq!(mask.count(), 1);
+        assert!(mask.contains(Feature::Sse2));
+    }
+
+    #[test]
+    fn from_words_and_words_round_trip() {
+        let words = [0xdead_beef_cafe_babe_u64, 0x0123_4567_89ab_cdef_u64];
+        assert_eq!(FeatureMask::from_words(words).words(), words);
+    }
+
+    #[test]
+    fn count_matches_popcount_of_words() {
+        let mask = FeatureMask::from_words([0b1011, 0b110_0001]);
+        // 3 bits set in low word, 3 bits set in high word.
+        assert_eq!(mask.count(), 6);
+    }
+
+    #[test]
+    fn union_is_bitwise_or_of_each_word() {
+        let a = FeatureMask::from_words([0b1010, 0b0101]);
+        let b = FeatureMask::from_words([0b0110, 0b1001]);
+        let u = a.union(b);
+        assert_eq!(u.words(), [0b1110, 0b1101]);
+    }
+
+    #[test]
+    fn union_preserves_features_from_both_operands() {
+        let mut a = FeatureMask::EMPTY;
+        a.insert(Feature::Sse2);
+        let mut b = FeatureMask::EMPTY;
+        b.insert(Feature::Avx2);
+        let u = a.union(b);
+        assert!(u.contains(Feature::Sse2));
+        assert!(u.contains(Feature::Avx2));
+        assert_eq!(u.count(), 2);
+    }
+
+    #[test]
+    fn empty_is_subset_of_anything_and_self() {
+        let empty = FeatureMask::EMPTY;
+        let mut full = FeatureMask::EMPTY;
+        for &feature in ALL_FEATURES {
+            full.insert(feature);
+        }
+        assert!(empty.is_subset_of(empty));
+        assert!(empty.is_subset_of(full));
+        assert!(full.is_subset_of(full));
+    }
+
+    #[test]
+    fn is_subset_of_rejects_when_required_bit_is_missing() {
+        let mut required = FeatureMask::EMPTY;
+        required.insert(Feature::Avx2);
+        required.insert(Feature::Sse2);
+        let mut host = FeatureMask::EMPTY;
+        host.insert(Feature::Sse2);
+        // host lacks Avx2 → required is NOT a subset of host.
+        assert!(!required.is_subset_of(host));
+        host.insert(Feature::Avx2);
+        assert!(required.is_subset_of(host));
+    }
+
+    #[test]
+    fn feature_by_name_returns_none_for_unknown_input() {
+        assert_eq!(feature_by_name(""), None);
+        assert_eq!(feature_by_name("not-a-feature"), None);
+        assert_eq!(feature_by_name("AVX"), None, "lookup is case-sensitive");
+    }
+
+    #[test]
+    fn feature_by_name_recognises_neon_alias_for_asimd() {
+        assert_eq!(feature_by_name("neon"), Some(Feature::Asimd));
+        assert_eq!(feature_by_name("asimd"), Some(Feature::Asimd));
+    }
+
+    #[test]
+    fn feature_name_round_trips_through_feature_by_name_for_every_feature() {
+        // Every feature in ALL_FEATURES must have a name, and that name must map
+        // back to the same feature via feature_by_name. This invariant is what
+        // lets the rest of the crate use these two functions as a bijection
+        // (modulo the asimd↔neon alias, where the canonical name is "neon").
+        for &feature in ALL_FEATURES {
+            let name = feature_name(feature);
+            assert!(!name.is_empty(), "empty name for {:?}", feature);
+            let parsed = feature_by_name(name).unwrap_or_else(|| {
+                panic!(
+                    "feature_by_name({:?}) returned None for canonical name of {:?}",
+                    name, feature
+                )
+            });
+            assert_eq!(
+                parsed, feature,
+                "round-trip failed: feature_name({:?}) = {:?}, feature_by_name({:?}) = {:?}",
+                feature, name, name, parsed
+            );
+        }
+    }
+
+    #[test]
+    fn all_features_canonical_names_are_unique() {
+        // No two features may share the same canonical name, otherwise
+        // feature_name → feature_by_name would not be a function.
+        let mut names: Vec<&'static str> = ALL_FEATURES.iter().map(|&f| feature_name(f)).collect();
+        names.sort();
+        let len_before = names.len();
+        names.dedup();
+        assert_eq!(
+            len_before,
+            names.len(),
+            "feature_name produced duplicate canonical names"
+        );
+    }
+
+    #[test]
+    fn all_features_have_distinct_bit_positions() {
+        // Two features assigned to the same bit would silently conflate in
+        // FeatureMask::contains. Verify each feature occupies its own bit.
+        let mut seen = FeatureMask::EMPTY;
+        for &feature in ALL_FEATURES {
+            assert!(
+                !seen.contains(feature),
+                "duplicate bit position for {:?}",
+                feature
+            );
+            seen.insert(feature);
+        }
+        assert_eq!(seen.count() as usize, ALL_FEATURES.len());
+    }
+
+    #[test]
+    fn feature_bits_fit_within_two_u64_words() {
+        // FeatureMask uses [u64; 2], so the largest discriminant must be < 128.
+        for &feature in ALL_FEATURES {
+            let bit = feature as usize;
+            assert!(
+                bit < 128,
+                "{:?} has bit {} which overflows FeatureMask",
+                feature,
+                bit
+            );
+        }
+    }
+}
