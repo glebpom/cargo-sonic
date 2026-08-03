@@ -308,12 +308,15 @@ cargo sonic --target-cpus=x86-64-v3,znver5 --loader=bundle build --release
 
 With uncompressed payloads, the bundle loader avoids copying or decompressing
 the selected payload at startup; it directly `exec`s the matching binary from
-the bundle directory. Uncompressed bundle payloads use the `.elf` extension;
-compressed bundle payloads use `.elf.zstd`. This is faster to start, works well
-in Docker images, and should be comparable to a single generic build for startup
-overhead. It is not a single-file binary distribution format. Compression can
-still be combined with bundle mode, but it gives up the fast-start benefit
-because the selected payload must be decompressed before execution.
+the bundle directory. Each target CPU has its own subdirectory, and the payload
+inside uses the main app name so Linux process listings continue to identify the
+app rather than the selected CPU. Compressed payload files add a `.zstd` suffix
+on disk, while the decompressed memfd uses the app name without that suffix. This
+is faster to start, works well in Docker images, and should be comparable to a
+single generic build for startup overhead. It is not a single-file binary
+distribution format. Compression can still be combined with bundle mode, but it
+gives up the fast-start benefit because the selected payload must be decompressed
+before execution.
 
 With `--parallelism=1`, payload build output is passed through without
 cargo-sonic block headers. Output from parallel payload builds is buffered
