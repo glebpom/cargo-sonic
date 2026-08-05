@@ -95,7 +95,6 @@ struct VariantBuild {
     artifact: Utf8PathBuf,
     payload_compression: PayloadCompression,
     uncompressed_len: u64,
-    bundle_path: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +285,7 @@ pub fn build(options: BuildOptions) -> Result<BuildOutput> {
     generate_loader_crate(
         &loader_dir,
         &target,
+        &bin_name,
         &variants,
         loader_strategy,
         auditable_section.as_deref(),
@@ -1414,13 +1414,8 @@ fn build_payload_variants(
                     break;
                 };
                 print_variant_build_prelude(&job.target_cpu);
-                let result = build_payload_variant(&ctx, &job.target_cpu).map(|payload| {
-                    let bundle_path = leaked_str(&format!(
-                        "{}{}\0",
-                        sanitize_cpu(&job.target_cpu),
-                        payload_extension(payload.compression)
-                    ));
-                    VariantBuild {
+                let result =
+                    build_payload_variant(&ctx, &job.target_cpu).map(|payload| VariantBuild {
                         target_cpu: job.target_cpu,
                         required_features: job.required_features,
                         rank_features: job.rank_features,
@@ -1430,9 +1425,7 @@ fn build_payload_variants(
                         artifact: payload.path,
                         payload_compression: payload.compression,
                         uncompressed_len: payload.uncompressed_len,
-                        bundle_path,
-                    }
-                });
+                    });
                 if tx.send((index, result)).is_err() {
                     break;
                 }
@@ -1855,6 +1848,9 @@ fn resolve_bin_name(
 
 fn prepare_bundle_directory(final_binary: &Utf8Path, variants: &[VariantBuild]) -> Result<()> {
     let bundle_dir = bundle_dir_for(final_binary);
+    let bin_name = final_binary
+        .file_name()
+        .context("final bundle launcher path has no file name")?;
     if bundle_dir.exists() {
         fs::remove_dir_all(&bundle_dir)
             .with_context(|| format!("failed to remove old bundle directory {bundle_dir}"))?;
@@ -1862,7 +1858,17 @@ fn prepare_bundle_directory(final_binary: &Utf8Path, variants: &[VariantBuild]) 
     fs::create_dir_all(&bundle_dir)
         .with_context(|| format!("failed to create bundle directory {bundle_dir}"))?;
     for variant in variants {
-        let destination = bundle_dir.join(variant.bundle_path.trim_end_matches('\0'));
+        let relative_path = bundle_payload_relative_path(
+            bin_name,
+            &variant.target_cpu,
+            variant.payload_compression,
+        );
+        let destination = bundle_dir.join(relative_path);
+        let parent = destination
+            .parent()
+            .context("bundle payload path has no parent directory")?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create bundle payload directory {parent}"))?;
         fs::copy(&variant.artifact, &destination).with_context(|| {
             format!(
                 "failed to copy payload {} to bundle path {destination}",
@@ -1876,6 +1882,18 @@ fn prepare_bundle_directory(final_binary: &Utf8Path, variants: &[VariantBuild]) 
 
 fn bundle_dir_for(final_binary: &Utf8Path) -> Utf8PathBuf {
     Utf8PathBuf::from(format!("{final_binary}.bundle"))
+}
+
+fn bundle_payload_relative_path(
+    bin_name: &str,
+    target_cpu: &str,
+    compression: PayloadCompression,
+) -> Utf8PathBuf {
+    let file_name = match compression {
+        PayloadCompression::None => bin_name.to_string(),
+        PayloadCompression::Zstd => format!("{bin_name}.zstd"),
+    };
+    Utf8PathBuf::from(sanitize_cpu(target_cpu)).join(file_name)
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -2106,6 +2124,7 @@ fn auditable_object(target: &str, contents: &[u8]) -> Result<Vec<u8>> {
 fn generate_loader_crate(
     loader_dir: &Utf8Path,
     target: &str,
+    bin_name: &str,
     variants: &[VariantBuild],
     loader_strategy: LoaderStrategy,
     auditable_section: Option<&[u8]>,
@@ -2157,7 +2176,7 @@ panic = "abort"
     fs::write(loader_dir.join("src/stack.rs"), generated_stack())?;
     fs::write(
         loader_dir.join("src/generated_manifest.rs"),
-        generated_manifest(variants, loader_strategy),
+        generated_manifest(variants, loader_strategy, bin_name),
     )?;
     fs::write(
         loader_dir.join("src/main.rs"),
@@ -2225,9 +2244,17 @@ fn loader_rustflags(target: &str) -> &'static str {
     }
 }
 
-fn generated_manifest(variants: &[VariantBuild], loader_strategy: LoaderStrategy) -> String {
+fn generated_manifest(
+    variants: &[VariantBuild],
+    loader_strategy: LoaderStrategy,
+    bin_name: &str,
+) -> String {
     let mut out = String::new();
     out.push_str("use crate::feature_mask::FeatureMask;\nuse crate::select::TargetKind;\n\n");
+    out.push_str(&format!(
+        "pub static APP_NAME: &[u8] = b\"{}\\0\";\n",
+        escape_bytes(bin_name)
+    ));
     out.push_str("pub static ENV_ENABLED: &[u8] = b\"CARGO_SONIC_ENABLED=1\\0\";\n\n");
     if loader_strategy == LoaderStrategy::Embedded {
         out.push_str(
@@ -2290,7 +2317,11 @@ fn generated_manifest(variants: &[VariantBuild], loader_strategy: LoaderStrategy
             "&[]".to_string()
         };
         out.push_str(&format!("        payload: {payload_expr},\n"));
-        out.push_str(&format!("        payload_path: b{:?},\n", v.bundle_path));
+        let mut bundle_path =
+            bundle_payload_relative_path(bin_name, &v.target_cpu, v.payload_compression)
+                .into_string();
+        bundle_path.push('\0');
+        out.push_str(&format!("        payload_path: b{bundle_path:?},\n"));
         out.push_str(&format!(
             "        payload_compression: {},\n",
             payload_compression_expr(v.payload_compression)
@@ -2771,7 +2802,7 @@ unsafe fn exec_payload(selected: &Variant, initial: &stack::InitialStack) -> ! {
 unsafe fn exec_embedded_payload(selected: &Variant, initial: &stack::InitialStack) -> ! {
     unsafe {
         let _ = exec_reflink_tmpfile(selected, initial);
-        let fd = linux_sys::memfd_create_best_effort(b"cargo-sonic-payload\0".as_ptr());
+        let fd = linux_sys::memfd_create_best_effort(generated_manifest::APP_NAME.as_ptr());
         if fd < 0 {
             linux_sys::exit(111);
         }
@@ -2827,7 +2858,7 @@ unsafe fn exec_bundle_payload(selected: &Variant, initial: &stack::InitialStack)
             linux_sys::exit(117);
         }
         if selected.payload_compression != PayloadCompression::None {
-            let memfd = linux_sys::memfd_create_best_effort(b"cargo-sonic-payload\0".as_ptr());
+            let memfd = linux_sys::memfd_create_best_effort(generated_manifest::APP_NAME.as_ptr());
             if memfd < 0 {
                 let _ = linux_sys::close(fd);
                 linux_sys::exit(120);
@@ -4362,7 +4393,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_and_runs_baseline_fixture() {
+    fn builds_and_runs_baseline_fixture_in_embedded_and_bundle_modes() {
         if !cfg!(target_os = "linux") || !cfg!(target_arch = "x86_64") {
             return;
         }
@@ -4415,6 +4446,56 @@ mod tests {
                     .contains(".dep-v0")
             );
         }
+
+        let bundle_output = build(BuildOptions {
+            cargo_args: Vec::new(),
+            manifest_path: Some(
+                Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/env-printer/Cargo.toml"),
+            ),
+            target_cpus: vec!["x86-64-v2".into()],
+            parallelism: 1,
+            compress: PayloadCompression::None,
+            compression_level: 22,
+            loader: LoaderStrategy::Bundle,
+            auditable: false,
+        })
+        .unwrap();
+        let bundle_run = Command::new(&bundle_output.final_binary)
+            .env("CARGO_SONIC_ENABLE", "false")
+            .output()
+            .unwrap();
+        assert!(bundle_run.status.success());
+        let bundle_stdout = String::from_utf8(bundle_run.stdout).unwrap();
+        assert!(bundle_stdout.contains("comm=env-printer"));
+
+        let compressed_output = build(BuildOptions {
+            cargo_args: Vec::new(),
+            manifest_path: Some(
+                Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/env-printer/Cargo.toml"),
+            ),
+            target_cpus: vec!["x86-64-v2".into()],
+            parallelism: 1,
+            compress: PayloadCompression::Zstd,
+            compression_level: 3,
+            loader: LoaderStrategy::Bundle,
+            auditable: false,
+        })
+        .unwrap();
+        let compressed_run = Command::new(&compressed_output.final_binary)
+            .env("CARGO_SONIC_ENABLE", "false")
+            .output()
+            .unwrap();
+        assert!(compressed_run.status.success());
+        let compressed_stdout = String::from_utf8(compressed_run.stdout).unwrap();
+        let compressed_comm = compressed_stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("comm="))
+            .unwrap();
+        assert!(compressed_comm.contains("env-prin"));
+        assert!(!compressed_comm.contains("cargo-sonic"));
+        assert!(!compressed_comm.contains("zstd"));
     }
 
     #[test]
@@ -5160,6 +5241,15 @@ Available CPUs for this target:
     }
 
     #[test]
+    fn bundle_payload_paths_keep_the_app_basename() {
+        let plain = bundle_payload_relative_path("myapp", "x86-64-v3", PayloadCompression::None);
+        assert_eq!(plain.as_str(), "x86_2d64_2dv3/myapp");
+
+        let compressed = bundle_payload_relative_path("myapp", "znver5", PayloadCompression::Zstd);
+        assert_eq!(compressed.as_str(), "znver5/myapp.zstd");
+    }
+
+    #[test]
     fn payload_extension_branches_on_compression() {
         assert_eq!(payload_extension(PayloadCompression::None), ".elf");
         assert_eq!(payload_extension(PayloadCompression::Zstd), ".elf.zstd");
@@ -5420,6 +5510,8 @@ Available CPUs for this target:
         let source = generated_main("x86_64-unknown-linux-musl", false, LoaderStrategy::Bundle);
         assert!(source.contains("exec_bundle_payload(selected, &initial)"));
         assert!(!source.contains("exec_embedded_payload(selected, &initial)"));
+        assert!(source.contains("memfd_create_best_effort(generated_manifest::APP_NAME.as_ptr())"));
+        assert!(!source.contains("cargo-sonic-payload"));
     }
 
     #[test]
@@ -5837,7 +5929,6 @@ Available CPUs for this target:
             artifact: artifact.to_path_buf(),
             payload_compression: PayloadCompression::None,
             uncompressed_len: 0,
-            bundle_path: "generic.elf",
         }
     }
 
@@ -5859,28 +5950,25 @@ Available CPUs for this target:
         let payload_b = root.join("payload-b.elf");
         fs::write(&payload_b, b"BBBB").unwrap();
         let variants = [
-            VariantBuild {
-                bundle_path: "x86-64.elf",
-                ..synth_variant_build("x86-64", &payload_a)
-            },
-            VariantBuild {
-                bundle_path: "haswell.elf",
-                ..synth_variant_build("haswell", &payload_b)
-            },
+            synth_variant_build("x86-64", &payload_a),
+            synth_variant_build("haswell", &payload_b),
         ];
 
         prepare_bundle_directory(&final_binary, &variants).unwrap();
 
         // Stale file gone, new files present.
         assert!(!bundle_dir.join("stale-file").exists());
-        assert_eq!(fs::read(bundle_dir.join("x86-64.elf")).unwrap(), b"AAAA");
-        assert_eq!(fs::read(bundle_dir.join("haswell.elf")).unwrap(), b"BBBB");
+        assert_eq!(
+            fs::read(bundle_dir.join("x86_2d64/myapp")).unwrap(),
+            b"AAAA"
+        );
+        assert_eq!(fs::read(bundle_dir.join("haswell/myapp")).unwrap(), b"BBBB");
 
         // make_executable ran on each payload (Unix only).
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(bundle_dir.join("x86-64.elf"))
+            let mode = fs::metadata(bundle_dir.join("x86_2d64/myapp"))
                 .unwrap()
                 .permissions()
                 .mode();
@@ -5923,11 +6011,15 @@ Available CPUs for this target:
             artifact: payload,
             payload_compression: PayloadCompression::None,
             uncompressed_len: 5,
-            bundle_path: "haswell.elf",
         };
 
-        let manifest = generated_manifest(std::slice::from_ref(&variant), LoaderStrategy::Embedded);
+        let manifest = generated_manifest(
+            std::slice::from_ref(&variant),
+            LoaderStrategy::Embedded,
+            "env-printer",
+        );
         assert!(manifest.contains("pub static VARIANTS"));
+        assert!(manifest.contains("pub static APP_NAME: &[u8] = b\"env-printer\\0\""));
         assert!(manifest.contains("target_cpu: \"haswell\""));
         assert!(manifest.contains("PAYLOAD_HASWELL"));
         assert!(manifest.contains("AlignedPayload"));
@@ -5938,16 +6030,17 @@ Available CPUs for this target:
         );
         assert!(manifest.contains("payload_compression: PayloadCompression::None"));
 
-        let bundle_manifest = generated_manifest(&[variant], LoaderStrategy::Bundle);
+        let bundle_manifest = generated_manifest(&[variant], LoaderStrategy::Bundle, "env-printer");
         // Bundle strategy uses an empty payload reference instead of an
         // include_bytes! constant.
         assert!(bundle_manifest.contains("payload: &[]"));
+        assert!(bundle_manifest.contains("payload_path: b\"haswell/env-printer\\0\""));
         assert!(!bundle_manifest.contains("AlignedPayload"));
     }
 
     #[test]
     fn generated_manifest_with_no_variants_emits_empty_table() {
-        let manifest = generated_manifest(&[], LoaderStrategy::Embedded);
+        let manifest = generated_manifest(&[], LoaderStrategy::Embedded, "myapp");
         assert!(manifest.contains("pub static VARIANTS: &[Variant] = &[\n];"));
     }
 
@@ -5962,7 +6055,7 @@ Available CPUs for this target:
             payload_compression: PayloadCompression::Zstd,
             ..synth_variant_build("znver5", &payload)
         };
-        let manifest = generated_manifest(&[variant], LoaderStrategy::Embedded);
+        let manifest = generated_manifest(&[variant], LoaderStrategy::Embedded, "myapp");
         assert!(manifest.contains("payload_compression: PayloadCompression::Zstd"));
     }
 
@@ -5975,6 +6068,7 @@ Available CPUs for this target:
         generate_loader_crate(
             &loader_dir,
             "x86_64-unknown-linux-gnu",
+            "myapp",
             &[],
             LoaderStrategy::Embedded,
             None,
@@ -6016,6 +6110,7 @@ Available CPUs for this target:
         generate_loader_crate(
             &loader_dir,
             "x86_64-unknown-linux-gnu",
+            "myapp",
             &[variant],
             LoaderStrategy::Embedded,
             None,
@@ -6032,6 +6127,7 @@ Available CPUs for this target:
         generate_loader_crate(
             &loader_dir,
             "aarch64-unknown-linux-gnu",
+            "myapp",
             &[],
             LoaderStrategy::Embedded,
             Some(b"audit-section-bytes"),
