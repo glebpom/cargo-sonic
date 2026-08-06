@@ -4,6 +4,7 @@
 
 - Add extensive unit and CLI integration tests for the `cargo-sonic` crate, lifting crate line coverage from 73.5% to 87.4%.
 - Use the main app name for bundle executables and compressed payload memfds instead of CPU or internal loader names.
+- Suppress a spurious clang 22 `-no-pie` warning when linking static generated loaders for GNU targets.
 
 # 0.2.0
 

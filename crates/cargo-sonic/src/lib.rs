@@ -2233,14 +2233,16 @@ fn loader_build_rustflags(target: &str, auditable: bool) -> Vec<String> {
 }
 
 fn loader_rustflags(target: &str) -> &'static str {
+    // Clang 22 warns that rustc's `-no-pie` is redundant with static GNU loader links.
+    // Keep the driver-only suppression off musl targets, which can invoke rust-lld directly.
     if target.starts_with("x86_64-") && target.contains("-musl") {
         "-C panic=abort -C code-model=large -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-static"
     } else if target.starts_with("x86_64-") {
-        "-C panic=abort -C code-model=large -C target-feature=+crt-static -C relocation-model=static -C link-arg=-nostartfiles -C link-arg=-static"
+        "-C panic=abort -C code-model=large -C target-feature=+crt-static -C relocation-model=static -C link-arg=-nostartfiles -C link-arg=-static -C link-arg=-Wno-unused-command-line-argument"
     } else if target.contains("-musl") {
         "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-self-contained=no -C link-arg=-static"
     } else {
-        "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-arg=-nostartfiles -C link-arg=-static"
+        "-C panic=abort -C target-feature=+crt-static -C relocation-model=static -C link-arg=-nostartfiles -C link-arg=-static -C link-arg=-Wno-unused-command-line-argument"
     }
 }
 
@@ -3801,14 +3803,17 @@ mod tests {
         let flags = loader_rustflags("aarch64-unknown-linux-musl");
         assert!(flags.contains("-C link-self-contained=no"));
         assert!(!flags.contains("-C link-arg=-nostartfiles"));
+        assert!(!flags.contains("-Wno-unused-command-line-argument"));
     }
 
     #[test]
-    fn x86_64_loader_rustflags_use_large_code_model() {
+    fn x86_64_gnu_loader_rustflags_silence_clang_static_warning() {
         let flags = loader_rustflags("x86_64-unknown-linux-gnu");
         assert!(flags.contains("-C code-model=large"));
         assert!(!flags.contains("-C link-self-contained=no"));
         assert!(flags.contains("-C link-arg=-nostartfiles"));
+        assert!(flags.contains("-C link-arg=-static"));
+        assert!(flags.contains("-C link-arg=-Wno-unused-command-line-argument"));
     }
 
     #[test]
@@ -3878,7 +3883,9 @@ mod tests {
                     "-C",
                     "link-arg=-nostartfiles",
                     "-C",
-                    "link-arg=-static"
+                    "link-arg=-static",
+                    "-C",
+                    "link-arg=-Wno-unused-command-line-argument"
                 ]
             );
         });
@@ -5182,21 +5189,25 @@ Available CPUs for this target:
         assert!(musl.contains("link-self-contained=no"));
         assert!(!musl.contains("-nostartfiles"));
         assert!(musl.contains("code-model=large"));
+        assert!(!musl.contains("-Wno-unused-command-line-argument"));
 
-        // x86_64 gnu: code-model=large + -nostartfiles, no link-self-contained
+        // x86_64 gnu: code-model=large + Clang's static-link warning suppression
         let gnu = loader_rustflags("x86_64-unknown-linux-gnu");
         assert!(gnu.contains("code-model=large"));
         assert!(gnu.contains("-nostartfiles"));
+        assert!(gnu.contains("-Wno-unused-command-line-argument"));
         assert!(!gnu.contains("link-self-contained=no"));
 
         // aarch64-musl: link-self-contained=no, no code-model=large
         let amusl = loader_rustflags("aarch64-unknown-linux-musl");
         assert!(amusl.contains("link-self-contained=no"));
         assert!(!amusl.contains("code-model=large"));
+        assert!(!amusl.contains("-Wno-unused-command-line-argument"));
 
-        // aarch64-gnu: -nostartfiles, no link-self-contained
+        // aarch64-gnu: Clang warning suppression, no link-self-contained
         let agnu = loader_rustflags("aarch64-unknown-linux-gnu");
         assert!(agnu.contains("-nostartfiles"));
+        assert!(agnu.contains("-Wno-unused-command-line-argument"));
         assert!(!agnu.contains("link-self-contained=no"));
     }
 
